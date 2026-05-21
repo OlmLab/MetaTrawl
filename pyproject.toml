@@ -1,0 +1,27 @@
+[project]
+name = "metatrawl"
+version = "0.1.0"
+description = "Mutable registry and workflow bookkeeping for large ZipStrain/SRA profiling projects."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.1",
+    "duckdb>=1.1",
+    "polars>=1.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+metatrawl = "metatrawl.cli:cli"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
