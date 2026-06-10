@@ -25,6 +25,7 @@ class PreparedReference:
 
     reference_fasta: Path
     gene_fasta: Path
+    stb_file: Path | None = None
 
 
 class GenomeCache:
@@ -84,10 +85,12 @@ class GenomeCache:
         prepared = [self.prepare_accession(accession) for accession in clean_accessions]
         reference_fasta = output_dir / "reference.fna"
         gene_fasta = output_dir / "genes.fna"
+        stb_file = output_dir / "reference.stb"
         _concatenate_fastas([pair[0] for pair in prepared], reference_fasta)
         _concatenate_fastas([pair[1] for pair in prepared], gene_fasta)
+        _write_stb_file(list(zip(clean_accessions, [pair[0] for pair in prepared])), stb_file)
         self.logger.emit(sample=sample, step="cache", status="done", accessions=len(clean_accessions))
-        return PreparedReference(reference_fasta=reference_fasta, gene_fasta=gene_fasta)
+        return PreparedReference(reference_fasta=reference_fasta, gene_fasta=gene_fasta, stb_file=stb_file)
 
     def genome_fasta_path(self, accession: str) -> Path:
         return self.genomes_dir / f"{_safe_name(accession)}.fna"
@@ -186,6 +189,24 @@ def _concatenate_fastas(inputs: list[Path], output: Path) -> None:
                 continue
             out.write("\n")
     _atomic_publish(tmp, output)
+
+
+def _write_stb_file(accession_fastas: list[tuple[str, Path]], output: Path) -> None:
+    tmp = output.with_suffix(output.suffix + ".tmp")
+    with tmp.open("w") as handle:
+        for accession, fasta in accession_fastas:
+            for scaffold in _fasta_headers(fasta):
+                handle.write(f"{scaffold}\t{accession}\n")
+    _atomic_publish(tmp, output)
+
+
+def _fasta_headers(fasta: Path) -> list[str]:
+    headers: list[str] = []
+    with Path(fasta).open() as handle:
+        for line in handle:
+            if line.startswith(">"):
+                headers.append(line[1:].strip().split()[0])
+    return headers
 
 
 def _atomic_publish(tmp: Path, final: Path) -> None:

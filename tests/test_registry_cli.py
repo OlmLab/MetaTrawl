@@ -259,6 +259,7 @@ def test_cache_prepare_reuses_cached_genome_and_gene_fasta(tmp_path: Path) -> No
     assert result.exit_code == 0, result.output
     assert ">g1" in (tmp_path / "ref" / "reference.fna").read_text()
     assert ">gene1" in (tmp_path / "ref" / "genes.fna").read_text()
+    assert (tmp_path / "ref" / "reference.stb").read_text() == "g1\tGCF_1\n"
 
 
 def test_datasets_exec_format_error_is_actionable(tmp_path: Path, monkeypatch) -> None:
@@ -428,6 +429,7 @@ def test_profile_sra_runs_sylph_and_extracts_accessions(tmp_path: Path, monkeypa
 
     monkeypatch.setattr(workflows.subprocess, "run", fake_subprocess_run)
     monkeypatch.setattr(workflows.cache, "GenomeCache", FakeGenomeCache)
+    monkeypatch.setattr(workflows, "_run_alignment_and_profile", lambda **kwargs: None)
 
     workflows.profile_sra_runs(
         run_ids=["SRR1"],
@@ -442,6 +444,63 @@ def test_profile_sra_runs_sylph_and_extracts_accessions(tmp_path: Path, monkeypa
     assert prepared_accessions == [["GCF_000001.1"]]
     assert (output_dir / "SRR1.sylph.tsv").read_text().startswith("Genome_file")
     assert not (scratch_dir / "SRR1").exists()
+
+
+def test_alignment_and_profile_stage_publishes_outputs(tmp_path: Path, monkeypatch) -> None:
+    sample_scratch = tmp_path / "scratch" / "SRR1"
+    sample_scratch.mkdir(parents=True)
+    (sample_scratch / "SRR1_1.fastq").write_text("@r1\nACGT\n+\n!!!!\n")
+    (sample_scratch / "SRR1_2.fastq").write_text("@r2\nTGCA\n+\n!!!!\n")
+    reference_dir = sample_scratch / "reference"
+    reference_dir.mkdir()
+    reference = cache.PreparedReference(
+        reference_fasta=reference_dir / "reference.fna",
+        gene_fasta=reference_dir / "genes.fna",
+        stb_file=reference_dir / "reference.stb",
+    )
+    reference.reference_fasta.write_text(">contig\nACGT\n")
+    reference.gene_fasta.write_text(">gene\nAC\n")
+    reference.stb_file.write_text("contig\tGCF_1\n")
+    run_calls: list[list[str]] = []
+    shell_calls: list[str] = []
+
+    def fake_run(cmd: list[str], *, sample: str, step: str) -> None:
+        run_calls.append(cmd)
+        if cmd[:3] == ["zipstrain", "utilities", "prepare_profiling"]:
+            output_dir = Path(cmd[cmd.index("--output-dir") + 1])
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "genomes_bed_file.bed").write_text("contig\t1\t4\n")
+            (output_dir / "gene_range_table.tsv").write_text("gene\tcontig\t1\t2\n")
+            (output_dir / "null_model.parquet").write_text("null")
+            (output_dir / "profiling_contract.json").write_text("{}")
+        if cmd[:3] == ["zipstrain", "utilities", "profile-single"]:
+            output_dir = Path(cmd[cmd.index("--output-dir") + 1])
+            (output_dir / "SRR1_profile.parquet").write_text("profile")
+            (output_dir / "SRR1_genome_stats.parquet").write_text("genome")
+            (output_dir / "SRR1_gene_stats.parquet").write_text("gene")
+
+    def fake_shell(*, command: str, sample: str) -> None:
+        shell_calls.append(command)
+
+    monkeypatch.setattr(workflows, "_run", fake_run)
+    monkeypatch.setattr(workflows, "_run_alignment_shell", fake_shell)
+
+    workflows._run_alignment_and_profile(
+        run_id="SRR1",
+        sample_scratch=sample_scratch,
+        reference=reference,
+        output_dir=tmp_path / "outputs",
+        threads=2,
+        logger=WorkflowLogger(),
+    )
+
+    assert any(call[:2] == ["bowtie2-build", "--threads"] for call in run_calls)
+    assert shell_calls
+    assert "bowtie2 -x" in shell_calls[0]
+    assert "samtools sort" in shell_calls[0]
+    assert (tmp_path / "outputs" / "SRR1.profile.parquet").read_text() == "profile"
+    assert (tmp_path / "outputs" / "SRR1.genome_stats.parquet").read_text() == "genome"
+    assert (tmp_path / "outputs" / "SRR1.gene_stats.parquet").read_text() == "gene"
 
 
 def test_sylph_single_end_reads_are_positional_not_dash_u(tmp_path: Path, monkeypatch) -> None:

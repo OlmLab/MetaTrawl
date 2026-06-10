@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 from tempfile import TemporaryDirectory
@@ -417,6 +418,15 @@ def _profile_one_sra_run(
             sample=run_id,
         )
         logger.emit(sample=run_id, step="profile", status="ready", reference=reference.reference_fasta)
+        if output_dir is not None:
+            _run_alignment_and_profile(
+                run_id=run_id,
+                sample_scratch=sample_scratch,
+                reference=reference,
+                output_dir=output_dir,
+                threads=threads,
+                logger=logger,
+            )
     finally:
         if sample_scratch.exists():
             shutil.rmtree(sample_scratch)
@@ -430,6 +440,130 @@ def _run(cmd: list[str], *, sample: str, step: str) -> None:
         raise RuntimeError(
             f"sample={sample} step={step} command failed: {' '.join(cmd)}\n{exc.stderr}"
         ) from exc
+
+
+def _run_alignment_and_profile(
+    *,
+    run_id: str,
+    sample_scratch: Path,
+    reference: cache.PreparedReference,
+    output_dir: Path,
+    threads: int,
+    logger: WorkflowLogger,
+) -> None:
+    if reference.stb_file is None:
+        raise ValueError(f"sample={run_id} step=profile missing STB file from cache reference preparation")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    profile_work = sample_scratch / "zipstrain_profile"
+    profile_work.mkdir(parents=True, exist_ok=True)
+
+    logger.emit(sample=run_id, step="prepare-profile", status="start")
+    _run(
+        [
+            "zipstrain",
+            "utilities",
+            "prepare_profiling",
+            "--reference-fasta",
+            str(reference.reference_fasta),
+            "--gene-fasta",
+            str(reference.gene_fasta),
+            "--stb-file",
+            str(reference.stb_file),
+            "--output-dir",
+            str(profile_work),
+        ],
+        sample=run_id,
+        step="prepare-profile",
+    )
+    logger.emit(sample=run_id, step="prepare-profile", status="done")
+
+    logger.emit(sample=run_id, step="bowtie2-build", status="start")
+    _run(["bowtie2-build", "--threads", str(threads), str(reference.reference_fasta), str(reference.reference_fasta)], sample=run_id, step="bowtie2-build")
+    logger.emit(sample=run_id, step="bowtie2-build", status="done")
+
+    bam_file = sample_scratch / f"{run_id}.bam"
+    logger.emit(sample=run_id, step="align", status="start", bam=bam_file)
+    _run_alignment_shell(
+        command=_build_alignment_command(
+            reference_fasta=reference.reference_fasta,
+            fastqs=_sample_fastqs(sample_scratch),
+            threads=threads,
+            bam_file=bam_file,
+        ),
+        sample=run_id,
+    )
+    logger.emit(sample=run_id, step="align", status="done", bam=bam_file)
+
+    logger.emit(sample=run_id, step="profile", status="start")
+    _run(
+        [
+            "zipstrain",
+            "utilities",
+            "profile-single",
+            "--bam-file",
+            str(bam_file),
+            "--bed-file",
+            str(profile_work / "genomes_bed_file.bed"),
+            "--stb-file",
+            str(reference.stb_file),
+            "--null-model",
+            str(profile_work / "null_model.parquet"),
+            "--gene-range-table",
+            str(profile_work / "gene_range_table.tsv"),
+            "--profiling-contract",
+            str(profile_work / "profiling_contract.json"),
+            "--max-concurrency",
+            str(threads),
+            "--output-dir",
+            str(profile_work),
+        ],
+        sample=run_id,
+        step="profile",
+    )
+    _publish_profile_outputs(run_id=run_id, profile_work=profile_work, output_dir=output_dir)
+    logger.emit(sample=run_id, step="profile", status="done", output_dir=output_dir)
+
+
+def _sample_fastqs(sample_scratch: Path) -> list[Path]:
+    fastqs = sorted(sample_scratch.glob("*.fastq")) + sorted(sample_scratch.glob("*.fq"))
+    fastqs += sorted(sample_scratch.glob("*.fastq.gz")) + sorted(sample_scratch.glob("*.fq.gz"))
+    if not fastqs:
+        raise FileNotFoundError(f"step=align found no FASTQ files in {sample_scratch}")
+    return fastqs
+
+
+def _build_alignment_command(*, reference_fasta: Path, fastqs: list[Path], threads: int, bam_file: Path) -> str:
+    quoted_reference = shlex.quote(str(reference_fasta))
+    quoted_threads = shlex.quote(str(threads))
+    if len(fastqs) == 2:
+        read_args = f"-1 {shlex.quote(str(fastqs[0]))} -2 {shlex.quote(str(fastqs[1]))}"
+    else:
+        read_args = f"-U {shlex.quote(','.join(str(path) for path in fastqs))}"
+    return (
+        f"bowtie2 -x {quoted_reference} {read_args} --threads {quoted_threads} "
+        f"| samtools view -bS -F 4 - "
+        f"| samtools sort -@ {quoted_threads} -o {shlex.quote(str(bam_file))} -"
+    )
+
+
+def _run_alignment_shell(*, command: str, sample: str) -> None:
+    try:
+        subprocess.run(command, check=True, shell=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"sample={sample} step=align command failed: {command}\n{exc.stderr}") from exc
+
+
+def _publish_profile_outputs(*, run_id: str, profile_work: Path, output_dir: Path) -> None:
+    outputs = {
+        profile_work / f"{run_id}_profile.parquet": output_dir / f"{run_id}.profile.parquet",
+        profile_work / f"{run_id}_genome_stats.parquet": output_dir / f"{run_id}.genome_stats.parquet",
+        profile_work / f"{run_id}_gene_stats.parquet": output_dir / f"{run_id}.gene_stats.parquet",
+    }
+    missing = [str(source) for source in outputs if not source.exists()]
+    if missing:
+        raise FileNotFoundError(f"sample={run_id} step=profile missing expected ZipStrain outputs: {', '.join(missing)}")
+    for source, destination in outputs.items():
+        shutil.copy2(source, destination)
 
 
 def _run_sylph_profile(*, sylph_db: Path, sample_scratch: Path, run_id: str, threads: int, output_file: Path) -> None:

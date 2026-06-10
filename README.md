@@ -77,7 +77,10 @@ metatrawl sync \
 
 MetaTrawl runs `sylph profile` for each sample, saves the abundance table as
 `SRR000001.sylph.tsv`, extracts nonzero `GCF_...`/`GCA_...` accessions from it,
-and asks the shared cache to prepare those genomes.
+and asks the shared cache to prepare those genomes. It then runs
+`zipstrain utilities prepare_profiling`, builds a Bowtie2 index, aligns reads
+with `bowtie2 | samtools`, and runs `zipstrain utilities profile-single` to
+produce the profile and stats files that are imported into DuckDB.
 
 Use an absolute `--sylph-db` path when possible. MetaTrawl validates the file
 before launching SRA workers.
