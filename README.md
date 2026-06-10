@@ -70,7 +70,7 @@ metatrawl sync \
   --db metatrawl.duckdb \
   --cache-dir cache \
   --scratch-dir scratch \
-  --sylph-db gtdb-r220-c200-dbv1.syldb \
+  --sylph-db /path/to/gtdb-r220-c200-dbv1.syldb \
   --output-dir outputs \
   --threads 16
 ```
@@ -78,6 +78,9 @@ metatrawl sync \
 MetaTrawl runs `sylph profile` for each sample, saves the abundance table as
 `SRR000001.sylph.tsv`, extracts nonzero `GCF_...`/`GCA_...` accessions from it,
 and asks the shared cache to prepare those genomes.
+
+Use an absolute `--sylph-db` path when possible. MetaTrawl validates the file
+before launching SRA workers.
 
 `--accessions-dir` is still available as a manual override. It should contain
 one accession list per run, produced by Sylph or another genome preselection

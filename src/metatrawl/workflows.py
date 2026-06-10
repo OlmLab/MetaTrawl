@@ -197,6 +197,7 @@ def profile_sra_runs(
     """
     logger = logger or WorkflowLogger()
     cache_manager = cache.GenomeCache(cache_dir, logger=logger)
+    sylph_db = _resolve_existing_sylph_db(sylph_db) if sylph_db is not None else None
     max_workers = max(1, min(len(run_ids), threads))
     logger.emit(step="profile-sra", status="start", samples=len(run_ids), workers=max_workers, db=db_file)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -206,7 +207,7 @@ def profile_sra_runs(
                 run_id=run_id,
                 cache_manager=cache_manager,
                 scratch_dir=Path(scratch_dir),
-                sylph_db=Path(sylph_db) if sylph_db is not None else None,
+                sylph_db=sylph_db,
                 output_dir=Path(output_dir) if output_dir is not None else None,
                 accessions_dir=Path(accessions_dir) if accessions_dir is not None else None,
                 threads=max(1, threads // max_workers),
@@ -439,12 +440,22 @@ def _run_sylph_profile(*, sylph_db: Path, sample_scratch: Path, run_id: str, thr
     if len(fastqs) == 2:
         cmd = ["sylph", "profile", str(sylph_db), "-1", str(fastqs[0]), "-2", str(fastqs[1]), "-t", str(threads)]
     else:
-        cmd = ["sylph", "profile", str(sylph_db), "-U", *[str(path) for path in fastqs], "-t", str(threads)]
+        cmd = ["sylph", "profile", str(sylph_db), *[str(path) for path in fastqs], "-t", str(threads)]
     try:
         with output_file.open("w") as handle:
             subprocess.run(cmd, check=True, stdout=handle, stderr=subprocess.PIPE, text=True)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(f"sample={run_id} step=sylph command failed: {' '.join(cmd)}\n{exc.stderr}") from exc
+
+
+def _resolve_existing_sylph_db(sylph_db: Path | str) -> Path:
+    path = Path(sylph_db).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(
+            f"step=sylph Sylph database does not exist: {path}. "
+            "Pass an absolute --sylph-db path or run from the directory containing the .syldb file."
+        )
+    return path.resolve()
 
 
 def extract_accessions_from_sylph_table(sylph_output: Path) -> list[str]:

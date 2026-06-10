@@ -161,16 +161,12 @@ def download_genome_with_datasets(accession: str, output_fasta: Path) -> None:
 def run_prodigal_gene_fasta(genome_fasta: Path, output_gene_fasta: Path) -> None:
     """Run Prodigal and keep only nucleotide gene FASTA output."""
     output_gene_fasta.parent.mkdir(parents=True, exist_ok=True)
-    proteins = output_gene_fasta.with_suffix(".faa")
-    genes = output_gene_fasta
     subprocess.run(
-        ["prodigal", "-i", str(genome_fasta), "-d", str(genes), "-a", str(proteins), "-p", "meta", "-q"],
+        ["prodigal", "-i", str(genome_fasta), "-d", str(output_gene_fasta), "-p", "meta", "-q"],
         check=True,
         capture_output=True,
         text=True,
     )
-    if proteins.exists():
-        proteins.unlink()
 
 
 def _concatenate_fastas(inputs: list[Path], output: Path) -> None:

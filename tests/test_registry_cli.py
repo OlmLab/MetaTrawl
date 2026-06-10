@@ -281,6 +281,25 @@ def test_duplicate_accession_requests_share_one_preparation_job(tmp_path: Path) 
     assert calls == {"download": 1, "prodigal": 1}
 
 
+def test_prodigal_runner_only_requests_nucleotide_gene_fasta(tmp_path: Path, monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, check, capture_output, text):
+        calls.append(cmd)
+        Path(cmd[cmd.index("-d") + 1]).write_text(">gene\nAC\n")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(cache.subprocess, "run", fake_run)
+
+    cache.run_prodigal_gene_fasta(tmp_path / "genome.fna", tmp_path / "genes.fna")
+
+    assert calls
+    assert "-d" in calls[0]
+    assert "-a" not in calls[0]
+    assert (tmp_path / "genes.fna").exists()
+    assert not (tmp_path / "genes.faa").exists()
+
+
 def test_profile_sra_deletes_temporary_reference_files_after_success(tmp_path: Path, monkeypatch) -> None:
     scratch_dir = tmp_path / "scratch"
 
@@ -360,6 +379,8 @@ def test_profile_sra_uses_per_sample_accessions_dir(tmp_path: Path, monkeypatch)
 def test_profile_sra_runs_sylph_and_extracts_accessions(tmp_path: Path, monkeypatch) -> None:
     scratch_dir = tmp_path / "scratch"
     output_dir = tmp_path / "outputs"
+    sylph_db = tmp_path / "gtdb.syldb"
+    sylph_db.write_text("fake syldb")
     prepared_accessions: list[list[str]] = []
 
     def fake_subprocess_run(cmd, check, capture_output=False, text=False, stdout=None, stderr=None):
@@ -398,7 +419,7 @@ def test_profile_sra_runs_sylph_and_extracts_accessions(tmp_path: Path, monkeypa
         db_file=tmp_path / "metatrawl.duckdb",
         cache_dir=tmp_path / "cache",
         scratch_dir=scratch_dir,
-        sylph_db=tmp_path / "gtdb.syldb",
+        sylph_db=sylph_db,
         output_dir=output_dir,
         logger=WorkflowLogger(),
     )
@@ -406,6 +427,33 @@ def test_profile_sra_runs_sylph_and_extracts_accessions(tmp_path: Path, monkeypa
     assert prepared_accessions == [["GCF_000001.1"]]
     assert (output_dir / "SRR1.sylph.tsv").read_text().startswith("Genome_file")
     assert not (scratch_dir / "SRR1").exists()
+
+
+def test_sylph_single_end_reads_are_positional_not_dash_u(tmp_path: Path, monkeypatch) -> None:
+    sample_scratch = tmp_path / "scratch" / "SRR1"
+    sample_scratch.mkdir(parents=True)
+    (sample_scratch / "SRR1.fastq").write_text("@r1\nACGT\n+\n!!!!\n")
+    sylph_db = tmp_path / "gtdb.syldb"
+    sylph_db.write_text("fake syldb")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, check, stdout, stderr, text):
+        calls.append(cmd)
+        stdout.write("Genome_file\tTaxonomic_abundance\n/path/GCF_000001.1_genomic.fna\t1.5\n")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(workflows.subprocess, "run", fake_run)
+
+    workflows._run_sylph_profile(
+        sylph_db=sylph_db,
+        sample_scratch=sample_scratch,
+        run_id="SRR1",
+        threads=1,
+        output_file=tmp_path / "sylph.tsv",
+    )
+
+    assert calls == [["sylph", "profile", str(sylph_db), str(sample_scratch / "SRR1.fastq"), "-t", "1"]]
+    assert "-U" not in calls[0]
 
 
 def test_sync_profiles_remaining_runs_and_imports_outputs(tmp_path: Path, monkeypatch) -> None:
