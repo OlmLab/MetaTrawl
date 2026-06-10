@@ -37,16 +37,23 @@ PackageProbe = Callable[[str, str | None], tuple[bool, str]]
 
 REQUIRED_EXECUTABLES = ("zipstrain", "sylph", "samtools", "bowtie2", "prefetch", "fasterq-dump", "datasets", "prodigal")
 REQUIRED_PACKAGES = (("torch", "torch"), ("h5py", "h5py"))
+VERSION_PROBES = {
+    "datasets": ["--version"],
+    "prodigal": ["-v"],
+}
 
 
 def probe_executable(command: str) -> tuple[bool, str]:
-    """Return whether an executable is present and runnable."""
+    """Return whether an executable is present and, when known, runnable."""
     path = shutil.which(command)
     if path is None:
         return False, "not found in PATH"
+    probe_args = VERSION_PROBES.get(command)
+    if probe_args is None:
+        return True, path
     try:
         result = subprocess.run(
-            [path, "--version"],
+            [path, *probe_args],
             check=False,
             capture_output=True,
             text=True,
@@ -55,13 +62,13 @@ def probe_executable(command: str) -> tuple[bool, str]:
     except OSError as exc:
         return False, f"found at {path}, but cannot execute it: {exc}"
     except subprocess.TimeoutExpired:
-        return False, f"found at {path}, but `{command} --version` timed out"
+        return False, f"found at {path}, but `{command} {' '.join(probe_args)}` timed out"
     detail = path
     output = (result.stdout or result.stderr).strip().splitlines()
     if output:
         detail = f"{path} ({output[0][:120]})"
     if result.returncode != 0:
-        return False, f"found at {path}, but `{command} --version` failed with exit code {result.returncode}"
+        return False, f"found at {path}, but `{command} {' '.join(probe_args)}` failed with exit code {result.returncode}"
     return True, detail
 
 

@@ -94,3 +94,34 @@ def test_probe_executable_reports_exec_format_errors(monkeypatch):
     assert ok is False
     assert "cannot execute" in detail
     assert "Exec format error" in detail
+
+
+def test_probe_executable_uses_prodigal_dash_v(monkeypatch):
+    calls: list[list[str]] = []
+    monkeypatch.setattr(healthcheck.shutil, "which", lambda command: f"/usr/local/bin/{command}")
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return healthcheck.subprocess.CompletedProcess(cmd, 0, stdout="Prodigal V2.6.3\n", stderr="")
+
+    monkeypatch.setattr(healthcheck.subprocess, "run", fake_run)
+
+    ok, detail = healthcheck.probe_executable("prodigal")
+
+    assert ok is True
+    assert calls == [["/usr/local/bin/prodigal", "-v"]]
+    assert "Prodigal" in detail
+
+
+def test_probe_executable_does_not_version_probe_unknown_tools(monkeypatch):
+    monkeypatch.setattr(healthcheck.shutil, "which", lambda command: f"/usr/local/bin/{command}")
+
+    def fake_run(*args, **kwargs):
+        raise AssertionError("should not run version probe")
+
+    monkeypatch.setattr(healthcheck.subprocess, "run", fake_run)
+
+    ok, detail = healthcheck.probe_executable("sylph")
+
+    assert ok is True
+    assert detail == "/usr/local/bin/sylph"
