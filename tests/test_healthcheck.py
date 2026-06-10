@@ -1,4 +1,5 @@
 from click.testing import CliRunner
+import pytest
 
 from metatrawl import cli
 from metatrawl import healthcheck
@@ -23,6 +24,8 @@ def test_healthcheck_reports_all_requested_dependencies():
         "bowtie2",
         "prefetch",
         "fasterq-dump",
+        "datasets",
+        "prodigal",
         "torch",
         "h5py",
     ]
@@ -46,3 +49,33 @@ def test_metatrawl_test_renders_dependency_report(monkeypatch):
     assert "zipstrain" in result.output
     assert "sylph" in result.output
     assert "MISSING" in result.output
+
+
+def test_assert_dependencies_fails_with_clear_missing_list():
+    checks = [
+        healthcheck.Check("zipstrain", "ok", "/usr/bin/zipstrain"),
+        healthcheck.Check("sylph", "missing", "not found in PATH"),
+    ]
+
+    with pytest.raises(healthcheck.DependencyCheckError) as exc_info:
+        healthcheck.assert_dependencies(checks)
+
+    assert "sylph" in str(exc_info.value)
+    assert "not found in PATH" in str(exc_info.value)
+
+
+def test_metatrawl_check_fails_when_dependency_missing(monkeypatch):
+    monkeypatch.setattr(
+        healthcheck,
+        "collect_checks",
+        lambda: [
+            healthcheck.Check("zipstrain", "ok", "/usr/bin/zipstrain"),
+            healthcheck.Check("sylph", "missing", "not found in PATH"),
+        ],
+    )
+
+    result = CliRunner().invoke(cli.cli, ["check"])
+
+    assert result.exit_code != 0
+    assert "MetaTrawl health check" in result.output
+    assert "Missing required MetaTrawl dependencies" in result.output

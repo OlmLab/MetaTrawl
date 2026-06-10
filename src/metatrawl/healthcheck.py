@@ -21,8 +21,21 @@ class Check:
     detail: str
 
 
+class DependencyCheckError(RuntimeError):
+    """Raised when required MetaTrawl dependencies are missing."""
+
+    def __init__(self, missing: list[Check]) -> None:
+        self.missing = missing
+        names = ", ".join(check.name for check in missing)
+        details = "; ".join(f"{check.name}: {check.detail}" for check in missing)
+        super().__init__(f"Missing required MetaTrawl dependencies: {names}. {details}")
+
+
 ExecutableProbe = Callable[[str], tuple[bool, str]]
 PackageProbe = Callable[[str, str | None], tuple[bool, str]]
+
+REQUIRED_EXECUTABLES = ("zipstrain", "sylph", "samtools", "bowtie2", "prefetch", "fasterq-dump", "datasets", "prodigal")
+REQUIRED_PACKAGES = (("torch", "torch"), ("h5py", "h5py"))
 
 
 def probe_executable(command: str) -> tuple[bool, str]:
@@ -54,12 +67,21 @@ def collect_checks(
 ) -> list[Check]:
     """Collect the small dependency report shown by ``metatrawl test``."""
     checks: list[Check] = []
-    for command in ("zipstrain", "sylph", "samtools", "bowtie2", "prefetch", "fasterq-dump"):
+    for command in REQUIRED_EXECUTABLES:
         ok, detail = executable_probe(command)
         checks.append(Check(name=command, status="ok" if ok else "missing", detail=detail))
-    for import_name, package_name in (("torch", "torch"), ("h5py", "h5py")):
+    for import_name, package_name in REQUIRED_PACKAGES:
         ok, detail = package_probe(import_name, package_name)
         checks.append(Check(name=import_name, status="ok" if ok else "missing", detail=detail))
+    return checks
+
+
+def assert_dependencies(checks: list[Check] | None = None) -> list[Check]:
+    """Fail clearly unless all required MetaTrawl dependencies are available."""
+    checks = checks or collect_checks()
+    missing = [check for check in checks if check.status != "ok"]
+    if missing:
+        raise DependencyCheckError(missing)
     return checks
 
 
