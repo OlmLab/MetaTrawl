@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import csv
 from pathlib import Path
+import subprocess
 import sys
 import time
 import types
@@ -313,6 +314,97 @@ def test_profile_sra_deletes_temporary_reference_files_after_success(tmp_path: P
         logger=WorkflowLogger(),
     )
 
+    assert not (scratch_dir / "SRR1").exists()
+
+
+def test_profile_sra_uses_per_sample_accessions_dir(tmp_path: Path, monkeypatch) -> None:
+    scratch_dir = tmp_path / "scratch"
+    accessions_dir = tmp_path / "accessions"
+    accessions_dir.mkdir()
+    (accessions_dir / "SRR1.accessions.txt").write_text("GCF_1\n")
+    prepared_accessions: list[list[str]] = []
+
+    def fake_run(cmd: list[str], *, sample: str, step: str) -> None:
+        return None
+
+    class FakeGenomeCache:
+        def __init__(self, cache_dir: Path, logger: WorkflowLogger | None = None) -> None:
+            self.cache_dir = cache_dir
+            self.logger = logger
+
+        def prepare_reference(self, *, accessions: list[str], output_dir: Path, sample: str | None = None) -> cache.PreparedReference:
+            prepared_accessions.append(accessions)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            reference = output_dir / "reference.fna"
+            genes = output_dir / "genes.fna"
+            reference.write_text(">g\nACGT\n")
+            genes.write_text(">gene\nAC\n")
+            return cache.PreparedReference(reference_fasta=reference, gene_fasta=genes)
+
+    monkeypatch.setattr(workflows, "_run", fake_run)
+    monkeypatch.setattr(workflows.cache, "GenomeCache", FakeGenomeCache)
+
+    workflows.profile_sra_runs(
+        run_ids=["SRR1"],
+        db_file=tmp_path / "metatrawl.duckdb",
+        cache_dir=tmp_path / "cache",
+        scratch_dir=scratch_dir,
+        accessions_dir=accessions_dir,
+        logger=WorkflowLogger(),
+    )
+
+    assert prepared_accessions == [["GCF_1"]]
+    assert not (scratch_dir / "SRR1").exists()
+
+
+def test_profile_sra_runs_sylph_and_extracts_accessions(tmp_path: Path, monkeypatch) -> None:
+    scratch_dir = tmp_path / "scratch"
+    output_dir = tmp_path / "outputs"
+    prepared_accessions: list[list[str]] = []
+
+    def fake_subprocess_run(cmd, check, capture_output=False, text=False, stdout=None, stderr=None):
+        if cmd[0] == "prefetch":
+            return subprocess.CompletedProcess(cmd, 0)
+        if cmd[0] == "fasterq-dump":
+            sample_dir = scratch_dir / "SRR1"
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            (sample_dir / "SRR1_1.fastq").write_text("@r1\nACGT\n+\n!!!!\n")
+            (sample_dir / "SRR1_2.fastq").write_text("@r2\nTGCA\n+\n!!!!\n")
+            return subprocess.CompletedProcess(cmd, 0)
+        if cmd[:2] == ["sylph", "profile"]:
+            stdout.write("Genome_file\tTaxonomic_abundance\n/path/GCF_000001.1_genomic.fna\t1.5\n/path/GCF_000002.1_genomic.fna\t0\n")
+            return subprocess.CompletedProcess(cmd, 0)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    class FakeGenomeCache:
+        def __init__(self, cache_dir: Path, logger: WorkflowLogger | None = None) -> None:
+            self.cache_dir = cache_dir
+            self.logger = logger
+
+        def prepare_reference(self, *, accessions: list[str], output_dir: Path, sample: str | None = None) -> cache.PreparedReference:
+            prepared_accessions.append(accessions)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            reference = output_dir / "reference.fna"
+            genes = output_dir / "genes.fna"
+            reference.write_text(">g\nACGT\n")
+            genes.write_text(">gene\nAC\n")
+            return cache.PreparedReference(reference_fasta=reference, gene_fasta=genes)
+
+    monkeypatch.setattr(workflows.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(workflows.cache, "GenomeCache", FakeGenomeCache)
+
+    workflows.profile_sra_runs(
+        run_ids=["SRR1"],
+        db_file=tmp_path / "metatrawl.duckdb",
+        cache_dir=tmp_path / "cache",
+        scratch_dir=scratch_dir,
+        sylph_db=tmp_path / "gtdb.syldb",
+        output_dir=output_dir,
+        logger=WorkflowLogger(),
+    )
+
+    assert prepared_accessions == [["GCF_000001.1"]]
+    assert (output_dir / "SRR1.sylph.tsv").read_text().startswith("Genome_file")
     assert not (scratch_dir / "SRR1").exists()
 
 

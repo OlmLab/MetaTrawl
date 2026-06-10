@@ -217,8 +217,20 @@ def cache_serve(cache_dir: Path, host: str, port: int) -> None:
 @click.option("--remaining-csv", required=True, type=click.Path(path_type=Path), help="CSV from profiles remaining.")
 @click.option("--cache-dir", required=True, type=click.Path(path_type=Path), help="Shared genome cache directory.")
 @click.option("--scratch-dir", required=True, type=click.Path(path_type=Path), help="Disposable worker scratch directory.")
+@click.option("--sylph-db", type=click.Path(path_type=Path), help="Sylph database used to select genomes from reads.")
+@click.option("--output-dir", type=click.Path(path_type=Path), help="Directory where Sylph/profile outputs are written.")
+@click.option("--accessions-dir", type=click.Path(path_type=Path), help="Manual override directory with per-run accession files.")
 @click.option("--threads", type=int, default=8, show_default=True)
-def profile_sra(db_file: Path, remaining_csv: Path, cache_dir: Path, scratch_dir: Path, threads: int) -> None:
+def profile_sra(
+    db_file: Path,
+    remaining_csv: Path,
+    cache_dir: Path,
+    scratch_dir: Path,
+    sylph_db: Path | None,
+    output_dir: Path | None,
+    accessions_dir: Path | None,
+    threads: int,
+) -> None:
     """Run the local SRA profiling lifecycle with scratch cleanup."""
     run_ids = _read_remaining_csv(remaining_csv)
     workflows.profile_sra_runs(
@@ -226,6 +238,9 @@ def profile_sra(db_file: Path, remaining_csv: Path, cache_dir: Path, scratch_dir
         db_file=db_file,
         cache_dir=cache_dir,
         scratch_dir=scratch_dir,
+        sylph_db=sylph_db,
+        output_dir=output_dir,
+        accessions_dir=accessions_dir,
         threads=threads,
         logger=WorkflowLogger(),
     )
@@ -236,6 +251,8 @@ def profile_sra(db_file: Path, remaining_csv: Path, cache_dir: Path, scratch_dir
 @click.option("--cache-dir", required=True, type=click.Path(path_type=Path), help="Shared genome cache directory.")
 @click.option("--scratch-dir", required=True, type=click.Path(path_type=Path), help="Disposable worker scratch directory.")
 @click.option("--output-dir", required=True, type=click.Path(path_type=Path), help="Directory where profile outputs are written.")
+@click.option("--sylph-db", type=click.Path(path_type=Path), help="Sylph database used to select genomes from reads.")
+@click.option("--accessions-dir", type=click.Path(path_type=Path), help="Manual override directory with per-run accession files.")
 @click.option("--threads", type=int, default=8, show_default=True)
 @click.option("--skip-dependency-check", is_flag=True, help="Do not preflight external tools before syncing.")
 @click.option("--keep-profile-outputs", is_flag=True, help="Keep imported profile/stat/Sylph files on disk for debugging.")
@@ -244,6 +261,8 @@ def sync(
     cache_dir: Path,
     scratch_dir: Path,
     output_dir: Path,
+    sylph_db: Path | None,
+    accessions_dir: Path | None,
     threads: int,
     skip_dependency_check: bool,
     keep_profile_outputs: bool,
@@ -255,6 +274,8 @@ def sync(
             cache_dir=cache_dir,
             scratch_dir=scratch_dir,
             output_dir=output_dir,
+            sylph_db=sylph_db,
+            accessions_dir=accessions_dir,
             threads=threads,
             check_dependencies=not skip_dependency_check,
             cleanup_outputs=not keep_profile_outputs,

@@ -1,0 +1,34 @@
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Packaging/build artifacts
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local MetaTrawl runtime artifacts
+*.duckdb
+*.duckdb.wal
+cache/
+scratch/
+outputs/
+matrices/
+compares/
+remaining_runs.csv
+completed_profiles.csv
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/

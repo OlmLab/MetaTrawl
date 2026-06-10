@@ -4,15 +4,23 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+import re
 import shutil
 import subprocess
 from tempfile import TemporaryDirectory
 from dataclasses import dataclass
 
+import polars as pl
+
 from metatrawl import cache
 from metatrawl import db
 from metatrawl import healthcheck
 from metatrawl.logging import WorkflowLogger
+
+
+ACCESSION_PATTERN = re.compile(r"\b((?:GC[AF])_\d+(?:\.\d+)?)", re.IGNORECASE)
+SYLPH_GENOME_COLUMNS = ["Genome_file", "genome_file", "genome", "Genome", "Reference", "reference", "target"]
+SYLPH_ABUNDANCE_COLUMNS = ["eff_cov", "genome_cov", "abundance", "relative_abundance", "rel_abundance", "Taxonomic_abundance"]
 
 
 @dataclass(frozen=True)
@@ -176,6 +184,9 @@ def profile_sra_runs(
     db_file: Path,
     cache_dir: Path,
     scratch_dir: Path,
+    sylph_db: Path | None = None,
+    output_dir: Path | None = None,
+    accessions_dir: Path | None = None,
     threads: int = 8,
     logger: WorkflowLogger | None = None,
 ) -> None:
@@ -195,6 +206,9 @@ def profile_sra_runs(
                 run_id=run_id,
                 cache_manager=cache_manager,
                 scratch_dir=Path(scratch_dir),
+                sylph_db=Path(sylph_db) if sylph_db is not None else None,
+                output_dir=Path(output_dir) if output_dir is not None else None,
+                accessions_dir=Path(accessions_dir) if accessions_dir is not None else None,
                 threads=max(1, threads // max_workers),
                 logger=logger,
             )
@@ -211,6 +225,8 @@ def sync_remaining_profiles(
     cache_dir: Path,
     scratch_dir: Path,
     output_dir: Path,
+    sylph_db: Path | None = None,
+    accessions_dir: Path | None = None,
     threads: int = 8,
     check_dependencies: bool = True,
     cleanup_outputs: bool = True,
@@ -236,6 +252,9 @@ def sync_remaining_profiles(
         db_file=db_file,
         cache_dir=cache_dir,
         scratch_dir=scratch_dir,
+        sylph_db=sylph_db,
+        output_dir=output_dir,
+        accessions_dir=accessions_dir,
         threads=threads,
         logger=logger,
     )
@@ -342,6 +361,9 @@ def _profile_one_sra_run(
     run_id: str,
     cache_manager: cache.GenomeCache,
     scratch_dir: Path,
+    sylph_db: Path | None,
+    output_dir: Path | None,
+    accessions_dir: Path | None,
     threads: int,
     logger: WorkflowLogger,
 ) -> None:
@@ -351,13 +373,41 @@ def _profile_one_sra_run(
         logger.emit(sample=run_id, step="download", status="start")
         _run(["prefetch", run_id], sample=run_id, step="download")
         _run(["fasterq-dump", run_id, "--outdir", str(sample_scratch), "--threads", str(threads)], sample=run_id, step="download")
-        logger.emit(sample=run_id, step="sylph", status="start")
-        # A full production runner will parse Sylph output here. The cache
-        # manager already owns the downstream reference preparation contract.
         accessions_file = sample_scratch / "accessions.txt"
+        if not accessions_file.exists() and accessions_dir is not None:
+            source = _find_sample_accessions_file(accessions_dir, run_id)
+            if source is not None:
+                shutil.copy2(source, accessions_file)
+                logger.emit(sample=run_id, step="sylph", status="using-accessions-file", file=source)
+        sylph_output = sample_scratch / f"{run_id}.sylph.tsv"
+        if not accessions_file.exists():
+            if sylph_db is None:
+                raise FileNotFoundError(
+                    f"sample={run_id} step=sylph missing accession list and no Sylph database was provided. "
+                    "Pass --sylph-db so MetaTrawl can run `sylph profile`, or pass --accessions-dir as a manual override."
+                )
+            logger.emit(sample=run_id, step="sylph", status="start", syldb=sylph_db)
+            _run_sylph_profile(
+                sylph_db=sylph_db,
+                sample_scratch=sample_scratch,
+                run_id=run_id,
+                threads=threads,
+                output_file=sylph_output,
+            )
+            accessions = extract_accessions_from_sylph_table(sylph_output)
+            if not accessions:
+                raise ValueError(f"sample={run_id} step=sylph produced no nonzero genome accessions: {sylph_output}")
+            _write_accessions_file(accessions_file, accessions)
+            logger.emit(sample=run_id, step="sylph", status="done", genomes=len(accessions), output=sylph_output)
+            if output_dir is not None:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                published_sylph = output_dir / f"{run_id}.sylph.tsv"
+                shutil.copy2(sylph_output, published_sylph)
+                logger.emit(sample=run_id, step="sylph", status="published", file=published_sylph)
         if not accessions_file.exists():
             raise FileNotFoundError(
-                f"sample={run_id} step=sylph expected accession file after Sylph scan: {accessions_file}"
+                f"sample={run_id} step=sylph missing accession list. "
+                f"Expected scratch file: {accessions_file}"
             )
         accessions = cache.read_accessions_file(accessions_file)
         reference = cache_manager.prepare_reference(
@@ -379,6 +429,107 @@ def _run(cmd: list[str], *, sample: str, step: str) -> None:
         raise RuntimeError(
             f"sample={sample} step={step} command failed: {' '.join(cmd)}\n{exc.stderr}"
         ) from exc
+
+
+def _run_sylph_profile(*, sylph_db: Path, sample_scratch: Path, run_id: str, threads: int, output_file: Path) -> None:
+    fastqs = sorted(sample_scratch.glob("*.fastq")) + sorted(sample_scratch.glob("*.fq"))
+    fastqs += sorted(sample_scratch.glob("*.fastq.gz")) + sorted(sample_scratch.glob("*.fq.gz"))
+    if not fastqs:
+        raise FileNotFoundError(f"sample={run_id} step=sylph found no FASTQ files in {sample_scratch}")
+    if len(fastqs) == 2:
+        cmd = ["sylph", "profile", str(sylph_db), "-1", str(fastqs[0]), "-2", str(fastqs[1]), "-t", str(threads)]
+    else:
+        cmd = ["sylph", "profile", str(sylph_db), "-U", *[str(path) for path in fastqs], "-t", str(threads)]
+    try:
+        with output_file.open("w") as handle:
+            subprocess.run(cmd, check=True, stdout=handle, stderr=subprocess.PIPE, text=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"sample={run_id} step=sylph command failed: {' '.join(cmd)}\n{exc.stderr}") from exc
+
+
+def extract_accessions_from_sylph_table(sylph_output: Path) -> list[str]:
+    table = _read_sylph_table(sylph_output)
+    if table.is_empty():
+        return []
+    genome_col = _first_matching_column(table.columns, SYLPH_GENOME_COLUMNS)
+    if genome_col is None:
+        raise ValueError(
+            f"step=sylph could not find a genome column in {sylph_output}. "
+            f"Expected one of: {', '.join(SYLPH_GENOME_COLUMNS)}"
+        )
+    table = _filter_nonzero_abundance_rows(table)
+    if table.is_empty():
+        return []
+    accessions = (
+        table.select(
+            pl.col(genome_col)
+            .cast(pl.Utf8)
+            .str.extract(ACCESSION_PATTERN.pattern, 1)
+            .str.to_uppercase()
+            .alias("accession")
+        )
+        .drop_nulls("accession")
+        .unique()
+        .sort("accession")
+        .get_column("accession")
+        .to_list()
+    )
+    return [str(accession) for accession in accessions]
+
+
+def _read_sylph_table(path: Path) -> pl.DataFrame:
+    suffix = path.suffix.lower()
+    if suffix == ".parquet":
+        return pl.read_parquet(path)
+    if suffix in {".tsv", ".txt"}:
+        return pl.read_csv(path, separator="\t")
+    return pl.read_csv(path)
+
+
+def _filter_nonzero_abundance_rows(table: pl.DataFrame) -> pl.DataFrame:
+    numeric_cols = [
+        name
+        for name, dtype in table.schema.items()
+        if dtype.is_numeric()
+    ]
+    if not numeric_cols:
+        return table
+    preferred = _first_matching_column(numeric_cols, SYLPH_ABUNDANCE_COLUMNS)
+    if preferred is not None:
+        cols_to_check = [preferred]
+    else:
+        abundance_like = [name for name in numeric_cols if ("abund" in name.lower()) or ("cov" in name.lower())]
+        cols_to_check = abundance_like if abundance_like else numeric_cols
+    return table.filter(
+        pl.any_horizontal([pl.col(name).cast(pl.Float64, strict=False).fill_null(0.0) > 0.0 for name in cols_to_check])
+    )
+
+
+def _write_accessions_file(path: Path, accessions: list[str]) -> None:
+    path.write_text("".join(f"{accession}\n" for accession in accessions))
+
+
+def _first_matching_column(columns: list[str], preferred: list[str]) -> str | None:
+    by_lower = {column.lower(): column for column in columns}
+    for name in preferred:
+        match = by_lower.get(name.lower())
+        if match is not None:
+            return match
+    return None
+
+
+def _find_sample_accessions_file(accessions_dir: Path, run_id: str) -> Path | None:
+    return _optional_existing_path(
+        Path(accessions_dir),
+        [
+            f"{run_id}.accessions.txt",
+            f"{run_id}.accessions.csv",
+            f"{run_id}.txt",
+            f"{run_id}.csv",
+            f"{run_id}/accessions.txt",
+            f"{run_id}/accessions.csv",
+        ],
+    )
 
 
 def _first_existing_path(output_dir: Path, names: list[str], *, required_name: str, run_id: str) -> Path:

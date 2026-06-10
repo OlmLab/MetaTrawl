@@ -70,9 +70,26 @@ metatrawl sync \
   --db metatrawl.duckdb \
   --cache-dir cache \
   --scratch-dir scratch \
+  --sylph-db gtdb-r220-c200-dbv1.syldb \
   --output-dir outputs \
   --threads 16
 ```
+
+MetaTrawl runs `sylph profile` for each sample, saves the abundance table as
+`SRR000001.sylph.tsv`, extracts nonzero `GCF_...`/`GCA_...` accessions from it,
+and asks the shared cache to prepare those genomes.
+
+`--accessions-dir` is still available as a manual override. It should contain
+one accession list per run, produced by Sylph or another genome preselection
+step:
+
+```text
+accessions/SRR000001.accessions.txt
+accessions/SRR000002.accessions.csv
+```
+
+Each file can be a plain one-accession-per-line text file or a CSV with an
+`accession` column.
 
 `sync` expects per-run outputs in `--output-dir` using these conventional names:
 
