@@ -506,6 +506,55 @@ def test_alignment_and_profile_stage_publishes_outputs(tmp_path: Path, monkeypat
     assert (tmp_path / "outputs" / "SRR1.gene_stats.parquet").read_text() == "gene"
 
 
+def test_alignment_profile_builds_null_model_when_prepare_does_not(tmp_path: Path, monkeypatch) -> None:
+    sample_scratch = tmp_path / "scratch" / "SRR1"
+    sample_scratch.mkdir(parents=True)
+    (sample_scratch / "SRR1.fastq").write_text("@r1\nACGT\n+\n!!!!\n")
+    reference_dir = sample_scratch / "reference"
+    reference_dir.mkdir()
+    reference = cache.PreparedReference(
+        reference_fasta=reference_dir / "reference.fna",
+        gene_fasta=reference_dir / "genes.fna",
+        stb_file=reference_dir / "reference.stb",
+    )
+    reference.reference_fasta.write_text(">contig\nACGT\n")
+    reference.gene_fasta.write_text(">gene\nAC\n")
+    reference.stb_file.write_text("contig\tGCF_1\n")
+    run_calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], *, sample: str, step: str) -> None:
+        run_calls.append(cmd)
+        if cmd[:3] == ["zipstrain", "utilities", "prepare_profiling"]:
+            output_dir = Path(cmd[cmd.index("--output-dir") + 1])
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "genomes_bed_file.bed").write_text("contig\t1\t4\n")
+            (output_dir / "gene_range_table.tsv").write_text("gene\tcontig\t1\t2\n")
+        if cmd[:3] == ["zipstrain", "utilities", "build-null-model"]:
+            Path(cmd[cmd.index("--output-file") + 1]).write_text("null")
+        if cmd[:3] == ["zipstrain", "utilities", "profile-single"]:
+            output_dir = Path(cmd[cmd.index("--output-dir") + 1])
+            (output_dir / "SRR1_profile.parquet").write_text("profile")
+            (output_dir / "SRR1_genome_stats.parquet").write_text("genome")
+            (output_dir / "SRR1_gene_stats.parquet").write_text("gene")
+
+    monkeypatch.setattr(workflows, "_run", fake_run)
+    monkeypatch.setattr(workflows, "_run_alignment_shell", lambda **kwargs: None)
+
+    workflows._run_alignment_and_profile(
+        run_id="SRR1",
+        sample_scratch=sample_scratch,
+        reference=reference,
+        output_dir=tmp_path / "outputs",
+        threads=1,
+        logger=WorkflowLogger(),
+    )
+
+    assert any(call[:3] == ["zipstrain", "utilities", "build-null-model"] for call in run_calls)
+    profile_call = next(call for call in run_calls if call[:3] == ["zipstrain", "utilities", "profile-single"])
+    assert (sample_scratch / "zipstrain_profile" / "null_model.parquet").exists()
+    assert profile_call[profile_call.index("--null-model") + 1].endswith("null_model.parquet")
+
+
 def test_sylph_single_end_reads_are_positional_not_dash_u(tmp_path: Path, monkeypatch) -> None:
     sample_scratch = tmp_path / "scratch" / "SRR1"
     sample_scratch.mkdir(parents=True)

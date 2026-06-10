@@ -475,6 +475,7 @@ def _run_alignment_and_profile(
         sample=run_id,
         step="prepare-profile",
     )
+    _ensure_null_model(profile_work=profile_work, run_id=run_id, logger=logger)
     logger.emit(sample=run_id, step="prepare-profile", status="done")
 
     logger.emit(sample=run_id, step="bowtie2-build", status="start")
@@ -528,6 +529,26 @@ def _sample_fastqs(sample_scratch: Path) -> list[Path]:
     if not fastqs:
         raise FileNotFoundError(f"step=align found no FASTQ files in {sample_scratch}")
     return fastqs
+
+
+def _ensure_null_model(*, profile_work: Path, run_id: str, logger: WorkflowLogger) -> Path:
+    null_model = profile_work / "null_model.parquet"
+    if null_model.exists():
+        return null_model
+    logger.emit(sample=run_id, step="null-model", status="start", output=null_model)
+    _run(
+        [
+            "zipstrain",
+            "utilities",
+            "build-null-model",
+            "--output-file",
+            str(null_model),
+        ],
+        sample=run_id,
+        step="null-model",
+    )
+    logger.emit(sample=run_id, step="null-model", status="done", output=null_model)
+    return null_model
 
 
 def _build_alignment_command(*, reference_fasta: Path, fastqs: list[Path], threads: int, bam_file: Path) -> str:
