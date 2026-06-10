@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import importlib
 from importlib import metadata
 import shutil
+import subprocess
 from typing import Callable
 
 from rich.console import Console
@@ -39,11 +40,29 @@ REQUIRED_PACKAGES = (("torch", "torch"), ("h5py", "h5py"))
 
 
 def probe_executable(command: str) -> tuple[bool, str]:
-    """Return whether an executable is present in PATH."""
+    """Return whether an executable is present and runnable."""
     path = shutil.which(command)
     if path is None:
         return False, "not found in PATH"
-    return True, path
+    try:
+        result = subprocess.run(
+            [path, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except OSError as exc:
+        return False, f"found at {path}, but cannot execute it: {exc}"
+    except subprocess.TimeoutExpired:
+        return False, f"found at {path}, but `{command} --version` timed out"
+    detail = path
+    output = (result.stdout or result.stderr).strip().splitlines()
+    if output:
+        detail = f"{path} ({output[0][:120]})"
+    if result.returncode != 0:
+        return False, f"found at {path}, but `{command} --version` failed with exit code {result.returncode}"
+    return True, detail
 
 
 def probe_package(import_name: str, package_name: str | None = None) -> tuple[bool, str]:

@@ -1,5 +1,5 @@
-from click.testing import CliRunner
 import pytest
+from click.testing import CliRunner
 
 from metatrawl import cli
 from metatrawl import healthcheck
@@ -79,3 +79,18 @@ def test_metatrawl_check_fails_when_dependency_missing(monkeypatch):
     assert result.exit_code != 0
     assert "MetaTrawl health check" in result.output
     assert "Missing required MetaTrawl dependencies" in result.output
+
+
+def test_probe_executable_reports_exec_format_errors(monkeypatch):
+    monkeypatch.setattr(healthcheck.shutil, "which", lambda command: f"/usr/local/bin/{command}")
+
+    def fake_run(*args, **kwargs):
+        raise OSError(8, "Exec format error")
+
+    monkeypatch.setattr(healthcheck.subprocess, "run", fake_run)
+
+    ok, detail = healthcheck.probe_executable("datasets")
+
+    assert ok is False
+    assert "cannot execute" in detail
+    assert "Exec format error" in detail

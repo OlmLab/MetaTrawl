@@ -11,6 +11,7 @@ import types
 from click.testing import CliRunner
 import duckdb
 import polars as pl
+import pytest
 
 from metatrawl import cache
 from metatrawl import cli
@@ -258,6 +259,20 @@ def test_cache_prepare_reuses_cached_genome_and_gene_fasta(tmp_path: Path) -> No
     assert result.exit_code == 0, result.output
     assert ">g1" in (tmp_path / "ref" / "reference.fna").read_text()
     assert ">gene1" in (tmp_path / "ref" / "genes.fna").read_text()
+
+
+def test_datasets_exec_format_error_is_actionable(tmp_path: Path, monkeypatch) -> None:
+    def fake_run(*args, **kwargs):
+        raise OSError(8, "Exec format error")
+
+    monkeypatch.setattr(cache.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        cache.download_genome_with_datasets("GCF_1", tmp_path / "GCF_1.fna")
+
+    assert "NCBI Datasets CLI" in str(exc_info.value)
+    assert "wrong OS/CPU architecture" in str(exc_info.value)
+    assert "datasets --version" in str(exc_info.value)
 
 
 def test_duplicate_accession_requests_share_one_preparation_job(tmp_path: Path) -> None:

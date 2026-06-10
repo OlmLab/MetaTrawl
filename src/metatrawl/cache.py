@@ -140,12 +140,20 @@ def download_genome_with_datasets(accession: str, output_fasta: Path) -> None:
     archive = output_fasta.with_suffix(".zip")
     tmp_dir = output_fasta.parent / f"{output_fasta.stem}.datasets"
     try:
-        subprocess.run(
-            ["datasets", "download", "genome", "accession", accession, "--filename", str(archive)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            subprocess.run(
+                ["datasets", "download", "genome", "accession", accession, "--filename", str(archive)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                "Failed to execute NCBI Datasets CLI command `datasets`. "
+                "This usually means the `datasets` binary on PATH is for the wrong OS/CPU architecture, "
+                "is corrupted, or is not a real executable. Reinstall the NCBI Datasets CLI binary for "
+                "your platform and confirm `datasets --version` works."
+            ) from exc
         shutil.unpack_archive(str(archive), str(tmp_dir))
         fasta_files = sorted(tmp_dir.rglob("*.fna"))
         if not fasta_files:
