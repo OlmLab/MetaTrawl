@@ -495,6 +495,9 @@ def test_alignment_and_profile_stage_publishes_outputs(tmp_path: Path, monkeypat
     )
 
     assert any(call[:2] == ["bowtie2-build", "--threads"] for call in run_calls)
+    profile_calls = [call for call in run_calls if call[:3] == ["zipstrain", "utilities", "profile-single"]]
+    assert profile_calls
+    assert "--profiling-contract" not in profile_calls[0]
     assert shell_calls
     assert "bowtie2 -x" in shell_calls[0]
     assert "samtools sort" in shell_calls[0]

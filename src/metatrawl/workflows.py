@@ -510,8 +510,6 @@ def _run_alignment_and_profile(
             str(profile_work / "null_model.parquet"),
             "--gene-range-table",
             str(profile_work / "gene_range_table.tsv"),
-            "--profiling-contract",
-            str(profile_work / "profiling_contract.json"),
             "--max-concurrency",
             str(threads),
             "--output-dir",
