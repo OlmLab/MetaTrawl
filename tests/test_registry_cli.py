@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 import types
+import zipfile
 
 from click.testing import CliRunner
 import duckdb
@@ -426,6 +427,99 @@ def test_datasets_exec_format_error_is_actionable(tmp_path: Path, monkeypatch) -
     assert "NCBI Datasets CLI" in str(exc_info.value)
     assert "wrong OS/CPU architecture" in str(exc_info.value)
     assert "datasets --version" in str(exc_info.value)
+
+
+def test_datasets_retries_transient_failure_then_downloads_fasta(tmp_path: Path, monkeypatch) -> None:
+    calls = 0
+
+    def fake_run(cmd, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise subprocess.CalledProcessError(
+                1,
+                cmd,
+                stderr="connection reset by peer",
+            )
+        archive = Path(cmd[cmd.index("--filename") + 1])
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr("ncbi_dataset/data/GCF_1/GCF_1_genomic.fna", ">contig\nACGT\n")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cache.subprocess, "run", fake_run)
+
+    output = tmp_path / "GCF_1.fna"
+    cache.download_genome_with_datasets("GCF_1", output, retry_delays=(0, 0))
+
+    assert calls == 3
+    assert output.read_text() == ">contig\nACGT\n"
+
+
+def test_datasets_does_not_retry_permanent_accession_failure(tmp_path: Path, monkeypatch) -> None:
+    calls = 0
+
+    def fake_run(cmd, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise subprocess.CalledProcessError(
+            1,
+            cmd,
+            stderr="assembly accession not found",
+        )
+
+    monkeypatch.setattr(cache.subprocess, "run", fake_run)
+
+    with pytest.raises(cache.GenomeUnavailableError, match="not found"):
+        cache.download_genome_with_datasets(
+            "GCA_902373375.1",
+            tmp_path / "genome.fna",
+            retry_delays=(0, 0, 0),
+        )
+
+    assert calls == 1
+
+
+def test_datasets_retries_ambiguous_empty_archives(tmp_path: Path, monkeypatch) -> None:
+    calls = 0
+
+    def fake_run(cmd, **kwargs):
+        nonlocal calls
+        calls += 1
+        archive = Path(cmd[cmd.index("--filename") + 1])
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr("README.md", "No genome payload")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cache.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="after 3 attempts"):
+        cache.download_genome_with_datasets(
+            "GCA_UNKNOWN",
+            tmp_path / "genome.fna",
+            retry_delays=(0, 0),
+        )
+
+    assert calls == 3
+
+
+def test_datasets_accepts_compressed_genome_fasta(tmp_path: Path, monkeypatch) -> None:
+    import gzip
+
+    def fake_run(cmd, **kwargs):
+        archive = Path(cmd[cmd.index("--filename") + 1])
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr(
+                "ncbi_dataset/data/GCF_1/GCF_1_genomic.fna.gz",
+                gzip.compress(b">contig\nACGT\n"),
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cache.subprocess, "run", fake_run)
+
+    output = tmp_path / "GCF_1.fna"
+    cache.download_genome_with_datasets("GCF_1", output, retry_delays=())
+
+    assert output.read_text() == ">contig\nACGT\n"
 
 
 def test_duplicate_accession_requests_share_one_preparation_job(tmp_path: Path) -> None:

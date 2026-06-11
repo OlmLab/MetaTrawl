@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+import gzip
 from pathlib import Path
 import shutil
 import subprocess
 import threading
+import time
 from typing import Callable
 
 import polars as pl
@@ -17,6 +19,22 @@ from metatrawl.logging import WorkflowLogger
 
 Downloader = Callable[[str, Path], None]
 ProdigalRunner = Callable[[Path, Path], None]
+
+DATASETS_RETRY_DELAYS = (5.0, 20.0, 60.0)
+DATASETS_PERMANENT_FAILURE_MARKERS = (
+    "not found",
+    "invalid accession",
+    "invalid assembly",
+    "suppressed",
+    "withdrawn",
+    "no assemblies found",
+    "no genome found",
+    "does not exist",
+)
+
+
+class GenomeUnavailableError(RuntimeError):
+    """NCBI does not provide a genome FASTA for the requested accession."""
 
 
 @dataclass(frozen=True)
@@ -218,15 +236,35 @@ def read_accessions_file(accessions_file: Path) -> list[str]:
     return [line.strip().split()[0] for line in path.read_text().splitlines() if line.strip()]
 
 
-def download_genome_with_datasets(accession: str, output_fasta: Path) -> None:
-    """Download a genome FASTA with NCBI datasets CLI when available."""
+def download_genome_with_datasets(
+    accession: str,
+    output_fasta: Path,
+    *,
+    retry_delays: tuple[float, ...] = DATASETS_RETRY_DELAYS,
+) -> None:
+    """Download a genome FASTA, retrying transient NCBI or network failures."""
     output_fasta.parent.mkdir(parents=True, exist_ok=True)
     archive = output_fasta.with_suffix(".zip")
     tmp_dir = output_fasta.parent / f"{output_fasta.stem}.datasets"
-    try:
+    attempts = len(retry_delays) + 1
+    last_error = ""
+    for attempt in range(1, attempts + 1):
+        _remove_datasets_download_artifacts(archive, tmp_dir)
+        if output_fasta.exists():
+            output_fasta.unlink()
         try:
-            subprocess.run(
-                ["datasets", "download", "genome", "accession", accession, "--filename", str(archive)],
+            result = subprocess.run(
+                [
+                    "datasets",
+                    "download",
+                    "genome",
+                    "accession",
+                    accession,
+                    "--include",
+                    "genome",
+                    "--filename",
+                    str(archive),
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -238,16 +276,82 @@ def download_genome_with_datasets(accession: str, output_fasta: Path) -> None:
                 "is corrupted, or is not a real executable. Reinstall the NCBI Datasets CLI binary for "
                 "your platform and confirm `datasets --version` works."
             ) from exc
-        shutil.unpack_archive(str(archive), str(tmp_dir))
-        fasta_files = sorted(tmp_dir.rglob("*.fna"))
-        if not fasta_files:
-            raise RuntimeError(f"datasets did not produce a FASTA for accession {accession}")
-        shutil.copy2(fasta_files[0], output_fasta)
-    finally:
-        if archive.exists():
-            archive.unlink()
-        if tmp_dir.exists():
-            shutil.rmtree(tmp_dir)
+        except subprocess.CalledProcessError as exc:
+            last_error = _subprocess_detail(exc)
+            if _is_permanent_datasets_failure(last_error):
+                _remove_datasets_download_artifacts(archive, tmp_dir)
+                raise GenomeUnavailableError(
+                    f"NCBI Datasets cannot provide accession {accession}: {last_error}"
+                ) from exc
+            if attempt < attempts:
+                time.sleep(retry_delays[attempt - 1])
+                continue
+            _remove_datasets_download_artifacts(archive, tmp_dir)
+            raise RuntimeError(
+                f"NCBI Datasets download failed for accession {accession} after {attempts} attempts. "
+                f"Last error: {last_error or 'unknown transient failure'}"
+            ) from exc
+
+        try:
+            if not archive.is_file():
+                raise ValueError("datasets command completed without creating an archive")
+            shutil.unpack_archive(str(archive), str(tmp_dir))
+            fasta_files = sorted(tmp_dir.rglob("*.fna"))
+            compressed_fasta_files = sorted(tmp_dir.rglob("*.fna.gz"))
+            if fasta_files:
+                shutil.copy2(fasta_files[0], output_fasta)
+            elif compressed_fasta_files:
+                with gzip.open(compressed_fasta_files[0], "rb") as source, output_fasta.open("wb") as destination:
+                    shutil.copyfileobj(source, destination)
+            else:
+                detail = _command_output(result)
+                if _is_permanent_datasets_failure(detail):
+                    raise GenomeUnavailableError(
+                        f"NCBI Datasets has no genome FASTA for accession {accession}: "
+                        f"{detail or 'assembly unavailable'}"
+                    )
+                raise ValueError("downloaded archive contained no genome FASTA")
+        except GenomeUnavailableError:
+            _remove_datasets_download_artifacts(archive, tmp_dir)
+            raise
+        except (OSError, shutil.ReadError, ValueError) as exc:
+            last_error = str(exc)
+            if attempt < attempts:
+                time.sleep(retry_delays[attempt - 1])
+                continue
+            _remove_datasets_download_artifacts(archive, tmp_dir)
+            raise RuntimeError(
+                f"NCBI Datasets produced no usable FASTA for accession {accession} "
+                f"after {attempts} attempts. Last error: {last_error}"
+            ) from exc
+        else:
+            _remove_datasets_download_artifacts(archive, tmp_dir)
+            return
+
+
+def _remove_datasets_download_artifacts(archive: Path, tmp_dir: Path) -> None:
+    if archive.exists():
+        archive.unlink()
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+
+
+def _command_output(result: subprocess.CompletedProcess[str]) -> str:
+    return "\n".join(part.strip() for part in (result.stderr, result.stdout) if part and part.strip())
+
+
+def _subprocess_detail(exc: subprocess.CalledProcessError) -> str:
+    detail = "\n".join(
+        part.strip()
+        for part in (getattr(exc, "stderr", None), getattr(exc, "stdout", None))
+        if part and part.strip()
+    )
+    return detail or f"datasets exited with status {exc.returncode}"
+
+
+def _is_permanent_datasets_failure(detail: str) -> bool:
+    normalized = detail.lower()
+    return any(marker in normalized for marker in DATASETS_PERMANENT_FAILURE_MARKERS)
 
 
 def run_prodigal_gene_fasta(genome_fasta: Path, output_gene_fasta: Path) -> None:
