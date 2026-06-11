@@ -240,6 +240,10 @@ from metatrawl import open_database
 
 db = open_database("metatrawl.duckdb")
 
+all_genomes = db.genomes().collect()
+all_samples = db.samples().collect()
+matching_genomes = db.genomes(pattern="996").collect()
+
 genome_stats = db.genome("GCF_000001").genome_stats().collect()
 gene_stats = db.genome("GCF_000001").gene_stats().collect()
 

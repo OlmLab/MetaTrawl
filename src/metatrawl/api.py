@@ -26,6 +26,54 @@ class MetaTrawlDatabase:
         """Return a view of all stored data for one sample."""
         return SampleView(self.path, _required_text(sample_id, "sample_id"))
 
+    def genomes(self, pattern: str | None = None) -> Query:
+        """Return distinct genomes, optionally filtered by a regular expression."""
+        condition = ""
+        parameters: tuple[Any, ...] = ()
+        if pattern is not None:
+            condition = "AND regexp_matches(genome, ?)"
+            parameters = (_required_text(pattern, "pattern"),)
+        return Query(
+            self.path,
+            f"""
+            SELECT genome
+            FROM (
+                SELECT genome FROM genome_stats
+                UNION
+                SELECT genome FROM gene_stats WHERE genome IS NOT NULL
+                UNION
+                SELECT genome FROM profile_positions
+                UNION
+                SELECT genome FROM sylph_abundance WHERE genome IS NOT NULL
+            )
+            WHERE genome IS NOT NULL
+              {condition}
+            ORDER BY genome
+            """,
+            parameters,
+        )
+
+    def samples(self, pattern: str | None = None, *, complete_only: bool = True) -> Query:
+        """Return samples, optionally filtered by sample ID regular expression."""
+        conditions: list[str] = []
+        parameters: tuple[Any, ...] = ()
+        if complete_only:
+            conditions.append("status = 'complete'")
+        if pattern is not None:
+            conditions.append("regexp_matches(sample_id, ?)")
+            parameters = (_required_text(pattern, "pattern"),)
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        return Query(
+            self.path,
+            f"""
+            SELECT sample_id, run_id, status, created_at, updated_at
+            FROM samples
+            {where_clause}
+            ORDER BY sample_id
+            """,
+            parameters,
+        )
+
 
 @dataclass(frozen=True)
 class Query:
