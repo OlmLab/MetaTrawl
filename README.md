@@ -117,6 +117,11 @@ metatrawl sync \
   --threads 16
 ```
 
+`sync` checkpoints each sample independently. If one worker fails, completed
+samples are still imported and cleaned, failed runs remain in the pending set,
+and the command exits non-zero with a summary. Rerun the same command to retry
+only incomplete samples.
+
 MetaTrawl runs `sylph profile` for each sample, saves the abundance table as
 `SRR000001.sylph.tsv`, extracts nonzero `GCF_...`/`GCA_...` accessions from it,
 and asks the shared cache to prepare those genomes. It then runs

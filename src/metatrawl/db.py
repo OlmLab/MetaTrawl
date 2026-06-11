@@ -253,6 +253,14 @@ def remaining_runs(conn: duckdb.DuckDBPyConnection) -> list[str]:
     return [str(row[0]) for row in rows]
 
 
+def mark_run_failed(conn: duckdb.DuckDBPyConnection, *, run_id: str, error: str) -> None:
+    """Mark a run as failed while leaving it eligible for the next sync."""
+    conn.execute(
+        "UPDATE sra_runs SET status = 'failed', updated_at = ? WHERE run_id = ?",
+        [time.time(), run_id],
+    )
+
+
 def import_profile_bundle(
     conn: duckdb.DuckDBPyConnection,
     bundle: ProfileBundle,

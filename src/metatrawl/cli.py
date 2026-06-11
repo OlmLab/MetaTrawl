@@ -326,8 +326,14 @@ def sync(
         raise click.ClickException(str(exc)) from exc
     click.echo(
         f"sync requested={summary.requested} imported={summary.imported} "
-        f"skipped={summary.skipped} cleaned_files={summary.cleaned_files}"
+        f"skipped={summary.skipped} failed={summary.failed} "
+        f"cleaned_files={summary.cleaned_files}"
     )
+    if summary.failed or summary.skipped:
+        raise click.ClickException(
+            "Sync completed with failures. Successful samples were checkpointed; "
+            "rerun the same command to retry remaining samples."
+        )
 
 
 @cli.group("matrix")

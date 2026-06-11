@@ -31,6 +31,7 @@ class SyncSummary:
     requested: int
     imported: int
     skipped: int
+    failed: int
     cleaned_files: int
 
 
@@ -190,7 +191,8 @@ def profile_sra_runs(
     accessions_dir: Path | None = None,
     threads: int = 8,
     logger: WorkflowLogger | None = None,
-) -> None:
+    raise_on_error: bool = True,
+) -> dict[str, str]:
     """Download/profile SRA runs, import outputs, and delete per-sample scratch.
 
     This is intentionally conservative: it wires the lifecycle and cleanup, while
@@ -202,7 +204,7 @@ def profile_sra_runs(
     max_workers = max(1, min(len(run_ids), threads))
     logger.emit(step="profile-sra", status="start", samples=len(run_ids), workers=max_workers, db=db_file)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
+        futures = {
             executor.submit(
                 _profile_one_sra_run,
                 run_id=run_id,
@@ -213,12 +215,28 @@ def profile_sra_runs(
                 accessions_dir=Path(accessions_dir) if accessions_dir is not None else None,
                 threads=max(1, threads // max_workers),
                 logger=logger,
-            )
+            ): run_id
             for run_id in run_ids
-        ]
+        }
+        failures: dict[str, str] = {}
         for future in as_completed(futures):
-            future.result()
-    logger.emit(step="profile-sra", status="done", samples=len(run_ids))
+            run_id = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                failures[run_id] = str(exc)
+                logger.emit(sample=run_id, step="profile-sra", status="failed", error=exc)
+    logger.emit(
+        step="profile-sra",
+        status="done",
+        samples=len(run_ids),
+        completed=len(run_ids) - len(failures),
+        failed=len(failures),
+    )
+    if failures and raise_on_error:
+        details = "; ".join(f"{run_id}: {error}" for run_id, error in sorted(failures.items()))
+        raise RuntimeError(f"{len(failures)} sample profiling job(s) failed: {details}")
+    return failures
 
 
 def sync_remaining_profiles(
@@ -246,10 +264,10 @@ def sync_remaining_profiles(
 
     if not run_ids:
         logger.emit(step="sync", status="done", remaining=0, imported=0)
-        return SyncSummary(requested=0, imported=0, skipped=0, cleaned_files=0)
+        return SyncSummary(requested=0, imported=0, skipped=0, failed=0, cleaned_files=0)
 
     logger.emit(step="sync", status="start", remaining=len(run_ids), output_dir=output_dir)
-    profile_sra_runs(
+    failures = profile_sra_runs(
         run_ids=run_ids,
         db_file=db_file,
         cache_dir=cache_dir,
@@ -259,7 +277,9 @@ def sync_remaining_profiles(
         accessions_dir=accessions_dir,
         threads=threads,
         logger=logger,
+        raise_on_error=False,
     )
+    failures = failures or {}
 
     imported = 0
     skipped = 0
@@ -271,7 +291,8 @@ def sync_remaining_profiles(
             except FileNotFoundError as exc:
                 skipped += 1
                 logger.emit(sample=run_id, step="import", status="missing-output", error=exc)
-                raise
+                db.mark_run_failed(conn, run_id=run_id, error=failures.get(run_id, str(exc)))
+                continue
             logger.emit(sample=run_id, step="import", status="start")
             db.import_profile_bundle(conn, bundle)
             imported += 1
@@ -281,8 +302,23 @@ def sync_remaining_profiles(
                 cleaned_files += removed
                 logger.emit(sample=run_id, step="cleanup", status="done", removed_files=removed)
 
-    logger.emit(step="sync", status="done", remaining=len(run_ids), imported=imported, skipped=skipped, cleaned_files=cleaned_files)
-    return SyncSummary(requested=len(run_ids), imported=imported, skipped=skipped, cleaned_files=cleaned_files)
+    failed = len(failures)
+    logger.emit(
+        step="sync",
+        status="done",
+        remaining=len(run_ids),
+        imported=imported,
+        skipped=skipped,
+        failed=failed,
+        cleaned_files=cleaned_files,
+    )
+    return SyncSummary(
+        requested=len(run_ids),
+        imported=imported,
+        skipped=skipped,
+        failed=failed,
+        cleaned_files=cleaned_files,
+    )
 
 
 def discover_profile_bundle(*, output_dir: Path, run_id: str) -> db.ProfileBundle:

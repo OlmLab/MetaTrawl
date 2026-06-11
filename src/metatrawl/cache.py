@@ -21,6 +21,7 @@ Downloader = Callable[[str, Path], None]
 ProdigalRunner = Callable[[Path, Path], None]
 
 DATASETS_RETRY_DELAYS = (5.0, 20.0, 60.0)
+PRODIGAL_RETRY_DELAYS = (2.0, 10.0)
 DATASETS_PERMANENT_FAILURE_MARKERS = (
     "not found",
     "invalid accession",
@@ -79,6 +80,7 @@ class GenomeCache:
         self.logger = logger or WorkflowLogger()
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._lock = threading.Lock()
+        self._prodigal_lock = threading.Lock()
         self._in_flight: dict[str, Future[tuple[Path, Path]]] = {}
 
     def prepare_accession(self, accession: str) -> tuple[Path, Path]:
@@ -166,7 +168,9 @@ class GenomeCache:
         if not gene_fasta.exists():
             self.logger.emit(accession=accession, step="prodigal", status="start")
             tmp_gene = gene_fasta.with_suffix(".tmp.fna")
-            self.prodigal_runner(genome_fasta, tmp_gene)
+            # Keep downloads concurrent, but avoid simultaneous Prodigal model training.
+            with self._prodigal_lock:
+                self.prodigal_runner(genome_fasta, tmp_gene)
             _atomic_publish(tmp_gene, gene_fasta)
             self.logger.emit(accession=accession, step="prodigal", status="done", file=gene_fasta)
         return genome_fasta, gene_fasta
@@ -380,15 +384,34 @@ def _is_permanent_datasets_failure(detail: str) -> bool:
     return any(marker in normalized for marker in DATASETS_PERMANENT_FAILURE_MARKERS)
 
 
-def run_prodigal_gene_fasta(genome_fasta: Path, output_gene_fasta: Path) -> None:
-    """Run Prodigal and keep only nucleotide gene FASTA output."""
+def run_prodigal_gene_fasta(
+    genome_fasta: Path,
+    output_gene_fasta: Path,
+    *,
+    retry_delays: tuple[float, ...] = PRODIGAL_RETRY_DELAYS,
+) -> None:
+    """Annotate one assembled genome, retrying transient process crashes."""
     output_gene_fasta.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["prodigal", "-i", str(genome_fasta), "-d", str(output_gene_fasta), "-p", "meta", "-q"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    command = ["prodigal", "-i", str(genome_fasta), "-d", str(output_gene_fasta), "-p", "single", "-q"]
+    attempts = len(retry_delays) + 1
+    for attempt in range(1, attempts + 1):
+        if output_gene_fasta.exists():
+            output_gene_fasta.unlink()
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            return
+        except OSError:
+            raise
+        except subprocess.CalledProcessError as exc:
+            if attempt < attempts:
+                time.sleep(retry_delays[attempt - 1])
+                continue
+            detail = _subprocess_detail(exc)
+            signal_detail = f" signal={-exc.returncode}" if exc.returncode < 0 else ""
+            raise RuntimeError(
+                f"Prodigal failed for {genome_fasta} after {attempts} attempts;"
+                f"{signal_detail} last_error={detail}"
+            ) from exc
 
 
 def _concatenate_fastas(inputs: list[Path], output: Path) -> None:

@@ -597,8 +597,31 @@ def test_prodigal_runner_only_requests_nucleotide_gene_fasta(tmp_path: Path, mon
     assert calls
     assert "-d" in calls[0]
     assert "-a" not in calls[0]
+    assert calls[0][calls[0].index("-p") + 1] == "single"
     assert (tmp_path / "genes.fna").exists()
     assert not (tmp_path / "genes.faa").exists()
+
+
+def test_prodigal_retries_signal_crash(tmp_path: Path, monkeypatch) -> None:
+    calls = 0
+
+    def fake_run(cmd, check, capture_output, text):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise subprocess.CalledProcessError(-11, cmd, stderr="segmentation fault")
+        Path(cmd[cmd.index("-d") + 1]).write_text(">gene\nACGT\n")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(cache.subprocess, "run", fake_run)
+
+    cache.run_prodigal_gene_fasta(
+        tmp_path / "genome.fna",
+        tmp_path / "genes.fna",
+        retry_delays=(0,),
+    )
+
+    assert calls == 2
 
 
 def test_profile_sra_deletes_temporary_reference_files_after_success(tmp_path: Path, monkeypatch) -> None:
@@ -947,6 +970,53 @@ def test_sync_can_keep_profile_outputs_for_debugging(tmp_path: Path, monkeypatch
     assert (output_dir / "SRR1.genome_stats.parquet").exists()
     assert (output_dir / "SRR1.gene_stats.parquet").exists()
     assert (output_dir / "SRR1.sylph.csv").exists()
+
+
+def test_sync_checkpoints_successful_samples_before_reporting_failures(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    output_dir = tmp_path / "outputs"
+    assert runner.invoke(
+        cli.cli,
+        ["runs", "add", "--db", str(db_file), "SRR_GOOD", "SRR_BAD"],
+    ).exit_code == 0
+
+    def fake_profile_sra_runs(**kwargs):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        bundle = _write_bundle_files(output_dir, "SRR_GOOD")
+        bundle.profile_file.rename(output_dir / "SRR_GOOD.profile.parquet")
+        return {"SRR_BAD": "prodigal crashed"}
+
+    monkeypatch.setattr(workflows, "profile_sra_runs", fake_profile_sra_runs)
+
+    result = runner.invoke(
+        cli.cli,
+        [
+            "sync",
+            "--db",
+            str(db_file),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--scratch-dir",
+            str(tmp_path / "scratch"),
+            "--output-dir",
+            str(output_dir),
+            "--skip-dependency-check",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "imported=1" in result.output
+    assert "failed=1" in result.output
+    assert "Successful samples were checkpointed" in result.output
+    with registry.connect(db_file) as conn:
+        assert conn.execute(
+            "SELECT status FROM sra_runs WHERE run_id = 'SRR_GOOD'"
+        ).fetchone() == ("complete",)
+        assert conn.execute(
+            "SELECT status FROM sra_runs WHERE run_id = 'SRR_BAD'"
+        ).fetchone() == ("failed",)
+        assert registry.remaining_runs(conn) == ["SRR_BAD"]
 
 
 def test_matrix_build_filters_samples_exports_selected_and_passes_sparse(tmp_path: Path, monkeypatch) -> None:
