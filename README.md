@@ -1,14 +1,56 @@
 # MetaTrawl
 
-MetaTrawl is a mutable DuckDB project store for SRA-scale ZipStrain projects.
-It tracks run IDs, imports completed ZipStrain/Sylph outputs into real database
-tables, coordinates shared genome cache preparation, and builds ZipStrain matrix
-stores from selected samples.
+<p align="center">
+  <img src="metatrawl-concept.svg" alt="MetaTrawl gathers bacterial chromosomes from large metagenomic collections and organizes them for strain-level comparison" width="100%">
+</p>
 
-The core idea is simple: many SRA workers can run in parallel, but one cache
-owner prepares genome and Prodigal outputs for shared accessions. Workers create
-per-sample concatenated references in scratch space, profile the sample, import
-the final tables into DuckDB, and then delete scratch files.
+MetaTrawl streamlines [ZipStrain](https://github.com/parsaghadermarzi/ZipStrain)
+for very large-scale, strain-level analysis of metagenomic samples. It turns a
+collection of SRA run IDs into a durable, queryable project database and
+coordinates the expensive steps needed to profile and compare thousands of
+samples efficiently.
+
+MetaTrawl is not a replacement for ZipStrain. It is the orchestration and data
+management layer around it. ZipStrain performs strain profiling and matrix
+comparison; MetaTrawl manages the samples, reference cache, parallel profiling,
+stored outputs, matrix membership, and incremental analysis.
+
+## Why MetaTrawl?
+
+Running a strain-level workflow over a few samples is straightforward. Running
+the same workflow over thousands of metagenomes introduces a different set of
+problems:
+
+- Which SRA runs have already been processed?
+- How can workers share downloaded genomes and Prodigal annotations safely?
+- How can temporary reads, alignments, and per-sample references be removed
+  without losing the durable results?
+- How can samples be selected for a genome-specific matrix using coverage,
+  breadth, BER, or Sylph abundance?
+- How can newly added samples be appended without rebuilding matrices or
+  recomputing completed sample pairs?
+- How can profile, genome, gene, and abundance data be queried without managing
+  thousands of loose files?
+
+MetaTrawl addresses these problems with a mutable DuckDB project store and an
+incremental workflow:
+
+1. Register SRA runs.
+2. Download and screen reads with Sylph.
+3. Reuse a shared genome and Prodigal cache.
+4. Align reads and profile samples with ZipStrain.
+5. Import profile positions, genome statistics, gene statistics, and Sylph
+   abundance into DuckDB.
+6. Build genome-specific dense or sparse ZipStrain matrices from eligible
+   samples.
+7. Run resumable strain-level comparisons and compute only newly introduced
+   sample pairs.
+
+Many SRA workers can profile samples concurrently while sharing one prepared
+reference cache. Per-sample reads, alignments, concatenated references, and
+intermediate outputs live in scratch space and are deleted after successful
+import. The DuckDB database, genome cache, matrix stores, and comparison
+databases remain durable.
 
 ## Install For Development
 

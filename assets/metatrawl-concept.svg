@@ -1,0 +1,179 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 900" role="img" aria-labelledby="title desc">
+  <title id="title">MetaTrawl genomic collection concept</title>
+  <desc id="desc">Circular bacterial chromosomes drift through an ocean, are gathered by a trawl-like mesh, and resolve into a phylogenetic tree.</desc>
+  <defs>
+    <radialGradient id="paper" cx="50%" cy="45%" r="75%">
+      <stop offset="0" stop-color="#fffdf7"/>
+      <stop offset="1" stop-color="#f8f4e9"/>
+    </radialGradient>
+    <filter id="softGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="10"/>
+    </filter>
+    <g id="chromosome">
+      <circle r="22" fill="none" stroke="#80aca2" stroke-width="4"/>
+      <path d="M-15.7-15.4A22 22 0 0 1-4.5-21.5" fill="none" stroke="#005b6b" stroke-width="4.5" stroke-linecap="round"/>
+      <path d="M15.9-15.1A22 22 0 0 1 21-6.3" fill="none" stroke="#e7653e" stroke-width="4.5" stroke-linecap="round"/>
+    </g>
+    <g id="chromosome-faint">
+      <circle r="18" fill="none" stroke="#9fc1b8" stroke-width="3"/>
+      <path d="M-12.7-12.7A18 18 0 0 1-3.8-17.6" fill="none" stroke="#4c9696" stroke-width="3.5" stroke-linecap="round"/>
+    </g>
+    <g id="chromosome-leaf">
+      <circle r="21" fill="#fffdf7" stroke="#80aca2" stroke-width="4"/>
+      <path d="M-14.8-14.7A21 21 0 0 1-4-20.6" fill="none" stroke="#005b6b" stroke-width="4.5" stroke-linecap="round"/>
+      <path d="M15-14.6A21 21 0 0 1 20.2-5.8" fill="none" stroke="#e7653e" stroke-width="4.5" stroke-linecap="round"/>
+    </g>
+    <clipPath id="netArea">
+      <path d="M462 70C645 250 1010 310 1325 382C1220 488 1195 687 1014 769C824 855 603 792 478 720C747 820 972 763 1104 637C1190 554 1232 450 1325 382C1030 411 783 430 653 555C568 637 604 717 478 720C590 647 496 506 517 383C535 278 491 169 462 70Z"/>
+    </clipPath>
+  </defs>
+
+  <rect width="1800" height="900" fill="url(#paper)"/>
+  <ellipse cx="650" cy="470" rx="660" ry="340" fill="#8ab8ae" opacity=".035" filter="url(#softGlow)"/>
+
+  <!-- Ocean of circular chromosomes -->
+  <g opacity=".95">
+    <use href="#chromosome" transform="translate(126 97) scale(.82) rotate(-15)"/>
+    <use href="#chromosome-faint" transform="translate(227 95) scale(.62)"/>
+    <use href="#chromosome" transform="translate(316 150) scale(1.12) rotate(20)"/>
+    <use href="#chromosome-faint" transform="translate(387 96) scale(.74)"/>
+    <use href="#chromosome-faint" transform="translate(61 170) scale(.55)"/>
+    <use href="#chromosome" transform="translate(181 184) scale(.75) rotate(8)"/>
+    <use href="#chromosome-faint" transform="translate(422 183) scale(.82)"/>
+    <use href="#chromosome" transform="translate(499 225) scale(.95) rotate(-22)"/>
+    <use href="#chromosome-faint" transform="translate(98 228) scale(.7)"/>
+    <use href="#chromosome" transform="translate(250 286) scale(1.2) rotate(13)"/>
+    <use href="#chromosome-faint" transform="translate(349 256) scale(.75)"/>
+    <use href="#chromosome" transform="translate(439 238) scale(.8) rotate(-8)"/>
+    <use href="#chromosome-faint" transform="translate(52 355) scale(.88)"/>
+    <use href="#chromosome-faint" transform="translate(114 352) scale(.62)"/>
+    <use href="#chromosome" transform="translate(307 370) scale(.86) rotate(17)"/>
+    <use href="#chromosome" transform="translate(523 364) scale(1.02) rotate(-18)"/>
+    <use href="#chromosome-faint" transform="translate(177 342) scale(.55)"/>
+    <use href="#chromosome" transform="translate(126 464) scale(1.1) rotate(9)"/>
+    <use href="#chromosome" transform="translate(284 470) scale(.82) rotate(-22)"/>
+    <use href="#chromosome-faint" transform="translate(438 452) scale(1.0)"/>
+    <use href="#chromosome" transform="translate(578 461) scale(.92) rotate(18)"/>
+    <use href="#chromosome-faint" transform="translate(207 536) scale(.68)"/>
+    <use href="#chromosome" transform="translate(370 523) scale(.82) rotate(-12)"/>
+    <use href="#chromosome" transform="translate(474 562) scale(1.08) rotate(23)"/>
+    <use href="#chromosome-faint" transform="translate(80 570) scale(.58)"/>
+    <use href="#chromosome-faint" transform="translate(171 637) scale(.9)"/>
+    <use href="#chromosome" transform="translate(283 650) scale(1.06) rotate(-10)"/>
+    <use href="#chromosome-faint" transform="translate(397 622) scale(.7)"/>
+    <use href="#chromosome" transform="translate(614 610) scale(.98) rotate(15)"/>
+    <use href="#chromosome-faint" transform="translate(99 705) scale(.92)"/>
+    <use href="#chromosome-faint" transform="translate(299 730) scale(.7)"/>
+    <use href="#chromosome" transform="translate(492 715) scale(.78) rotate(-25)"/>
+    <use href="#chromosome-faint" transform="translate(682 711) scale(.55)"/>
+    <use href="#chromosome-faint" transform="translate(352 784) scale(.55)"/>
+    <use href="#chromosome-faint" transform="translate(552 777) scale(.74)"/>
+    <use href="#chromosome-faint" transform="translate(706 668) scale(.48)"/>
+    <use href="#chromosome-faint" transform="translate(548 298) scale(.62)"/>
+    <use href="#chromosome-faint" transform="translate(658 344) scale(.52)"/>
+    <use href="#chromosome-faint" transform="translate(709 511) scale(.55)"/>
+  </g>
+
+  <!-- Trawl outline -->
+  <path d="M462 70C645 250 1010 310 1325 382" fill="none" stroke="#005b6b" stroke-width="3.2" stroke-linecap="round"/>
+  <path d="M478 720C747 820 972 763 1104 637C1190 554 1232 450 1325 382" fill="none" stroke="#005b6b" stroke-width="5.2" stroke-linecap="round"/>
+  <path d="M1325 382C1220 488 1195 687 1014 769C824 855 603 792 478 720" fill="none" stroke="#005b6b" stroke-width="1.2" opacity=".55"/>
+
+  <!-- Net knots -->
+  <g fill="#005b6b">
+    <circle cx="538" cy="134" r="5"/><circle cx="611" cy="174" r="5"/>
+    <circle cx="684" cy="207" r="5"/><circle cx="756" cy="237" r="5"/>
+    <circle cx="822" cy="263" r="5"/><circle cx="883" cy="285" r="5"/>
+    <circle cx="941" cy="303" r="5"/><circle cx="994" cy="320" r="4.5"/>
+    <circle cx="1042" cy="334" r="4.5"/><circle cx="1088" cy="346" r="4"/>
+    <circle cx="1130" cy="356" r="4"/><circle cx="1170" cy="364" r="3.8"/>
+  </g>
+
+  <!-- Net mesh -->
+  <g clip-path="url(#netArea)" fill="none" stroke="#76a9a4" stroke-width="1.2" opacity=".42">
+    <path d="M538 134C650 318 760 555 604 753"/>
+    <path d="M611 174C722 346 809 592 675 785"/>
+    <path d="M684 207C784 366 867 616 742 801"/>
+    <path d="M756 237C846 386 922 631 812 807"/>
+    <path d="M822 263C905 401 976 642 879 799"/>
+    <path d="M883 285C959 413 1029 642 946 780"/>
+    <path d="M941 303C1011 422 1077 631 1008 752"/>
+    <path d="M994 320C1058 429 1121 609 1065 714"/>
+    <path d="M1042 334C1102 434 1161 581 1118 668"/>
+    <path d="M1088 346C1144 438 1197 548 1167 617"/>
+    <path d="M1130 356C1183 441 1228 516 1212 563"/>
+    <path d="M1170 364C1218 442 1257 484 1252 514"/>
+
+    <path d="M504 215C720 304 1014 362 1305 390"/>
+    <path d="M512 285C724 351 1010 394 1286 411"/>
+    <path d="M517 350C734 396 1006 426 1269 435"/>
+    <path d="M519 414C740 441 1004 458 1251 463"/>
+    <path d="M524 476C751 481 999 491 1234 495"/>
+    <path d="M535 536C762 522 995 526 1216 532"/>
+    <path d="M550 594C773 562 988 563 1197 575"/>
+    <path d="M568 650C784 602 979 603 1173 625"/>
+    <path d="M590 701C793 647 963 650 1141 680"/>
+    <path d="M622 746C806 692 944 704 1096 733"/>
+  </g>
+
+  <!-- Chromosomes collected in the net -->
+  <g>
+    <use href="#chromosome" transform="translate(785 386) scale(.92) rotate(-15)"/>
+    <use href="#chromosome" transform="translate(866 410) scale(1.05) rotate(12)"/>
+    <use href="#chromosome-faint" transform="translate(1003 410) scale(.92)"/>
+    <use href="#chromosome" transform="translate(838 474) scale(1.18) rotate(-20)"/>
+    <use href="#chromosome" transform="translate(936 474) scale(.96) rotate(10)"/>
+    <use href="#chromosome" transform="translate(1034 466) scale(1.04) rotate(18)"/>
+    <use href="#chromosome-faint" transform="translate(1127 444) scale(.82)"/>
+    <use href="#chromosome" transform="translate(901 536) scale(.98) rotate(-8)"/>
+    <use href="#chromosome" transform="translate(1000 535) scale(.96) rotate(16)"/>
+    <use href="#chromosome" transform="translate(1096 520) scale(1.02) rotate(-18)"/>
+    <use href="#chromosome-faint" transform="translate(1182 493) scale(.72)"/>
+    <use href="#chromosome" transform="translate(856 592) scale(.92) rotate(19)"/>
+    <use href="#chromosome" transform="translate(953 602) scale(1.08) rotate(-12)"/>
+    <use href="#chromosome" transform="translate(1053 584) scale(.92) rotate(8)"/>
+    <use href="#chromosome" transform="translate(1147 557) scale(.9) rotate(-20)"/>
+    <use href="#chromosome-faint" transform="translate(1212 523) scale(.62)"/>
+    <use href="#chromosome" transform="translate(949 672) scale(1.0) rotate(15)"/>
+    <use href="#chromosome" transform="translate(1044 660) scale(.86) rotate(-8)"/>
+    <use href="#chromosome" transform="translate(1122 626) scale(.95) rotate(21)"/>
+  </g>
+
+  <!-- Phylogenetic tree -->
+  <g fill="none" stroke="#005b6b" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M1325 382C1363 378 1374 343 1390 309"/>
+    <path d="M1390 309C1402 280 1420 274 1450 274"/>
+    <path d="M1450 274C1478 274 1484 247 1494 224"/>
+    <path d="M1494 224C1503 204 1514 196 1534 196H1642"/>
+    <path d="M1494 224C1506 244 1518 254 1542 254H1625"/>
+    <path d="M1450 274C1468 298 1478 320 1506 322"/>
+    <path d="M1506 322C1526 322 1537 304 1551 292H1673"/>
+    <path d="M1506 322C1522 344 1538 356 1560 356H1646"/>
+
+    <path d="M1325 382C1362 388 1374 428 1392 464"/>
+    <path d="M1392 464C1409 497 1425 505 1458 505"/>
+    <path d="M1458 505C1485 505 1498 480 1512 458"/>
+    <path d="M1512 458C1526 438 1540 430 1563 430H1682"/>
+    <path d="M1512 458C1528 482 1541 492 1566 492H1648"/>
+    <path d="M1458 505C1480 529 1485 555 1516 566"/>
+    <path d="M1516 566C1538 566 1549 548 1564 535H1665"/>
+    <path d="M1516 566C1532 590 1547 603 1572 603H1648"/>
+    <path d="M1516 566C1517 621 1544 648 1583 648"/>
+    <path d="M1583 648C1603 648 1612 631 1624 619H1684"/>
+    <path d="M1583 648C1601 672 1616 684 1640 684H1670"/>
+  </g>
+
+  <!-- Tree leaves -->
+  <g>
+    <use href="#chromosome-leaf" transform="translate(1663 196) rotate(8)"/>
+    <use href="#chromosome-leaf" transform="translate(1646 254) rotate(-14)"/>
+    <use href="#chromosome-leaf" transform="translate(1694 292) rotate(16)"/>
+    <use href="#chromosome-leaf" transform="translate(1667 356) rotate(-9)"/>
+    <use href="#chromosome-leaf" transform="translate(1703 430) rotate(10)"/>
+    <use href="#chromosome-leaf" transform="translate(1669 492) rotate(-17)"/>
+    <use href="#chromosome-leaf" transform="translate(1686 535) rotate(13)"/>
+    <use href="#chromosome-leaf" transform="translate(1669 603) rotate(-8)"/>
+    <use href="#chromosome-leaf" transform="translate(1705 619) rotate(18)"/>
+    <use href="#chromosome-leaf" transform="translate(1691 684) rotate(-14)"/>
+  </g>
+</svg>

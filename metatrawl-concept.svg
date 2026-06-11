@@ -1,0 +1,461 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg width="100%" height="100%" viewBox="0 0 1800 900" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xml:space="preserve" xmlns:serif="http://www.serif.com/" style="fill-rule:evenodd;clip-rule:evenodd;">
+    <rect x="0" y="0" width="1800" height="900" style="fill:url(#_Radial1);"/>
+    <g opacity="0.95">
+        <g id="chromosome" transform="matrix(0.792059,-0.212232,0.212232,0.792059,126,97)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint" transform="matrix(0.62,0,0,0.62,227,95)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome1" serif:id="chromosome" transform="matrix(1.05246,0.383063,-0.383063,1.05246,316,150)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint1" serif:id="chromosome-faint" transform="matrix(0.74,0,0,0.74,387,96)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint2" serif:id="chromosome-faint" transform="matrix(0.55,0,0,0.55,61,170)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome2" serif:id="chromosome" transform="matrix(0.742701,0.10438,-0.10438,0.742701,181,184)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint3" serif:id="chromosome-faint" transform="matrix(0.82,0,0,0.82,422,183)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome3" serif:id="chromosome" transform="matrix(0.880825,-0.355876,0.355876,0.880825,499,225)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint4" serif:id="chromosome-faint" transform="matrix(0.7,0,0,0.7,98,228)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome4" serif:id="chromosome" transform="matrix(1.16924,0.269941,-0.269941,1.16924,250,286)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint5" serif:id="chromosome-faint" transform="matrix(0.75,0,0,0.75,349,256)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome5" serif:id="chromosome" transform="matrix(0.792214,-0.111338,0.111338,0.792214,439,238)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint6" serif:id="chromosome-faint" transform="matrix(0.88,0,0,0.88,52,355)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint7" serif:id="chromosome-faint" transform="matrix(0.62,0,0,0.62,114,352)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome6" serif:id="chromosome" transform="matrix(0.822422,0.25144,-0.25144,0.822422,307,370)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome7" serif:id="chromosome" transform="matrix(0.970078,-0.315197,0.315197,0.970078,523,364)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint8" serif:id="chromosome-faint" transform="matrix(0.55,0,0,0.55,177,342)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome8" serif:id="chromosome" transform="matrix(1.08646,0.172078,-0.172078,1.08646,126,464)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome9" serif:id="chromosome" transform="matrix(0.760291,-0.307177,0.307177,0.760291,284,470)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint9" serif:id="chromosome-faint" transform="matrix(1,0,0,1,438,452)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome10" serif:id="chromosome" transform="matrix(0.874972,0.284296,-0.284296,0.874972,578,461)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint10" serif:id="chromosome-faint" transform="matrix(0.68,0,0,0.68,207,536)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome11" serif:id="chromosome" transform="matrix(0.802081,-0.170488,0.170488,0.802081,370,523)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome12" serif:id="chromosome" transform="matrix(0.994145,0.42199,-0.42199,0.994145,474,562)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint11" serif:id="chromosome-faint" transform="matrix(0.58,0,0,0.58,80,570)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint12" serif:id="chromosome-faint" transform="matrix(0.9,0,0,0.9,171,637)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome13" serif:id="chromosome" transform="matrix(1.0439,-0.184067,0.184067,1.0439,283,650)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint13" serif:id="chromosome-faint" transform="matrix(0.7,0,0,0.7,397,622)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome14" serif:id="chromosome" transform="matrix(0.946607,0.253643,-0.253643,0.946607,614,610)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint14" serif:id="chromosome-faint" transform="matrix(0.92,0,0,0.92,99,705)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint15" serif:id="chromosome-faint" transform="matrix(0.7,0,0,0.7,299,730)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome15" serif:id="chromosome" transform="matrix(0.70692,-0.329642,0.329642,0.70692,495.162,692.156)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint16" serif:id="chromosome-faint" transform="matrix(0.55,0,0,0.55,682,711)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint17" serif:id="chromosome-faint" transform="matrix(0.55,0,0,0.55,352,784)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint18" serif:id="chromosome-faint" transform="matrix(0.74,0,0,0.74,552,777)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint19" serif:id="chromosome-faint" transform="matrix(0.48,0,0,0.48,706,668)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint20" serif:id="chromosome-faint" transform="matrix(0.62,0,0,0.62,548,298)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint21" serif:id="chromosome-faint" transform="matrix(0.52,0,0,0.52,658,344)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint22" serif:id="chromosome-faint" transform="matrix(0.55,0,0,0.55,709,511)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+    </g>
+    <path d="M462,70C645,250 1010,310 1325,382" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:3.2px;stroke-linecap:round;"/>
+    <path d="M478,720C747,820 972,763 1104,637C1190,554 1232,450 1325,382" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:5.2px;stroke-linecap:round;"/>
+    <path d="M1325,382C1220,488 1195,687 1014,769C824,855 603,792 478,720" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-opacity:0.55;stroke-width:1.2px;"/>
+    <g>
+        <circle cx="538" cy="134" r="5" style="fill:rgb(0,91,107);"/>
+        <circle cx="611" cy="174" r="5" style="fill:rgb(0,91,107);"/>
+        <g transform="matrix(1,0,0,1,0,3)">
+            <circle cx="684" cy="207" r="5" style="fill:rgb(0,91,107);"/>
+        </g>
+        <circle cx="756" cy="237" r="5" style="fill:rgb(0,91,107);"/>
+        <g transform="matrix(1,0,0,1,-1.19746,-2.84722)">
+            <circle cx="822" cy="263" r="5" style="fill:rgb(0,91,107);"/>
+        </g>
+        <g transform="matrix(1,0,0,1,-3.6798,-8.83681)">
+            <circle cx="883" cy="285" r="5" style="fill:rgb(0,91,107);"/>
+        </g>
+        <g transform="matrix(0.980176,0,0,1,18.6546,-9.32715)">
+            <circle cx="941" cy="303" r="5" style="fill:rgb(0,91,107);"/>
+        </g>
+        <g transform="matrix(1,0,0,1,-2.84766,-12.9121)">
+            <circle cx="994" cy="320" r="4.5" style="fill:rgb(0,91,107);"/>
+        </g>
+        <g transform="matrix(1,0,0,1,-4.5,-15.7969)">
+            <circle cx="1042" cy="334" r="4.5" style="fill:rgb(0,91,107);"/>
+        </g>
+        <g transform="matrix(1,0,0,1,-3.49805,-17.2609)">
+            <circle cx="1088" cy="346" r="4" style="fill:rgb(0,91,107);"/>
+        </g>
+        <g transform="matrix(1,0,0,1,-8.94922,-19.2609)">
+            <circle cx="1130" cy="356" r="4" style="fill:rgb(0,91,107);"/>
+        </g>
+        <g transform="matrix(1,0,0,1,-13.9193,-19.4609)">
+            <circle cx="1170" cy="364" r="3.8" style="fill:rgb(0,91,107);"/>
+        </g>
+    </g>
+    <g>
+        <clipPath id="_clip2">
+            <path d="M462,70C645,250 1010,310 1325,382C1220,488 1195,687 1014,769C824,855 603,792 478,720C747,820 972,763 1104,637C1190,554 1232,450 1325,382C1030,411 783,430 653,555C568,637 604,717 478,720C590,647 496,506 517,383C535,278 491,169 462,70Z"/>
+        </clipPath>
+        <g clip-path="url(#_clip2)">
+            <g opacity="0.42">
+                <path d="M538,134C650,318 760,555 604,753" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+                <g transform="matrix(1,0,0,1.01577,0,-2.74367)">
+                    <path d="M611,174C722,346 809,592 675,785" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+                </g>
+                <g transform="matrix(1,0,0,0.999724,0,5.05717)">
+                    <path d="M684,207C784,366 867,616 742,801" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+                </g>
+                <g transform="matrix(1,0,0,1.00624,0,-1.47809)">
+                    <path d="M756,237C846,386 922,631 812,807" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+                </g>
+                <g transform="matrix(0.992031,0,0,1.00874,7.37754,-0.145116)">
+                    <path d="M822,263C905,401 976,642 879,799" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+                </g>
+                <g transform="matrix(1.0192,0,0,1.03411,-18.8848,-13.5577)">
+                    <path d="M883,285C959,413 1029,642 946,780" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+                </g>
+                <g transform="matrix(0.982436,0,0,1.072,18.2174,-26.1426)">
+                    <path d="M941,303C1011,422 1077,631 1008,752" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+                </g>
+                <g transform="matrix(0.933602,0,0,1.09583,63.1521,-39.0768)">
+                    <path d="M994,320C1058,429 1121,609 1065,714" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+                </g>
+                <g transform="matrix(1.0496,0,0,1.1166,-56.1803,-50.2402)">
+                    <path d="M1042,334C1102,434 1161,581 1118,668" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+                </g>
+                <g transform="matrix(1.12,0,0,1.08034,-134.053,-41.0576)">
+                    <path d="M1088,346C1144,438 1197,548 1167,617" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+                </g>
+                <g transform="matrix(1.10494,0,0,1.07372,-127.532,-41.5068)">
+                    <path d="M1130,356C1183,441 1228,516 1212,563" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+                </g>
+                <g transform="matrix(1.18642,0,0,1.38455,-228.236,-155.636)">
+                    <path d="M1170,364C1218,442 1237.5,455.668 1232.5,485.668" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+                </g>
+                <path d="M504,215C720,304 1014,362 1305,390" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+                <path d="M512,285C724,351 1010,394 1286,411" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+                <path d="M517,350C734,396 1006,426 1269,435" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+                <path d="M519,414C740,441 1004,458 1251,463" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+                <g transform="matrix(1,0,0,1,0.931121,21.7941)">
+                    <path d="M524,476C751,481 999,491 1234,495" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+                </g>
+                <g transform="matrix(1,0,0,1,-2.26758,26.752)">
+                    <path d="M535,536C762,522 995,526 1216,532" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+                </g>
+                <g transform="matrix(1,0,0,1,-14.2969,44.8684)">
+                    <path d="M550,594C773,562 988,563 1197,575" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+                </g>
+                <path d="M590,701C793,647 963,650 1141,680" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+                <path d="M622,746C806,692 944,704 1096,733" style="fill:none;fill-rule:nonzero;stroke:rgb(118,169,164);stroke-width:1.2px;"/>
+            </g>
+        </g>
+    </g>
+    <g>
+        <g id="chromosome16" serif:id="chromosome" transform="matrix(0.888652,-0.238114,0.238114,0.888652,785,386)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome17" serif:id="chromosome" transform="matrix(1.02705,0.218307,-0.218307,1.02705,866,410)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint23" serif:id="chromosome-faint" transform="matrix(0.92,0,0,0.92,1003,410)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome18" serif:id="chromosome" transform="matrix(1.10884,-0.403584,0.403584,1.10884,838,474)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome19" serif:id="chromosome" transform="matrix(0.945415,0.166702,-0.166702,0.945415,936,474)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome20" serif:id="chromosome" transform="matrix(0.989099,0.321378,-0.321378,0.989099,1034,466)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint24" serif:id="chromosome-faint" transform="matrix(0.82,0,0,0.82,1127,444)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint25" serif:id="chromosome-faint" transform="matrix(0.498955,0,0,0.498955,1135.22,264.242)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome21" serif:id="chromosome" transform="matrix(0.970463,-0.13639,0.13639,0.970463,901,536)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome22" serif:id="chromosome" transform="matrix(0.922811,0.264612,-0.264612,0.922811,1000,535)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome23" serif:id="chromosome" transform="matrix(0.970078,-0.315197,0.315197,0.970078,1096,520)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint26" serif:id="chromosome-faint" transform="matrix(0.72,0,0,0.72,1182,493)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome24" serif:id="chromosome" transform="matrix(0.869877,0.299523,-0.299523,0.869877,856,592)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome25" serif:id="chromosome" transform="matrix(1.0564,-0.224545,0.224545,1.0564,953,602)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome26" serif:id="chromosome" transform="matrix(0.911047,0.128039,-0.128039,0.911047,1053,584)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome27" serif:id="chromosome" transform="matrix(-0.502684,-0.746531,0.746531,-0.502684,801.004,546.713)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome28" serif:id="chromosome" transform="matrix(-0.197749,-0.293675,0.293675,-0.197749,1018.03,266.072)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint27" serif:id="chromosome-faint" transform="matrix(0.454585,0.205691,-0.205691,0.454585,952.971,173.03)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome29" serif:id="chromosome" transform="matrix(-0.0590983,-0.34908,0.34908,-0.0590983,845.451,126.388)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-faint28" serif:id="chromosome-faint" transform="matrix(0.62,0,0,0.62,1132.29,486.541)">
+            <circle cx="0" cy="0" r="18" style="fill:none;stroke:rgb(159,193,184);stroke-width:3px;"/>
+            <path d="M-12.7,-12.7C-10.266,-15.154 -7.175,-16.855 -3.8,-17.6" style="fill:none;fill-rule:nonzero;stroke:rgb(76,150,150);stroke-width:3.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome30" serif:id="chromosome" transform="matrix(0.965926,0.258819,-0.258819,0.965926,798.798,674.561)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome31" serif:id="chromosome" transform="matrix(0.851631,-0.119689,0.119689,0.851631,951.205,669.258)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome32" serif:id="chromosome" transform="matrix(0.886901,0.34045,-0.34045,0.886901,1182.7,754.852)">
+            <circle cx="0" cy="0" r="22" style="fill:none;stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-15.7,-15.4C-12.651,-18.494 -8.753,-20.617 -4.5,-21.5" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15.9,-15.1C18.264,-12.605 20.011,-9.591 21,-6.3" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+    </g>
+    <g>
+        <path d="M1325,382C1363,378 1374,343 1390,309" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:3px;stroke-linecap:round;stroke-linejoin:round;"/>
+        <path d="M1390,309C1402,280 1420,274 1450,274" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:3px;stroke-linecap:round;stroke-linejoin:round;"/>
+        <path d="M1450,274C1478,274 1484,247 1494,224" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:3px;stroke-linecap:round;stroke-linejoin:round;"/>
+        <path d="M1494,224C1503,204 1514,196 1534,196L1642,196" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:3px;stroke-linecap:round;stroke-linejoin:round;"/>
+        <path d="M1494,224C1506,244 1518,254 1542,254L1625,254" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:3px;stroke-linecap:round;stroke-linejoin:round;"/>
+        <path d="M1450,274C1468,298 1478,320 1506,322" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:3px;stroke-linecap:round;stroke-linejoin:round;"/>
+        <path d="M1506,322C1526,322 1537,304 1551,292L1673,292" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:3px;stroke-linecap:round;stroke-linejoin:round;"/>
+        <path d="M1506,322C1522,344 1538,356 1560,356L1646,356" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:3px;stroke-linecap:round;stroke-linejoin:round;"/>
+        <path d="M1325,382C1362,388 1374,428 1392,464" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:3px;stroke-linecap:round;stroke-linejoin:round;"/>
+        <path d="M1392,464C1409,497 1425,505 1458,505" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:3px;stroke-linecap:round;stroke-linejoin:round;"/>
+        <path d="M1458,505C1485,505 1498,480 1512,458" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:3px;stroke-linecap:round;stroke-linejoin:round;"/>
+        <path d="M1512,458C1526,438 1540,430 1563,430L1682,430" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:3px;stroke-linecap:round;stroke-linejoin:round;"/>
+        <path d="M1512,458C1528,482 1541,492 1566,492L1648,492" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:3px;stroke-linecap:round;stroke-linejoin:round;"/>
+        <path d="M1458,505C1480,529 1485,555 1516,566" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:3px;stroke-linecap:round;stroke-linejoin:round;"/>
+        <g transform="matrix(1,0,0,0.67754,0,182.513)">
+            <path d="M1516,566C1527.65,558.032 1577.72,537.408 1580.5,535L1665,535" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:3px;stroke-linecap:round;stroke-linejoin:round;"/>
+        </g>
+        <path d="M1516,566C1532,590 1561.16,596.484 1582.43,603L1648,603" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:3px;stroke-linecap:round;stroke-linejoin:round;"/>
+        <path d="M1516,566C1517,621 1502.94,665.161 1541.94,665.161" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:3px;stroke-linecap:round;stroke-linejoin:round;"/>
+        <path d="M1541.94,665.161C1563.62,673.394 1592.17,662.009 1648,666.996C1662.04,668.028 1669.03,665.263 1673.38,666.996" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:3px;stroke-linecap:round;stroke-linejoin:round;"/>
+        <path d="M1541.94,665.161C1559.94,689.161 1594.78,710.992 1618.78,710.992L1659.38,712.976" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:3px;stroke-linecap:round;stroke-linejoin:round;"/>
+    </g>
+    <g>
+        <g id="chromosome-leaf" transform="matrix(0.990268,0.139173,-0.139173,0.990268,1663,196)">
+            <circle cx="0" cy="0" r="21" style="fill:rgb(255,253,247);stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-14.8,-14.7C-11.87,-17.701 -8.108,-19.756 -4,-20.6" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15,-14.6C17.432,-12.14 19.218,-9.117 20.2,-5.8" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-leaf1" serif:id="chromosome-leaf" transform="matrix(0.970296,-0.241922,0.241922,0.970296,1646,254)">
+            <circle cx="0" cy="0" r="21" style="fill:rgb(255,253,247);stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-14.8,-14.7C-11.87,-17.701 -8.108,-19.756 -4,-20.6" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15,-14.6C17.432,-12.14 19.218,-9.117 20.2,-5.8" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-leaf2" serif:id="chromosome-leaf" transform="matrix(0.961262,0.275637,-0.275637,0.961262,1694,292)">
+            <circle cx="0" cy="0" r="21" style="fill:rgb(255,253,247);stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-14.8,-14.7C-11.87,-17.701 -8.108,-19.756 -4,-20.6" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15,-14.6C17.432,-12.14 19.218,-9.117 20.2,-5.8" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-leaf3" serif:id="chromosome-leaf" transform="matrix(0.987688,-0.156434,0.156434,0.987688,1667,356)">
+            <circle cx="0" cy="0" r="21" style="fill:rgb(255,253,247);stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-14.8,-14.7C-11.87,-17.701 -8.108,-19.756 -4,-20.6" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15,-14.6C17.432,-12.14 19.218,-9.117 20.2,-5.8" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-leaf4" serif:id="chromosome-leaf" transform="matrix(0.984808,0.173648,-0.173648,0.984808,1703,430)">
+            <circle cx="0" cy="0" r="21" style="fill:rgb(255,253,247);stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-14.8,-14.7C-11.87,-17.701 -8.108,-19.756 -4,-20.6" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15,-14.6C17.432,-12.14 19.218,-9.117 20.2,-5.8" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-leaf5" serif:id="chromosome-leaf" transform="matrix(0.956305,-0.292372,0.292372,0.956305,1669,492)">
+            <circle cx="0" cy="0" r="21" style="fill:rgb(255,253,247);stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-14.8,-14.7C-11.87,-17.701 -8.108,-19.756 -4,-20.6" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15,-14.6C17.432,-12.14 19.218,-9.117 20.2,-5.8" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-leaf6" serif:id="chromosome-leaf" transform="matrix(0.97437,0.224951,-0.224951,0.97437,1686,544.996)">
+            <circle cx="0" cy="0" r="21" style="fill:rgb(255,253,247);stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-14.8,-14.7C-11.87,-17.701 -8.108,-19.756 -4,-20.6" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15,-14.6C17.432,-12.14 19.218,-9.117 20.2,-5.8" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-leaf7" serif:id="chromosome-leaf" transform="matrix(0.990268,-0.139173,0.139173,0.990268,1669,603)">
+            <circle cx="0" cy="0" r="21" style="fill:rgb(255,253,247);stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-14.8,-14.7C-11.87,-17.701 -8.108,-19.756 -4,-20.6" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15,-14.6C17.432,-12.14 19.218,-9.117 20.2,-5.8" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-leaf8" serif:id="chromosome-leaf" transform="matrix(0.951057,0.309017,-0.309017,0.951057,1694.38,666.996)">
+            <circle cx="0" cy="0" r="21" style="fill:rgb(255,253,247);stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-14.8,-14.7C-11.87,-17.701 -8.108,-19.756 -4,-20.6" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15,-14.6C17.432,-12.14 19.218,-9.117 20.2,-5.8" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+        <g id="chromosome-leaf9" serif:id="chromosome-leaf" transform="matrix(0.970296,-0.241922,0.241922,0.970296,1680.38,712.976)">
+            <circle cx="0" cy="0" r="21" style="fill:rgb(255,253,247);stroke:rgb(128,172,162);stroke-width:4px;"/>
+            <path d="M-14.8,-14.7C-11.87,-17.701 -8.108,-19.756 -4,-20.6" style="fill:none;fill-rule:nonzero;stroke:rgb(0,91,107);stroke-width:4.5px;stroke-linecap:round;"/>
+            <path d="M15,-14.6C17.432,-12.14 19.218,-9.117 20.2,-5.8" style="fill:none;fill-rule:nonzero;stroke:rgb(231,101,62);stroke-width:4.5px;stroke-linecap:round;"/>
+        </g>
+    </g>
+    <defs>
+        <radialGradient id="_Radial1" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="matrix(1350,0,0,1350,900,405)"><stop offset="0" style="stop-color:rgb(255,253,247);stop-opacity:1"/><stop offset="1" style="stop-color:rgb(248,244,233);stop-opacity:1"/></radialGradient>
+    </defs>
+</svg>
