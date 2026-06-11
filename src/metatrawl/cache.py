@@ -112,14 +112,40 @@ class GenomeCache:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         self.logger.emit(sample=sample, step="cache", status="start", accessions=len(clean_accessions))
-        prepared = [self.prepare_accession(accession) for accession in clean_accessions]
+        prepared: list[tuple[str, Path, Path]] = []
+        unavailable: list[str] = []
+        for accession in clean_accessions:
+            try:
+                genome_fasta, gene_fasta = self.prepare_accession(accession)
+            except GenomeUnavailableError as exc:
+                unavailable.append(accession)
+                self.logger.emit(
+                    sample=sample,
+                    accession=accession,
+                    step="cache",
+                    status="skipped-unavailable",
+                    error=exc,
+                )
+                continue
+            prepared.append((accession, genome_fasta, gene_fasta))
+        if not prepared:
+            raise GenomeUnavailableError(
+                "None of the requested accessions produced a usable genome FASTA: "
+                + ", ".join(unavailable)
+            )
         reference_fasta = output_dir / "reference.fna"
         gene_fasta = output_dir / "genes.fna"
         stb_file = output_dir / "reference.stb"
-        _concatenate_fastas([pair[0] for pair in prepared], reference_fasta)
-        _concatenate_fastas([pair[1] for pair in prepared], gene_fasta)
-        _write_stb_file(list(zip(clean_accessions, [pair[0] for pair in prepared])), stb_file)
-        self.logger.emit(sample=sample, step="cache", status="done", accessions=len(clean_accessions))
+        _concatenate_fastas([item[1] for item in prepared], reference_fasta)
+        _concatenate_fastas([item[2] for item in prepared], gene_fasta)
+        _write_stb_file([(item[0], item[1]) for item in prepared], stb_file)
+        self.logger.emit(
+            sample=sample,
+            step="cache",
+            status="done",
+            accessions=len(prepared),
+            unavailable=len(unavailable),
+        )
         return PreparedReference(reference_fasta=reference_fasta, gene_fasta=gene_fasta, stb_file=stb_file)
 
     def genome_fasta_path(self, accession: str) -> Path:
@@ -320,9 +346,9 @@ def download_genome_with_datasets(
                 time.sleep(retry_delays[attempt - 1])
                 continue
             _remove_datasets_download_artifacts(archive, tmp_dir)
-            raise RuntimeError(
+            raise GenomeUnavailableError(
                 f"NCBI Datasets produced no usable FASTA for accession {accession} "
-                f"after {attempts} attempts. Last error: {last_error}"
+                f"after {attempts} attempts; skipping this accession. Last error: {last_error}"
             ) from exc
         else:
             _remove_datasets_download_artifacts(archive, tmp_dir)

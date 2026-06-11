@@ -492,7 +492,7 @@ def test_datasets_retries_ambiguous_empty_archives(tmp_path: Path, monkeypatch) 
 
     monkeypatch.setattr(cache.subprocess, "run", fake_run)
 
-    with pytest.raises(RuntimeError, match="after 3 attempts"):
+    with pytest.raises(cache.GenomeUnavailableError, match="after 3 attempts"):
         cache.download_genome_with_datasets(
             "GCA_UNKNOWN",
             tmp_path / "genome.fna",
@@ -500,6 +500,45 @@ def test_datasets_retries_ambiguous_empty_archives(tmp_path: Path, monkeypatch) 
         )
 
     assert calls == 3
+
+
+def test_reference_preparation_skips_unavailable_accessions(tmp_path: Path) -> None:
+    def downloader(accession: str, output: Path) -> None:
+        if accession == "GCA_UNAVAILABLE":
+            raise cache.GenomeUnavailableError("no usable FASTA")
+        output.write_text(f">{accession}_contig\nACGT\n")
+
+    def prodigal(genome: Path, output: Path) -> None:
+        output.write_text(">gene\nACGT\n")
+
+    manager = cache.GenomeCache(
+        tmp_path / "cache",
+        downloader=downloader,
+        prodigal_runner=prodigal,
+    )
+
+    reference = manager.prepare_reference(
+        accessions=["GCA_UNAVAILABLE", "GCF_AVAILABLE"],
+        output_dir=tmp_path / "reference",
+        sample="SRR1",
+    )
+
+    assert reference.reference_fasta.read_text() == ">GCF_AVAILABLE_contig\nACGT\n\n"
+    assert reference.stb_file.read_text() == "GCF_AVAILABLE_contig\tGCF_AVAILABLE\n"
+
+
+def test_reference_preparation_fails_if_every_accession_is_unavailable(tmp_path: Path) -> None:
+    def downloader(accession: str, output: Path) -> None:
+        raise cache.GenomeUnavailableError("no usable FASTA")
+
+    manager = cache.GenomeCache(tmp_path / "cache", downloader=downloader)
+
+    with pytest.raises(cache.GenomeUnavailableError, match="None of the requested accessions"):
+        manager.prepare_reference(
+            accessions=["GCA_1", "GCA_2"],
+            output_dir=tmp_path / "reference",
+            sample="SRR1",
+        )
 
 
 def test_datasets_accepts_compressed_genome_fasta(tmp_path: Path, monkeypatch) -> None:
