@@ -4,10 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 import time
 
 import duckdb
 import polars as pl
+
+
+ACCESSION_PATTERN = re.compile(r"(GC[AF]_\d+(?:\.\d+)?)", re.IGNORECASE)
 
 
 SCHEMA_SQL = """
@@ -43,10 +47,10 @@ CREATE TABLE IF NOT EXISTS profile_positions (
     pos BIGINT NOT NULL,
     genome VARCHAR NOT NULL,
     gene VARCHAR,
-    A DOUBLE NOT NULL,
-    C DOUBLE NOT NULL,
-    G DOUBLE NOT NULL,
-    T DOUBLE NOT NULL
+    A USMALLINT NOT NULL,
+    C USMALLINT NOT NULL,
+    G USMALLINT NOT NULL,
+    T USMALLINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS genome_stats (
@@ -165,6 +169,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("ALTER TABLE matrix_stores ADD COLUMN IF NOT EXISTS min_breadth DOUBLE")
     conn.execute("ALTER TABLE matrix_stores ADD COLUMN IF NOT EXISTS min_ber DOUBLE")
     conn.execute("ALTER TABLE matrix_stores ADD COLUMN IF NOT EXISTS min_sylph_abundance DOUBLE")
+    _migrate_profile_counts_to_uint16(conn)
+    _normalize_existing_sylph_genomes(conn)
     if had_legacy_matrix_profiles:
         conn.execute(
             """
@@ -555,10 +561,10 @@ def _insert_profile_positions(conn: duckdb.DuckDBPyConnection, *, sample_id: str
         pl.col("pos").cast(pl.Int64),
         pl.col("genome").cast(pl.Utf8),
         pl.col("gene").cast(pl.Utf8),
-        pl.col("A").cast(pl.Float64),
-        pl.col("C").cast(pl.Float64),
-        pl.col("G").cast(pl.Float64),
-        pl.col("T").cast(pl.Float64),
+        pl.col("A").cast(pl.UInt16),
+        pl.col("C").cast(pl.UInt16),
+        pl.col("G").cast(pl.UInt16),
+        pl.col("T").cast(pl.UInt16),
     )
     conn.register("_metatrawl_profile_positions", df)
     try:
@@ -609,17 +615,44 @@ def _insert_gene_stats(conn: duckdb.DuckDBPyConnection, *, sample_id: str, stats
 
 def _insert_sylph_abundance(conn: duckdb.DuckDBPyConnection, *, sample_id: str, abundance_file: Path) -> None:
     df = _read_table(abundance_file)
-    genome_col = _first_existing(df, ["genome", "genome_name", "reference", "Genome_file", "name"])
+    semantic_genome_col = _first_existing(df, ["genome", "genome_name"])
+    genome_col = semantic_genome_col or _first_existing(df, ["reference", "Genome_file", "name"])
     accession_col = _first_existing(df, ["accession", "genome", "genome_name", "reference", "Genome_file", "name"])
     abundance_col = _first_existing(df, ["abundance", "relative_abundance", "Taxonomic_abundance", "ANI"])
     if genome_col is None and accession_col is None:
         raise ValueError("sylph_abundance_file missing a genome/accession column")
+    source_col = accession_col or genome_col
+    canonical_accession = (
+        pl.col(source_col)
+        .cast(pl.Utf8)
+        .str.extract(ACCESSION_PATTERN.pattern, 1)
+        .str.to_uppercase()
+    )
+    genome_expr = (
+        pl.col(semantic_genome_col).cast(pl.Utf8)
+        if semantic_genome_col is not None
+        else canonical_accession
+    )
     df = df.select(
         pl.lit(sample_id).alias("sample_id"),
-        (pl.col(genome_col).cast(pl.Utf8) if genome_col else pl.lit(None, dtype=pl.Utf8)).alias("genome"),
-        (pl.col(accession_col).cast(pl.Utf8) if accession_col else pl.lit(None, dtype=pl.Utf8)).alias("accession"),
+        genome_expr.alias("genome"),
+        canonical_accession.alias("accession"),
         (pl.col(abundance_col).cast(pl.Float64) if abundance_col else pl.lit(None, dtype=pl.Float64)).alias("abundance"),
     )
+    if df["accession"].null_count():
+        bad_values = (
+            _read_table(abundance_file)
+            .filter(canonical_accession.is_null())
+            .get_column(source_col)
+            .cast(pl.Utf8)
+            .unique()
+            .head(5)
+            .to_list()
+        )
+        raise ValueError(
+            "sylph_abundance_file contains genome values without a recognizable "
+            f"GCF/GCA accession: {', '.join(bad_values)}"
+        )
     conn.register("_metatrawl_sylph_abundance", df)
     try:
         conn.execute("INSERT INTO sylph_abundance SELECT * FROM _metatrawl_sylph_abundance")
@@ -678,6 +711,49 @@ def _table_exists(conn: duckdb.DuckDBPyConnection, table_name: str) -> bool:
         [table_name],
     ).fetchone()
     return row is not None
+
+
+def _migrate_profile_counts_to_uint16(conn: duckdb.DuckDBPyConnection) -> None:
+    """Convert legacy floating-point profile counts to unsigned 16-bit integers."""
+    column_types = {
+        str(name): str(data_type).upper()
+        for name, data_type in conn.execute(
+            """
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'profile_positions'
+              AND column_name IN ('A', 'C', 'G', 'T')
+            """
+        ).fetchall()
+    }
+    for column in ("A", "C", "G", "T"):
+        if column_types.get(column) != "USMALLINT":
+            conn.execute(
+                f'ALTER TABLE profile_positions ALTER COLUMN "{column}" '
+                f'TYPE USMALLINT USING "{column}"::USMALLINT'
+            )
+
+
+def _normalize_existing_sylph_genomes(conn: duckdb.DuckDBPyConnection) -> None:
+    """Replace legacy Sylph database paths with canonical assembly accessions."""
+    pattern = ACCESSION_PATTERN.pattern.replace("'", "''")
+    conn.execute(
+        f"""
+        UPDATE sylph_abundance
+        SET genome = upper(regexp_extract(genome, '{pattern}', 1))
+        WHERE regexp_extract(genome, '{pattern}', 1) <> ''
+          AND genome <> upper(regexp_extract(genome, '{pattern}', 1))
+        """
+    )
+    conn.execute(
+        f"""
+        UPDATE sylph_abundance
+        SET accession = upper(regexp_extract(accession, '{pattern}', 1))
+        WHERE regexp_extract(accession, '{pattern}', 1) <> ''
+          AND accession <> upper(regexp_extract(accession, '{pattern}', 1))
+        """
+    )
 
 
 def _rows_as_dicts(result) -> list[dict[str, object]]:

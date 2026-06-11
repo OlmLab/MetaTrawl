@@ -169,6 +169,47 @@ def cache_prepare(cache_dir: Path, accessions_file: Path, output_dir: Path) -> N
     click.echo(json.dumps({"reference_fasta": str(prepared.reference_fasta), "gene_fasta": str(prepared.gene_fasta)}))
 
 
+@cache_group.command("build-matrix-files")
+@click.option("--genome-dir", required=True, type=click.Path(path_type=Path), help="Directory containing ACCESSION.fna files.")
+@click.option("--gene-dir", required=True, type=click.Path(path_type=Path), help="Directory containing ACCESSION.genes.fna files.")
+@click.option("--output-dir", required=True, type=click.Path(path_type=Path), help="Directory for generated matrix reference files.")
+@click.option("--genome", help="Build files for one genome accession.")
+@click.option("--accessions", "accessions_file", type=click.Path(path_type=Path), help="Optional accession list; defaults to every cached genome.")
+def cache_build_matrix_files(
+    genome_dir: Path,
+    gene_dir: Path,
+    output_dir: Path,
+    genome: str | None,
+    accessions_file: Path | None,
+) -> None:
+    """Build reusable BED, STB, and gene-range files from cache directories."""
+    if genome is not None and accessions_file is not None:
+        raise click.UsageError("Use either --genome or --accessions, not both.")
+    accessions = cache.read_accessions_file(accessions_file) if accessions_file is not None else None
+    try:
+        files = cache.build_matrix_reference_files(
+            genome_dir=genome_dir,
+            gene_dir=gene_dir,
+            output_dir=output_dir,
+            accessions=accessions,
+            genome=genome,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        json.dumps(
+            {
+                "accessions": len(files.accessions),
+                "reference_fasta": str(files.reference_fasta),
+                "gene_fasta": str(files.gene_fasta),
+                "bed_file": str(files.bed_file),
+                "stb_file": str(files.stb_file),
+                "gene_range_table": str(files.gene_range_table),
+            }
+        )
+    )
+
+
 @cache_group.command("serve")
 @click.option("--cache-dir", required=True, type=click.Path(path_type=Path), help="Shared genome cache directory.")
 @click.option("--host", default="127.0.0.1", show_default=True)

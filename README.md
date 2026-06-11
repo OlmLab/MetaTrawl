@@ -194,6 +194,25 @@ METATRAWL sample=SRR123 step=cleanup status=done removed=scratch/SRR123
 
 ## Matrix Workflow
 
+Build reusable matrix inputs from the genome and Prodigal gene cache:
+
+```bash
+metatrawl cache build-matrix-files \
+  --genome-dir cache/genomes \
+  --gene-dir cache/genes \
+  --output-dir cache/matrix_reference
+```
+
+For one genome only:
+
+```bash
+metatrawl cache build-matrix-files \
+  --genome-dir cache/genomes \
+  --gene-dir cache/genes \
+  --genome GCF_000269965.1 \
+  --output-dir cache/matrix_reference/GCF_000269965.1
+```
+
 Build a ZipStrain matrix from complete DuckDB samples. Thresholds are applied
 before temporary profile parquets are exported:
 
@@ -201,8 +220,9 @@ before temporary profile parquets are exported:
 metatrawl matrix build \
   --db metatrawl.duckdb \
   --genome GCF_000269965.1_ASM26996v1_genomic.fna \
-  --bed-file reference/genomes.bed \
-  --stb-file reference/genomes.stb \
+  --bed-file cache/matrix_reference/genomes_bed_file.bed \
+  --stb-file cache/matrix_reference/reference.stb \
+  --gene-range-table cache/matrix_reference/gene_range_table.tsv \
   --output-file matrices/binfantis.h5 \
   --min-coverage 1 \
   --min-breadth 0.2 \

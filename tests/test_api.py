@@ -71,6 +71,12 @@ def test_sample_view_queries_profiles_genomes_and_genes(tmp_path: Path) -> None:
     profile = sample.profile(genome="genome_1", gene="gene_1").collect()
     assert profile.shape == (2, 9)
     assert profile["pos"].to_list() == [1, 2]
+    assert profile.select("A", "C", "G", "T").schema == {
+        "A": pl.UInt16,
+        "C": pl.UInt16,
+        "G": pl.UInt16,
+        "T": pl.UInt16,
+    }
 
 
 def test_query_lazy_supports_polars_expressions(tmp_path: Path) -> None:
@@ -120,6 +126,68 @@ def test_genome_view_queries_sylph_by_accession(tmp_path: Path) -> None:
     result = open_database(_database(tmp_path)).genome("GCF_1").sylph_abundance().collect()
 
     assert result["sample_id"].to_list() == ["sample_a", "sample_b"]
+
+
+def test_connect_migrates_legacy_float_profile_counts(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy.duckdb"
+    with registry.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE OR REPLACE TABLE profile_positions (
+                sample_id VARCHAR,
+                chrom VARCHAR,
+                pos BIGINT,
+                genome VARCHAR,
+                gene VARCHAR,
+                A DOUBLE,
+                C DOUBLE,
+                G DOUBLE,
+                T DOUBLE
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO profile_positions VALUES ('sample', 'contig', 1, 'genome', 'gene', 5.0, 0.0, 1.0, 2.0)"
+        )
+
+    with registry.connect(db_path) as conn:
+        types = dict(
+            conn.execute(
+                """
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_name = 'profile_positions'
+                  AND column_name IN ('A', 'C', 'G', 'T')
+                """
+            ).fetchall()
+        )
+        values = conn.execute("SELECT A, C, G, T FROM profile_positions").fetchone()
+
+    assert types == {"A": "USMALLINT", "C": "USMALLINT", "G": "USMALLINT", "T": "USMALLINT"}
+    assert values == (5, 0, 1, 2)
+
+
+def test_connect_normalizes_existing_sylph_genome_paths(tmp_path: Path) -> None:
+    db_path = _database(tmp_path)
+    with registry.connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE sylph_abundance
+            SET genome = ?, accession = ?
+            WHERE sample_id = 'sample_a'
+            """,
+            [
+                "gtdb/database/GCF/901/875/305/GCF_901875305.1_genomic.fna.gz",
+                "gtdb/database/GCF/901/875/305/GCF_901875305.1_genomic.fna.gz",
+            ],
+        )
+
+    with registry.connect(db_path) as conn:
+        value = conn.execute(
+            "SELECT genome, accession FROM sylph_abundance WHERE sample_id = 'sample_a'"
+        ).fetchone()
+
+    assert value == ("GCF_901875305.1", "GCF_901875305.1")
 
 
 def test_database_lists_distinct_genomes_and_samples(tmp_path: Path) -> None:

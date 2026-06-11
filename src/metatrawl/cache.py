@@ -28,6 +28,18 @@ class PreparedReference:
     stb_file: Path | None = None
 
 
+@dataclass(frozen=True)
+class MatrixReferenceFiles:
+    """Reusable reference files required to build ZipStrain matrices."""
+
+    reference_fasta: Path
+    gene_fasta: Path
+    bed_file: Path
+    stb_file: Path
+    gene_range_table: Path
+    accessions: tuple[str, ...]
+
+
 class GenomeCache:
     """Single-process authoritative writer for genome/prodigal cache files."""
 
@@ -127,6 +139,75 @@ def prepare_cache_reference(
     return GenomeCache(cache_dir, logger=logger).prepare_reference(accessions=accessions, output_dir=output_dir)
 
 
+def build_matrix_reference_files(
+    *,
+    genome_dir: Path,
+    gene_dir: Path,
+    output_dir: Path,
+    accessions: list[str] | None = None,
+    genome: str | None = None,
+    max_bed_interval: int = 500_000,
+) -> MatrixReferenceFiles:
+    """Build matrix BED/STB/gene-range inputs from cached FASTA directories."""
+    genome_dir = Path(genome_dir)
+    gene_dir = Path(gene_dir)
+    output_dir = Path(output_dir)
+    if not genome_dir.is_dir():
+        raise FileNotFoundError(f"Genome directory does not exist: {genome_dir}")
+    if not gene_dir.is_dir():
+        raise FileNotFoundError(f"Gene directory does not exist: {gene_dir}")
+    if max_bed_interval <= 0:
+        raise ValueError("max_bed_interval must be greater than zero")
+    if genome is not None and accessions is not None:
+        raise ValueError("Use either genome or accessions, not both")
+
+    genome_files = {
+        path.name.removesuffix(".fna"): path
+        for path in sorted(genome_dir.glob("*.fna"))
+        if not path.name.endswith(".genes.fna")
+    }
+    gene_files = {
+        path.name.removesuffix(".genes.fna"): path
+        for path in sorted(gene_dir.glob("*.genes.fna"))
+    }
+    if genome is not None:
+        selected = _dedupe([genome])
+    else:
+        selected = _dedupe(accessions) if accessions is not None else sorted(genome_files)
+    if not selected:
+        raise ValueError(f"No genome FASTA files found in: {genome_dir}")
+
+    missing_genomes = [accession for accession in selected if accession not in genome_files]
+    missing_genes = [accession for accession in selected if accession not in gene_files]
+    if missing_genomes:
+        raise FileNotFoundError("Missing genome FASTA for: " + ", ".join(missing_genomes))
+    if missing_genes:
+        raise FileNotFoundError("Missing Prodigal gene FASTA for: " + ", ".join(missing_genes))
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    reference_fasta = output_dir / "reference.fna"
+    gene_fasta = output_dir / "genes.fna"
+    bed_file = output_dir / "genomes_bed_file.bed"
+    stb_file = output_dir / "reference.stb"
+    gene_range_table = output_dir / "gene_range_table.tsv"
+
+    selected_genomes = [genome_files[accession] for accession in selected]
+    selected_genes = [gene_files[accession] for accession in selected]
+    _concatenate_fastas(selected_genomes, reference_fasta)
+    _concatenate_fastas(selected_genes, gene_fasta)
+    _write_stb_file(list(zip(selected, selected_genomes)), stb_file)
+    _write_bed_file(selected_genomes, bed_file, max_interval=max_bed_interval)
+    _write_gene_range_table(selected_genes, gene_range_table)
+    return MatrixReferenceFiles(
+        reference_fasta=reference_fasta,
+        gene_fasta=gene_fasta,
+        bed_file=bed_file,
+        stb_file=stb_file,
+        gene_range_table=gene_range_table,
+        accessions=tuple(selected),
+    )
+
+
 def read_accessions_file(accessions_file: Path) -> list[str]:
     """Read accessions from a one-column CSV/TSV/text file."""
     path = Path(accessions_file)
@@ -198,6 +279,53 @@ def _write_stb_file(accession_fastas: list[tuple[str, Path]], output: Path) -> N
             for scaffold in _fasta_headers(fasta):
                 handle.write(f"{scaffold}\t{accession}\n")
     _atomic_publish(tmp, output)
+
+
+def _write_bed_file(inputs: list[Path], output: Path, *, max_interval: int) -> None:
+    tmp = output.with_suffix(output.suffix + ".tmp")
+    with tmp.open("w") as handle:
+        for fasta in inputs:
+            for scaffold, length in _fasta_lengths(fasta):
+                for start in range(0, length, max_interval):
+                    handle.write(f"{scaffold}\t{start}\t{min(start + max_interval, length)}\n")
+    _atomic_publish(tmp, output)
+
+
+def _write_gene_range_table(inputs: list[Path], output: Path) -> None:
+    tmp = output.with_suffix(output.suffix + ".tmp")
+    with tmp.open("w") as handle:
+        for fasta in inputs:
+            with fasta.open() as fasta_handle:
+                for line in fasta_handle:
+                    if not line.startswith(">"):
+                        continue
+                    parts = line[1:].strip().split()
+                    if len(parts) < 5 or parts[1] != "#" or parts[3] != "#":
+                        raise ValueError(f"Invalid Prodigal gene FASTA header in {fasta}: {line.strip()}")
+                    gene = parts[0]
+                    scaffold_parts = gene.rsplit("_", 1)
+                    if len(scaffold_parts) != 2:
+                        raise ValueError(f"Cannot infer scaffold from Prodigal gene ID: {gene}")
+                    handle.write(f"{gene}\t{scaffold_parts[0]}\t{int(parts[2])}\t{int(parts[4])}\n")
+    _atomic_publish(tmp, output)
+
+
+def _fasta_lengths(fasta: Path) -> list[tuple[str, int]]:
+    records: list[tuple[str, int]] = []
+    scaffold: str | None = None
+    length = 0
+    with Path(fasta).open() as handle:
+        for line in handle:
+            if line.startswith(">"):
+                if scaffold is not None:
+                    records.append((scaffold, length))
+                scaffold = line[1:].strip().split()[0]
+                length = 0
+            else:
+                length += len(line.strip())
+    if scaffold is not None:
+        records.append((scaffold, length))
+    return records
 
 
 def _fasta_headers(fasta: Path) -> list[str]:

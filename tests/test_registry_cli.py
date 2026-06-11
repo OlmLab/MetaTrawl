@@ -184,6 +184,43 @@ def test_profiles_import_stores_profile_stats_gene_and_abundance_tables(tmp_path
         assert conn.execute("SELECT gene FROM gene_stats WHERE sample_id = 'SRR1'").fetchone() == ("gene1",)
         assert conn.execute("SELECT accession, abundance FROM sylph_abundance WHERE sample_id = 'SRR1'").fetchone() == ("GCF_1", 0.1)
         assert conn.execute("SELECT status FROM samples WHERE sample_id = 'SRR1'").fetchone() == ("complete",)
+        count_types = dict(
+            conn.execute(
+                """
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_name = 'profile_positions'
+                  AND column_name IN ('A', 'C', 'G', 'T')
+                """
+            ).fetchall()
+        )
+        assert count_types == {
+            "A": "USMALLINT",
+            "C": "USMALLINT",
+            "G": "USMALLINT",
+            "T": "USMALLINT",
+        }
+
+
+def test_profiles_import_normalizes_sylph_genome_paths(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    bundle = _write_bundle_files(tmp_path, "SRR1")
+    pl.DataFrame(
+        {
+            "Genome_file": [
+                "gtdb_genomes_reps_r232/database/GCF/901/875/305/GCF_901875305.1_genomic.fna.gz"
+            ],
+            "Taxonomic_abundance": [1.5],
+        }
+    ).write_csv(bundle.sylph_abundance_file)
+
+    _import_bundle(runner, db_file, bundle, add_run=True)
+
+    with duckdb.connect(str(db_file)) as conn:
+        assert conn.execute(
+            "SELECT genome, accession FROM sylph_abundance WHERE sample_id = 'SRR1'"
+        ).fetchone() == ("GCF_901875305.1", "GCF_901875305.1")
 
 
 def test_profiles_remaining_after_duckdb_import(tmp_path: Path) -> None:
@@ -260,6 +297,121 @@ def test_cache_prepare_reuses_cached_genome_and_gene_fasta(tmp_path: Path) -> No
     assert ">g1" in (tmp_path / "ref" / "reference.fna").read_text()
     assert ">gene1" in (tmp_path / "ref" / "genes.fna").read_text()
     assert (tmp_path / "ref" / "reference.stb").read_text() == "g1\tGCF_1\n"
+
+
+def test_build_matrix_reference_files_from_genome_and_gene_directories(tmp_path: Path) -> None:
+    genomes = tmp_path / "genomes"
+    genes = tmp_path / "genes"
+    genomes.mkdir()
+    genes.mkdir()
+    (genomes / "GCF_1.fna").write_text(">contig_1\nACGTAC\n")
+    (genomes / "GCF_2.fna").write_text(">contig_2\nAAAA\n")
+    (genes / "GCF_1.genes.fna").write_text(">contig_1_1 # 2 # 5 # 1 # ID=1\nCGTA\n")
+    (genes / "GCF_2.genes.fna").write_text(">contig_2_1 # 1 # 3 # 1 # ID=1\nAAA\n")
+
+    files = cache.build_matrix_reference_files(
+        genome_dir=genomes,
+        gene_dir=genes,
+        output_dir=tmp_path / "matrix_reference",
+        accessions=["GCF_2"],
+    )
+
+    assert files.accessions == ("GCF_2",)
+    assert files.reference_fasta.read_text().startswith(">contig_2")
+    assert files.stb_file.read_text() == "contig_2\tGCF_2\n"
+    assert files.bed_file.read_text() == "contig_2\t0\t4\n"
+    assert files.gene_range_table.read_text() == "contig_2_1\tcontig_2\t1\t3\n"
+
+
+def test_cache_build_matrix_files_cli_uses_all_cached_accessions(tmp_path: Path) -> None:
+    genomes = tmp_path / "genomes"
+    genes = tmp_path / "genes"
+    genomes.mkdir()
+    genes.mkdir()
+    (genomes / "GCF_1.fna").write_text(">contig_1\nACGT\n")
+    (genes / "GCF_1.genes.fna").write_text(">contig_1_1 # 1 # 4 # 1 # ID=1\nACGT\n")
+    output = tmp_path / "matrix_reference"
+
+    result = CliRunner().invoke(
+        cli.cli,
+        [
+            "cache",
+            "build-matrix-files",
+            "--genome-dir",
+            str(genomes),
+            "--gene-dir",
+            str(genes),
+            "--output-dir",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert '"accessions": 1' in result.output
+    assert (output / "genomes_bed_file.bed").exists()
+    assert (output / "reference.stb").exists()
+    assert (output / "gene_range_table.tsv").exists()
+
+
+def test_cache_build_matrix_files_cli_can_select_one_genome(tmp_path: Path) -> None:
+    genomes = tmp_path / "genomes"
+    genes = tmp_path / "genes"
+    genomes.mkdir()
+    genes.mkdir()
+    for accession in ("GCF_1", "GCF_2"):
+        (genomes / f"{accession}.fna").write_text(f">contig_{accession[-1]}\nACGT\n")
+        (genes / f"{accession}.genes.fna").write_text(
+            f">contig_{accession[-1]}_1 # 1 # 4 # 1 # ID=1\nACGT\n"
+        )
+    output = tmp_path / "matrix_reference"
+
+    result = CliRunner().invoke(
+        cli.cli,
+        [
+            "cache",
+            "build-matrix-files",
+            "--genome-dir",
+            str(genomes),
+            "--gene-dir",
+            str(genes),
+            "--genome",
+            "GCF_2",
+            "--output-dir",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert '"accessions": 1' in result.output
+    assert (output / "reference.stb").read_text() == "contig_2\tGCF_2\n"
+    assert ">contig_2" in (output / "reference.fna").read_text()
+    assert ">contig_1" not in (output / "reference.fna").read_text()
+
+
+def test_cache_build_matrix_files_rejects_genome_and_accession_list(tmp_path: Path) -> None:
+    accessions = tmp_path / "accessions.txt"
+    accessions.write_text("GCF_1\n")
+
+    result = CliRunner().invoke(
+        cli.cli,
+        [
+            "cache",
+            "build-matrix-files",
+            "--genome-dir",
+            str(tmp_path),
+            "--gene-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--genome",
+            "GCF_1",
+            "--accessions",
+            str(accessions),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "either --genome or --accessions" in result.output
 
 
 def test_datasets_exec_format_error_is_actionable(tmp_path: Path, monkeypatch) -> None:
