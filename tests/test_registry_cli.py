@@ -1025,12 +1025,20 @@ def test_matrix_build_filters_samples_exports_selected_and_passes_sparse(tmp_pat
     assert runner.invoke(cli.cli, ["runs", "add", "--db", str(db_file), "SRR_PASS", "SRR_FAIL"]).exit_code == 0
     _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR_PASS", coverage=5, breadth=0.95, ber=0.9, abundance=0.2))
     _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR_FAIL", coverage=0.1, breadth=0.2, ber=0.1, abundance=0.001))
+    with registry.connect(db_file) as conn:
+        conn.execute(
+            """
+            INSERT INTO profile_positions
+            VALUES ('SRR_PASS', 'other_contig', 1, 'other_genome', 'geneX', 1, 0, 0, 0)
+            """
+        )
     bed_file, stb_file = _matrix_contract_files(tmp_path)
     calls: list[dict[str, object]] = []
 
     def build_matrix_hdf5(**kwargs):
         profile_dir = Path(kwargs["profile_dir"])
-        calls.append({**kwargs, "staged": sorted(path.name for path in profile_dir.glob("*.parquet"))})
+        staged_tables = {path.name: pl.read_parquet(path) for path in profile_dir.glob("*.parquet")}
+        calls.append({**kwargs, "staged": sorted(staged_tables), "staged_tables": staged_tables})
         Path(kwargs["output_file"]).write_text("matrix")
 
     zipstrain_module = types.ModuleType("zipstrain")
@@ -1071,6 +1079,7 @@ def test_matrix_build_filters_samples_exports_selected_and_passes_sparse(tmp_pat
     assert result.exit_code == 0, result.output
     assert "profiles=1" in result.output
     assert calls[0]["staged"] == ["SRR_PASS.parquet"]
+    assert calls[0]["staged_tables"]["SRR_PASS.parquet"]["genome"].unique().to_list() == ["genome_a"]
     assert calls[0]["sparse"] is True
     with duckdb.connect(str(db_file)) as conn:
         assert conn.execute("SELECT storage_layout, profile_count FROM matrix_stores").fetchall() == [("sparse", 1)]

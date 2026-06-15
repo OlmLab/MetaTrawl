@@ -6,11 +6,13 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import time
+from typing import Callable
 
 import duckdb
 import polars as pl
 
 
+ExportProgressCallback = Callable[[dict[str, object]], None]
 ACCESSION_PATTERN = re.compile(r"(GC[AF]_\d+(?:\.\d+)?)", re.IGNORECASE)
 
 
@@ -461,11 +463,15 @@ def export_profile_parquets(
     sample_ids: list[str],
     output_dir: Path,
     genome: str | None = None,
+    progress_callback: ExportProgressCallback | None = None,
 ) -> list[Path]:
     """Export selected samples from DuckDB into temporary ZipStrain profile parquets."""
     output_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
-    for sample_id in sample_ids:
+    total = len(sample_ids)
+    if progress_callback is not None:
+        progress_callback({"phase": "start", "completed": 0, "total": total, "genome": genome or "all"})
+    for index, sample_id in enumerate(sample_ids, start=1):
         output_file = output_dir / f"{sample_id}.parquet"
         conditions = ["sample_id = ?"]
         params: list[object] = [sample_id]
@@ -483,6 +489,18 @@ def export_profile_parquets(
         ).fetch_arrow_table()
         pl.from_arrow(arrow_table).write_parquet(output_file)
         paths.append(output_file)
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "advance",
+                    "completed": index,
+                    "total": total,
+                    "sample_name": sample_id,
+                    "genome": genome or "all",
+                }
+            )
+    if progress_callback is not None:
+        progress_callback({"phase": "done", "completed": total, "total": total, "genome": genome or "all"})
     return paths
 
 

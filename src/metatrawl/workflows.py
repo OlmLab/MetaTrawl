@@ -16,7 +16,7 @@ import polars as pl
 from metatrawl import cache
 from metatrawl import db
 from metatrawl import healthcheck
-from metatrawl.logging import WorkflowLogger
+from metatrawl.logging import ThrottledMatrixLogger, WorkflowLogger
 
 
 ACCESSION_PATTERN = re.compile(r"\b((?:GC[AF])_\d+(?:\.\d+)?)", re.IGNORECASE)
@@ -81,7 +81,14 @@ def build_matrix_from_database(
     logger.emit(step="matrix-build", status="exporting-profiles", samples=len(sample_ids), genome=genome)
     with TemporaryDirectory(prefix="metatrawl_matrix_profiles_") as tmp_dir:
         profile_dir = Path(tmp_dir)
-        db.export_profile_parquets(conn, sample_ids=sample_ids, output_dir=profile_dir)
+        db.export_profile_parquets(
+            conn,
+            sample_ids=sample_ids,
+            output_dir=profile_dir,
+            genome=None if genome == "all" else genome,
+            progress_callback=ThrottledMatrixLogger("METATRAWL-EXPORT", stored_rows=False),
+        )
+        logger.emit(step="matrix-build", status="exported-profiles", samples=len(sample_ids), genome=genome)
         logger.emit(step="matrix-build", status="building", samples=len(sample_ids), sparse=sparse)
         mp.build_matrix_hdf5(
             profile_dir=profile_dir,
@@ -94,6 +101,7 @@ def build_matrix_from_database(
             memory_limit_gb=memory_limit_gb,
             export_batch_mb=export_batch_mb,
             sparse=sparse,
+            progress_callback=ThrottledMatrixLogger("MATRIX-BUILD"),
         )
 
     store = db.register_matrix_store(
@@ -153,6 +161,7 @@ def append_matrix_from_database(
             sample_ids=sample_ids,
             output_dir=profile_dir,
             genome=None if context.genome == "all" else context.genome,
+            progress_callback=ThrottledMatrixLogger("METATRAWL-EXPORT", stored_rows=False),
         )
         logger.emit(step="matrix-append", status="appending", matrix=matrix_label, samples=len(sample_ids))
         mp.append_matrix_hdf5(
@@ -160,6 +169,7 @@ def append_matrix_from_database(
             matrix_hdf5_file=context.matrix_file,
             memory_limit_gb=memory_limit_gb,
             export_batch_mb=export_batch_mb,
+            progress_callback=ThrottledMatrixLogger("MATRIX-APPEND"),
         )
     if matrix_id is not None and db.get_matrix_store(conn, matrix_id) is not None:
         db.add_matrix_store_samples(conn, matrix_id=matrix_id, sample_ids=sample_ids)
