@@ -437,6 +437,20 @@ def completed_sample_ids(conn: duckdb.DuckDBPyConnection) -> list[str]:
     return [str(row[0]) for row in rows]
 
 
+def genomes_with_complete_samples(conn: duckdb.DuckDBPyConnection) -> list[str]:
+    """Return genomes represented by at least one complete sample."""
+    rows = conn.execute(
+        """
+        SELECT DISTINCT gs.genome
+        FROM genome_stats gs
+        JOIN samples s USING (sample_id)
+        WHERE s.status = 'complete'
+        ORDER BY gs.genome
+        """
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
 def matrix_store_filters(conn: duckdb.DuckDBPyConnection, matrix_id: str) -> MatrixFilters:
     """Return the filters originally used to build a matrix store."""
     row = conn.execute(
