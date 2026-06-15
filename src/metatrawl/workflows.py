@@ -75,8 +75,6 @@ def build_matrix_from_database(
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
     chosen_matrix_id = matrix_id or output_file.stem
-    if db.get_matrix_store(conn, chosen_matrix_id) is not None and not overwrite:
-        raise ValueError(f"Matrix ID already exists: {chosen_matrix_id}")
 
     from zipstrain import matrix_pairs as mp
 
@@ -107,7 +105,7 @@ def build_matrix_from_database(
         storage_layout="sparse" if sparse else "dense",
         sample_ids=sample_ids,
         filters=filters,
-        overwrite=overwrite,
+        overwrite=True,
     )
     _write_matrix_hdf5_metatrawl_metadata(output_file, filters=filters)
     logger.emit(step="matrix-build", status="done", matrix_id=chosen_matrix_id, samples=len(sample_ids))

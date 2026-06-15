@@ -1105,6 +1105,55 @@ def test_matrix_build_fails_when_no_complete_profiles_exist(tmp_path: Path) -> N
     assert "No complete samples" in result.output
 
 
+def test_matrix_build_ignores_stale_registry_row_when_output_file_is_deleted(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    matrix_file = tmp_path / "matrix.h5"
+    _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR1"), add_run=True)
+    bed_file, stb_file = _matrix_contract_files(tmp_path)
+    with registry.connect(db_file) as conn:
+        registry.register_matrix_store(
+            conn,
+            matrix_id="matrix",
+            genome="genome_a",
+            matrix_file=matrix_file,
+            profile_count=99,
+        )
+
+    def build_matrix_hdf5(**kwargs):
+        Path(kwargs["output_file"]).write_text("matrix")
+
+    zipstrain_module = types.ModuleType("zipstrain")
+    matrix_pairs_module = types.ModuleType("zipstrain.matrix_pairs")
+    matrix_pairs_module.build_matrix_hdf5 = build_matrix_hdf5
+    monkeypatch.setitem(sys.modules, "zipstrain", zipstrain_module)
+    monkeypatch.setitem(sys.modules, "zipstrain.matrix_pairs", matrix_pairs_module)
+    monkeypatch.setattr(zipstrain_module, "matrix_pairs", matrix_pairs_module, raising=False)
+    monkeypatch.setattr(workflows, "_write_matrix_hdf5_metatrawl_metadata", lambda *args, **kwargs: None)
+
+    result = runner.invoke(
+        cli.cli,
+        [
+            "matrix",
+            "build",
+            "--db",
+            str(db_file),
+            "--genome",
+            "genome_a",
+            "--bed-file",
+            str(bed_file),
+            "--stb-file",
+            str(stb_file),
+            "--output-file",
+            str(matrix_file),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    with registry.connect(db_file) as conn:
+        assert conn.execute("SELECT profile_count FROM matrix_stores WHERE matrix_id = 'matrix'").fetchone() == (1,)
+
+
 def test_matrix_compare_uses_registered_matrix_store(tmp_path: Path, monkeypatch) -> None:
     runner = CliRunner()
     db_file = tmp_path / "metatrawl.duckdb"

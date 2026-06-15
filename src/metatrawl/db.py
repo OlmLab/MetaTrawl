@@ -506,10 +506,8 @@ def register_matrix_store(
     filters: MatrixFilters | None = None,
     overwrite: bool = False,
 ) -> MatrixStore:
-    """Record a matrix store in the registry."""
+    """Record matrix metadata for legacy listing; the HDF5 file is authoritative."""
     existing = get_matrix_store(conn, matrix_id)
-    if existing is not None and not overwrite:
-        raise ValueError(f"Matrix ID already exists: {matrix_id}")
     now = time.time()
     created_at = now
     if existing is not None:
@@ -536,8 +534,7 @@ def register_matrix_store(
             now,
         ],
     )
-    if overwrite:
-        conn.execute("DELETE FROM matrix_store_samples WHERE matrix_id = ?", [matrix_id])
+    conn.execute("DELETE FROM matrix_store_samples WHERE matrix_id = ?", [matrix_id])
     if sample_ids:
         add_matrix_store_samples(conn, matrix_id=matrix_id, sample_ids=sample_ids)
     return MatrixStore(matrix_id=matrix_id, genome=genome, matrix_file=matrix_file, profile_count=profile_count, storage_layout=storage_layout)
