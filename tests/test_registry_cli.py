@@ -1039,6 +1039,7 @@ def test_matrix_build_filters_samples_exports_selected_and_passes_sparse(tmp_pat
     monkeypatch.setitem(sys.modules, "zipstrain", zipstrain_module)
     monkeypatch.setitem(sys.modules, "zipstrain.matrix_pairs", matrix_pairs_module)
     monkeypatch.setattr(zipstrain_module, "matrix_pairs", matrix_pairs_module, raising=False)
+    monkeypatch.setattr(workflows, "_write_matrix_hdf5_metatrawl_metadata", lambda *args, **kwargs: None)
 
     result = runner.invoke(
         cli.cli,
@@ -1130,6 +1131,17 @@ def test_matrix_compare_uses_registered_matrix_store(tmp_path: Path, monkeypatch
     monkeypatch.setitem(sys.modules, "zipstrain", zipstrain_module)
     monkeypatch.setitem(sys.modules, "zipstrain.matrix_pairs", matrix_pairs_module)
     monkeypatch.setattr(zipstrain_module, "matrix_pairs", matrix_pairs_module, raising=False)
+    monkeypatch.setattr(
+        workflows,
+        "read_matrix_file_context",
+        lambda path: workflows.MatrixFileContext(
+            matrix_file=matrix_file,
+            genome="genome_a",
+            storage_layout="dense",
+            sample_ids=("SRR1", "SRR2"),
+            filters=registry.MatrixFilters(),
+        ),
+    )
 
     result = runner.invoke(
         cli.cli,
@@ -1152,6 +1164,212 @@ def test_matrix_compare_uses_registered_matrix_store(tmp_path: Path, monkeypatch
     assert calls[0]["matrix_db_file"] == matrix_file
     with duckdb.connect(str(db_file)) as conn:
         assert conn.execute("SELECT compare_id, matrix_id, calculate FROM matrix_compares").fetchall() == [("compare", "genome_a", "all")]
+
+
+def test_matrix_compare_accepts_registered_matrix_file(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    matrix_file = tmp_path / "matrix.h5"
+    matrix_file.write_text("matrix")
+    calls: list[dict[str, object]] = []
+
+    with registry.connect(db_file) as conn:
+        registry.register_matrix_store(
+            conn,
+            matrix_id="genome_a",
+            genome="genome_a",
+            matrix_file=matrix_file,
+            profile_count=2,
+        )
+
+    def matrix_compare(**kwargs):
+        calls.append(kwargs)
+        Path(kwargs["output_file"]).write_text("compare")
+
+    zipstrain_module = types.ModuleType("zipstrain")
+    matrix_pairs_module = types.ModuleType("zipstrain.matrix_pairs")
+    matrix_pairs_module.matrix_compare = matrix_compare
+    monkeypatch.setitem(sys.modules, "zipstrain", zipstrain_module)
+    monkeypatch.setitem(sys.modules, "zipstrain.matrix_pairs", matrix_pairs_module)
+    monkeypatch.setattr(zipstrain_module, "matrix_pairs", matrix_pairs_module, raising=False)
+    monkeypatch.setattr(
+        workflows,
+        "read_matrix_file_context",
+        lambda path: workflows.MatrixFileContext(
+            matrix_file=matrix_file,
+            genome="genome_a",
+            storage_layout="dense",
+            sample_ids=("SRR1", "SRR2"),
+            filters=registry.MatrixFilters(),
+        ),
+    )
+
+    result = runner.invoke(
+        cli.cli,
+        [
+            "matrix",
+            "compare",
+            "--db",
+            str(db_file),
+            "--matrix-file",
+            str(matrix_file),
+            "--output-file",
+            str(tmp_path / "compare.duckdb"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert f"matrix_file={matrix_file}" in result.output
+    assert calls[0]["matrix_db_file"] == matrix_file
+
+
+def test_matrix_append_accepts_registered_matrix_file(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    matrix_file = tmp_path / "matrix.h5"
+    matrix_file.write_text("matrix")
+    _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR1"), add_run=True)
+
+    with registry.connect(db_file) as conn:
+        registry.register_matrix_store(
+            conn,
+            matrix_id="genome_a",
+            genome="genome_a",
+            matrix_file=matrix_file,
+            profile_count=0,
+        )
+
+    calls: list[dict[str, object]] = []
+
+    def append_matrix_hdf5(**kwargs):
+        calls.append(kwargs)
+
+    zipstrain_module = types.ModuleType("zipstrain")
+    matrix_pairs_module = types.ModuleType("zipstrain.matrix_pairs")
+    matrix_pairs_module.append_matrix_hdf5 = append_matrix_hdf5
+    monkeypatch.setitem(sys.modules, "zipstrain", zipstrain_module)
+    monkeypatch.setitem(sys.modules, "zipstrain.matrix_pairs", matrix_pairs_module)
+    monkeypatch.setattr(zipstrain_module, "matrix_pairs", matrix_pairs_module, raising=False)
+    monkeypatch.setattr(
+        workflows,
+        "read_matrix_file_context",
+        lambda path: workflows.MatrixFileContext(
+            matrix_file=matrix_file,
+            genome="genome_a",
+            storage_layout="dense",
+            sample_ids=(),
+            filters=registry.MatrixFilters(),
+        ),
+    )
+
+    result = runner.invoke(
+        cli.cli,
+        [
+            "matrix",
+            "append",
+            "--db",
+            str(db_file),
+            "--matrix-file",
+            str(matrix_file),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert f"matrix_file={matrix_file}" in result.output
+    assert calls[0]["matrix_hdf5_file"] == matrix_file
+
+
+def test_matrix_append_exports_only_eligible_samples_and_matrix_genome(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    matrix_file = tmp_path / "matrix.h5"
+    matrix_file.write_text("matrix")
+    _import_bundle(
+        runner,
+        db_file,
+        _write_bundle_files(tmp_path, "SRR_PASS", coverage=5, breadth=0.95, ber=0.9, abundance=0.2),
+        add_run=True,
+    )
+    _import_bundle(
+        runner,
+        db_file,
+        _write_bundle_files(tmp_path, "SRR_FAIL", coverage=0.1, breadth=0.95, ber=0.9, abundance=0.2),
+        add_run=True,
+    )
+    with registry.connect(db_file) as conn:
+        conn.execute(
+            """
+            INSERT INTO profile_positions
+            VALUES ('SRR_PASS', 'other_contig', 1, 'other_genome', 'geneX', 1, 0, 0, 0)
+            """
+        )
+        registry.register_matrix_store(
+            conn,
+            matrix_id="genome_a",
+            genome="genome_a",
+            matrix_file=matrix_file,
+            profile_count=0,
+            filters=registry.MatrixFilters(min_coverage=1),
+        )
+
+    staged: dict[str, pl.DataFrame] = {}
+
+    def append_matrix_hdf5(**kwargs):
+        profile_dir = Path(kwargs["profile_dir"])
+        staged.update({path.name: pl.read_parquet(path) for path in profile_dir.glob("*.parquet")})
+
+    zipstrain_module = types.ModuleType("zipstrain")
+    matrix_pairs_module = types.ModuleType("zipstrain.matrix_pairs")
+    matrix_pairs_module.append_matrix_hdf5 = append_matrix_hdf5
+    monkeypatch.setitem(sys.modules, "zipstrain", zipstrain_module)
+    monkeypatch.setitem(sys.modules, "zipstrain.matrix_pairs", matrix_pairs_module)
+    monkeypatch.setattr(zipstrain_module, "matrix_pairs", matrix_pairs_module, raising=False)
+    monkeypatch.setattr(
+        workflows,
+        "read_matrix_file_context",
+        lambda path: workflows.MatrixFileContext(
+            matrix_file=matrix_file,
+            genome="genome_a",
+            storage_layout="dense",
+            sample_ids=(),
+            filters=registry.MatrixFilters(min_coverage=1),
+        ),
+    )
+
+    result = runner.invoke(
+        cli.cli,
+        [
+            "matrix",
+            "append",
+            "--db",
+            str(db_file),
+            "--matrix-file",
+            str(matrix_file),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert sorted(staged) == ["SRR_PASS.parquet"]
+    assert staged["SRR_PASS.parquet"]["genome"].unique().to_list() == ["genome_a"]
+
+
+def test_matrix_commands_reject_id_and_file_together(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        cli.cli,
+        [
+            "matrix",
+            "append",
+            "--db",
+            str(tmp_path / "metatrawl.duckdb"),
+            "--matrix-id",
+            "genome_a",
+            "--matrix-file",
+            str(tmp_path / "matrix.h5"),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "exactly one" in result.output
 
 
 def test_workflow_logs_include_clear_step_context(capsys) -> None:

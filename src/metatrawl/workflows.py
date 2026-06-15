@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 import re
 import shlex
 import shutil
 import subprocess
 from tempfile import TemporaryDirectory
-from dataclasses import dataclass
 
 import polars as pl
 
@@ -33,6 +33,17 @@ class SyncSummary:
     skipped: int
     failed: int
     cleaned_files: int
+
+
+@dataclass(frozen=True)
+class MatrixFileContext:
+    """Metadata read directly from a ZipStrain HDF5 matrix store."""
+
+    matrix_file: Path
+    genome: str
+    storage_layout: str
+    sample_ids: tuple[str, ...]
+    filters: db.MatrixFilters
 
 
 def build_matrix_from_database(
@@ -98,6 +109,7 @@ def build_matrix_from_database(
         filters=filters,
         overwrite=overwrite,
     )
+    _write_matrix_hdf5_metatrawl_metadata(output_file, filters=filters)
     logger.emit(step="matrix-build", status="done", matrix_id=chosen_matrix_id, samples=len(sample_ids))
     return store
 
@@ -105,37 +117,89 @@ def build_matrix_from_database(
 def append_matrix_from_database(
     conn,
     *,
-    matrix_id: str,
+    matrix_file: Path,
+    matrix_id: str | None = None,
     memory_limit_gb: float = 16.0,
     export_batch_mb: float = 128.0,
     logger: WorkflowLogger | None = None,
 ) -> int:
-    """Append newly imported complete samples into a registered matrix store."""
+    """Append newly imported complete samples into a matrix store HDF5 file."""
     logger = logger or WorkflowLogger()
-    store = db.get_matrix_store(conn, matrix_id)
-    if store is None:
-        raise ValueError(f"Unknown matrix ID: {matrix_id}")
-    sample_ids = db.unmaterialized_sample_ids(conn, matrix_id)
+    context = read_matrix_file_context(matrix_file)
+    matrix_label = matrix_id or str(context.matrix_file)
+    sample_ids = (
+        [
+            sample_id
+            for sample_id in db.completed_sample_ids(conn)
+            if sample_id not in set(context.sample_ids)
+        ]
+        if context.genome == "all"
+        else db.eligible_unmaterialized_sample_ids(
+            conn,
+            matrix_id=None,
+            existing_sample_ids=list(context.sample_ids),
+            genome=context.genome,
+            filters=context.filters,
+        )
+    )
     if not sample_ids:
-        raise ValueError(f"No new complete samples are available to append to matrix ID: {matrix_id}")
+        raise ValueError(f"No new complete samples are available to append to matrix: {context.matrix_file}")
 
     from zipstrain import matrix_pairs as mp
 
-    logger.emit(step="matrix-append", status="exporting-profiles", matrix_id=matrix_id, samples=len(sample_ids))
+    logger.emit(step="matrix-append", status="exporting-profiles", matrix=matrix_label, samples=len(sample_ids))
     with TemporaryDirectory(prefix="metatrawl_matrix_append_") as tmp_dir:
         profile_dir = Path(tmp_dir)
-        db.export_profile_parquets(conn, sample_ids=sample_ids, output_dir=profile_dir)
-        logger.emit(step="matrix-append", status="appending", matrix_id=matrix_id, samples=len(sample_ids))
+        db.export_profile_parquets(
+            conn,
+            sample_ids=sample_ids,
+            output_dir=profile_dir,
+            genome=None if context.genome == "all" else context.genome,
+        )
+        logger.emit(step="matrix-append", status="appending", matrix=matrix_label, samples=len(sample_ids))
         mp.append_matrix_hdf5(
             profile_dir=profile_dir,
-            matrix_hdf5_file=store.matrix_file,
+            matrix_hdf5_file=context.matrix_file,
             memory_limit_gb=memory_limit_gb,
             export_batch_mb=export_batch_mb,
         )
-    db.add_matrix_store_samples(conn, matrix_id=matrix_id, sample_ids=sample_ids)
-    db.update_matrix_profile_count(conn, matrix_id=matrix_id)
-    logger.emit(step="matrix-append", status="done", matrix_id=matrix_id, samples=len(sample_ids))
+    if matrix_id is not None and db.get_matrix_store(conn, matrix_id) is not None:
+        db.add_matrix_store_samples(conn, matrix_id=matrix_id, sample_ids=sample_ids)
+        db.update_matrix_profile_count(conn, matrix_id=matrix_id)
+    logger.emit(step="matrix-append", status="done", matrix=matrix_label, samples=len(sample_ids))
     return len(sample_ids)
+
+
+def resolve_matrix_store(conn, *, matrix_id: str | None = None, matrix_file: Path | None = None) -> db.MatrixStore:
+    """Resolve a matrix store from either its registry ID or its file path."""
+    if (matrix_id is None) == (matrix_file is None):
+        raise ValueError("Provide exactly one of matrix_id or matrix_file.")
+    if matrix_id is not None:
+        store = db.get_matrix_store(conn, matrix_id)
+        if store is None:
+            raise ValueError(f"Unknown matrix ID: {matrix_id}")
+        return store
+    assert matrix_file is not None
+    store = db.get_matrix_store_by_file(conn, matrix_file)
+    if store is None:
+        raise ValueError(
+            f"Matrix file is not registered in MetaTrawl: {matrix_file}. "
+            "Build it with `metatrawl matrix build` first."
+        )
+    return store
+
+
+def resolve_matrix_file(conn, *, matrix_id: str | None = None, matrix_file: Path | None = None) -> tuple[Path, str | None]:
+    """Resolve a matrix file from either a path or a legacy registry ID."""
+    if (matrix_id is None) == (matrix_file is None):
+        raise ValueError("Provide exactly one of matrix_id or matrix_file.")
+    if matrix_file is not None:
+        return Path(matrix_file), None
+    assert matrix_id is not None
+    store = db.get_matrix_store(conn, matrix_id)
+    if store is None:
+        raise ValueError(f"Unknown matrix ID: {matrix_id}")
+    return store.matrix_file, store.matrix_id
 
 
 def compare_matrix_from_registry(
@@ -178,6 +242,113 @@ def compare_matrix_from_registry(
     )
     logger.emit(step="matrix-compare", status="done", matrix_id=matrix_id, compare_id=compare_id)
     return compare_id
+
+
+def compare_matrix_file(
+    conn,
+    *,
+    matrix_file: Path,
+    output_file: Path,
+    calculate: str = "all",
+    genome: str = "all",
+    backend: str = "numpy",
+    memory_limit_gb: float = 16.0,
+    matrix_id: str | None = None,
+    logger: WorkflowLogger | None = None,
+) -> str:
+    """Run ZipStrain matrix compare using the HDF5 file as the durable handle."""
+    logger = logger or WorkflowLogger()
+    context = read_matrix_file_context(matrix_file)
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    from zipstrain import matrix_pairs as mp
+
+    logger.emit(step="matrix-compare", status="start", matrix=context.matrix_file, calculate=calculate)
+    mp.matrix_compare(
+        matrix_db_file=context.matrix_file,
+        output_file=output_file,
+        genome=genome,
+        memory_limit_gb=memory_limit_gb,
+        backend=backend,
+        calculate=calculate,
+    )
+    compare_id = output_file.stem
+    db.register_matrix_compare(
+        conn,
+        compare_id=compare_id,
+        matrix_id=matrix_id or str(context.matrix_file),
+        compare_db_file=output_file,
+        calculate=calculate,
+    )
+    logger.emit(step="matrix-compare", status="done", matrix=context.matrix_file, compare_id=compare_id)
+    return compare_id
+
+
+def read_matrix_file_context(matrix_file: Path) -> MatrixFileContext:
+    """Read matrix metadata and materialized samples from a ZipStrain HDF5 store."""
+    path = Path(matrix_file).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Matrix store file does not exist: {path}")
+    h5py = _import_h5py()
+    with h5py.File(str(path), "r") as handle:
+        if "metadata" not in handle:
+            raise ValueError(f"Matrix store is missing metadata group: {path}")
+        metadata = {str(key): str(value) for key, value in handle["metadata"].attrs.items()}
+        genome = metadata.get("genome_scope", "all")
+        layout = metadata.get("layout", "dense")
+        if "samples" not in handle or "sample_name" not in handle["samples"]:
+            sample_ids: tuple[str, ...] = ()
+        else:
+            sample_ids = tuple(_decode_hdf5_value(value) for value in handle["samples"]["sample_name"][()])
+        filters = db.MatrixFilters(
+            min_coverage=_optional_float_metadata(metadata, "metatrawl_min_coverage"),
+            min_breadth=_optional_float_metadata(metadata, "metatrawl_min_breadth"),
+            min_ber=_optional_float_metadata(metadata, "metatrawl_min_ber"),
+            min_sylph_abundance=_optional_float_metadata(metadata, "metatrawl_min_sylph_abundance"),
+        )
+    return MatrixFileContext(
+        matrix_file=path,
+        genome=genome,
+        storage_layout=layout,
+        sample_ids=sample_ids,
+        filters=filters,
+    )
+
+
+def _write_matrix_hdf5_metatrawl_metadata(matrix_file: Path, *, filters: db.MatrixFilters) -> None:
+    h5py = _import_h5py()
+    with h5py.File(str(Path(matrix_file).expanduser().resolve()), "r+") as handle:
+        metadata = handle.require_group("metadata")
+        metadata.attrs["metatrawl_min_coverage"] = _metadata_float(filters.min_coverage)
+        metadata.attrs["metatrawl_min_breadth"] = _metadata_float(filters.min_breadth)
+        metadata.attrs["metatrawl_min_ber"] = _metadata_float(filters.min_ber)
+        metadata.attrs["metatrawl_min_sylph_abundance"] = _metadata_float(filters.min_sylph_abundance)
+
+
+def _import_h5py():
+    try:
+        import h5py  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("HDF5 matrix operations require h5py. Install MetaTrawl with matrix dependencies.") from exc
+    return h5py
+
+
+def _decode_hdf5_value(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def _metadata_float(value: float | None) -> str:
+    return "" if value is None else str(value)
+
+
+def _optional_float_metadata(metadata: dict[str, str], key: str) -> float | None:
+    value = metadata.get(key)
+    if value in (None, ""):
+        return None
+    return float(value)
 
 
 def profile_sra_runs(

@@ -283,7 +283,7 @@ Append newly imported complete samples to a registered matrix:
 ```bash
 metatrawl matrix append \
   --db metatrawl.duckdb \
-  --matrix-id binfantis
+  --matrix-file matrices/binfantis.h5
 ```
 
 Compare a registered matrix:
@@ -291,7 +291,7 @@ Compare a registered matrix:
 ```bash
 metatrawl matrix compare \
   --db metatrawl.duckdb \
-  --matrix-id binfantis \
+  --matrix-file matrices/binfantis.h5 \
   --output-file compares/binfantis.duckdb \
   --calculate all
 ```

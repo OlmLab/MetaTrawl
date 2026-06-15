@@ -405,40 +405,54 @@ def matrix_build(
 
 @matrix_group.command("append")
 @click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
-@click.option("--matrix-id", required=True, help="Registered matrix ID.")
+@click.option("--matrix-id", help="Registered matrix ID.")
+@click.option("--matrix-file", type=click.Path(path_type=Path), help="Registered matrix HDF5 file.")
 @click.option("--memory-limit-gb", type=float, default=16.0, show_default=True)
 @click.option("--export-batch-mb", type=float, default=128.0, show_default=True)
-def matrix_append(db_file: Path, matrix_id: str, memory_limit_gb: float, export_batch_mb: float) -> None:
+def matrix_append(db_file: Path, matrix_id: str | None, matrix_file: Path | None, memory_limit_gb: float, export_batch_mb: float) -> None:
     """Append newly imported complete samples to a registered matrix store."""
     try:
         with registry.connect(db_file) as conn:
-            appended = workflows.append_matrix_from_database(
+            resolved_matrix_file, resolved_matrix_id = workflows.resolve_matrix_file(
                 conn,
                 matrix_id=matrix_id,
+                matrix_file=matrix_file,
+            )
+            appended = workflows.append_matrix_from_database(
+                conn,
+                matrix_file=resolved_matrix_file,
+                matrix_id=resolved_matrix_id,
                 memory_limit_gb=memory_limit_gb,
                 export_batch_mb=export_batch_mb,
                 logger=WorkflowLogger(),
             )
     except (FileNotFoundError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"matrix_id={matrix_id} appended={appended}")
+    click.echo(f"matrix_file={resolved_matrix_file} appended={appended}")
 
 
 @matrix_group.command("compare")
 @click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
-@click.option("--matrix-id", required=True, help="Registered matrix ID.")
+@click.option("--matrix-id", help="Registered matrix ID.")
+@click.option("--matrix-file", type=click.Path(path_type=Path), help="Registered matrix HDF5 file.")
 @click.option("--output-file", required=True, type=click.Path(path_type=Path), help="Output ZipStrain compare DuckDB.")
 @click.option("--calculate", default="all", show_default=True, help="Metrics to calculate.")
 @click.option("--genome", default="all", show_default=True, help="Optional compare genome scope.")
 @click.option("--backend", default="numpy", show_default=True, help="ZipStrain matrix backend.")
 @click.option("--memory-limit-gb", type=float, default=16.0, show_default=True)
-def matrix_compare(db_file: Path, matrix_id: str, output_file: Path, calculate: str, genome: str, backend: str, memory_limit_gb: float) -> None:
+def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | None, output_file: Path, calculate: str, genome: str, backend: str, memory_limit_gb: float) -> None:
     """Compare a registered matrix store."""
     try:
         with registry.connect(db_file) as conn:
-            compare_id = workflows.compare_matrix_from_registry(
+            resolved_matrix_file, resolved_matrix_id = workflows.resolve_matrix_file(
                 conn,
                 matrix_id=matrix_id,
+                matrix_file=matrix_file,
+            )
+            compare_id = workflows.compare_matrix_file(
+                conn,
+                matrix_file=resolved_matrix_file,
+                matrix_id=resolved_matrix_id,
                 output_file=output_file,
                 calculate=calculate,
                 genome=genome,
@@ -448,7 +462,7 @@ def matrix_compare(db_file: Path, matrix_id: str, output_file: Path, calculate: 
             )
     except (FileNotFoundError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"compare_id={compare_id} wrote={output_file}")
+    click.echo(f"compare_id={compare_id} matrix_file={resolved_matrix_file} wrote={output_file}")
 
 
 @cli.command("status")

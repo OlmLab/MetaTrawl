@@ -391,20 +391,95 @@ def eligible_sample_ids(conn: duckdb.DuckDBPyConnection, *, genome: str, filters
     return [str(row[0]) for row in rows]
 
 
-def export_profile_parquets(conn: duckdb.DuckDBPyConnection, *, sample_ids: list[str], output_dir: Path) -> list[Path]:
+def eligible_unmaterialized_sample_ids(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    matrix_id: str | None = None,
+    existing_sample_ids: list[str] | None = None,
+    genome: str,
+    filters: MatrixFilters,
+) -> list[str]:
+    """Return matrix-eligible samples not yet materialized into a matrix store."""
+    eligible = eligible_sample_ids(conn, genome=genome, filters=filters)
+    if not eligible:
+        return []
+    existing_sample_ids = existing_sample_ids or []
+    if matrix_id is None:
+        return [sample_id for sample_id in eligible if sample_id not in set(existing_sample_ids)]
+    rows = conn.execute(
+        """
+        SELECT sample_id
+        FROM unnest(?) AS candidates(sample_id)
+        WHERE sample_id NOT IN (
+            SELECT sample_id
+            FROM matrix_store_samples
+            WHERE matrix_id = ?
+        )
+        ORDER BY sample_id
+        """,
+        [eligible, matrix_id],
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def completed_sample_ids(conn: duckdb.DuckDBPyConnection) -> list[str]:
+    """Return complete sample IDs."""
+    rows = conn.execute(
+        """
+        SELECT sample_id
+        FROM samples
+        WHERE status = 'complete'
+        ORDER BY sample_id
+        """
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def matrix_store_filters(conn: duckdb.DuckDBPyConnection, matrix_id: str) -> MatrixFilters:
+    """Return the filters originally used to build a matrix store."""
+    row = conn.execute(
+        """
+        SELECT min_coverage, min_breadth, min_ber, min_sylph_abundance
+        FROM matrix_stores
+        WHERE matrix_id = ?
+        """,
+        [matrix_id],
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"Unknown matrix ID: {matrix_id}")
+    return MatrixFilters(
+        min_coverage=row[0],
+        min_breadth=row[1],
+        min_ber=row[2],
+        min_sylph_abundance=row[3],
+    )
+
+
+def export_profile_parquets(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    sample_ids: list[str],
+    output_dir: Path,
+    genome: str | None = None,
+) -> list[Path]:
     """Export selected samples from DuckDB into temporary ZipStrain profile parquets."""
     output_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     for sample_id in sample_ids:
         output_file = output_dir / f"{sample_id}.parquet"
+        conditions = ["sample_id = ?"]
+        params: list[object] = [sample_id]
+        if genome is not None and genome != "all":
+            conditions.append("genome = ?")
+            params.append(genome)
         arrow_table = conn.execute(
-            """
+            f"""
             SELECT chrom, genome, pos, COALESCE(gene, 'NA') AS gene, A, T, C, G
             FROM profile_positions
-            WHERE sample_id = ?
+            WHERE {' AND '.join(conditions)}
             ORDER BY chrom, pos
             """,
-            [sample_id],
+            params,
         ).fetch_arrow_table()
         pl.from_arrow(arrow_table).write_parquet(output_file)
         paths.append(output_file)
@@ -476,6 +551,37 @@ def get_matrix_store(conn: duckdb.DuckDBPyConnection, matrix_id: str) -> MatrixS
     ).fetchone()
     if row is None:
         return None
+    return MatrixStore(row[0], row[1], Path(row[2]), int(row[3]), row[4])
+
+
+def get_matrix_store_by_file(conn: duckdb.DuckDBPyConnection, matrix_file: Path) -> MatrixStore | None:
+    """Return a registered matrix store by matrix file path, if present."""
+    requested = str(Path(matrix_file))
+    requested_resolved = str(Path(matrix_file).expanduser().resolve())
+    rows = conn.execute(
+        """
+        SELECT matrix_id, genome, matrix_file, profile_count, storage_layout
+        FROM matrix_stores
+        WHERE matrix_file = ?
+           OR matrix_file = ?
+        """,
+        [requested, requested_resolved],
+    ).fetchall()
+    if not rows:
+        all_rows = conn.execute(
+            "SELECT matrix_id, genome, matrix_file, profile_count, storage_layout FROM matrix_stores"
+        ).fetchall()
+        matches = [
+            row
+            for row in all_rows
+            if Path(row[2]).expanduser().resolve() == Path(matrix_file).expanduser().resolve()
+        ]
+        rows = matches
+    if not rows:
+        return None
+    if len(rows) > 1:
+        raise ValueError(f"Multiple matrix registry rows point to matrix file: {matrix_file}")
+    row = rows[0]
     return MatrixStore(row[0], row[1], Path(row[2]), int(row[3]), row[4])
 
 
