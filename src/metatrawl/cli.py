@@ -456,6 +456,7 @@ def matrix_build(
 @matrix_group.command("sync-build")
 @click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
 @click.option("--matrix-dir", required=True, type=click.Path(path_type=Path), help="Directory for per-genome HDF5 matrices.")
+@click.option("--genome", "genomes", multiple=True, help="Optional genome accession/name to sync. Repeat for multiple genomes.")
 @click.option("--bed-file", type=click.Path(path_type=Path), help="Optional cache-wide BED fallback file.")
 @click.option("--stb-file", type=click.Path(path_type=Path), help="Optional cache-wide STB fallback file.")
 @click.option("--bed-dir", type=click.Path(path_type=Path), help="Optional directory with per-genome ACCESSION.bed files.")
@@ -472,6 +473,7 @@ def matrix_build(
 def matrix_sync_build(
     db_file: Path,
     matrix_dir: Path,
+    genomes: tuple[str, ...],
     bed_file: Path,
     stb_file: Path,
     bed_dir: Path | None,
@@ -498,6 +500,7 @@ def matrix_sync_build(
             summary = workflows.sync_build_matrices(
                 conn,
                 matrix_dir=matrix_dir,
+                genomes=list(genomes) if genomes else None,
                 bed_file=bed_file,
                 stb_file=stb_file,
                 bed_dir=bed_dir,

@@ -203,6 +203,7 @@ def sync_build_matrices(
     conn,
     *,
     matrix_dir: Path,
+    genomes: list[str] | None = None,
     bed_file: Path | None = None,
     stb_file: Path | None = None,
     bed_dir: Path | None = None,
@@ -220,11 +221,11 @@ def sync_build_matrices(
     filters = filters or db.MatrixFilters()
     matrix_dir = Path(matrix_dir)
     matrix_dir.mkdir(parents=True, exist_ok=True)
-    genomes = db.genomes_with_complete_samples(conn)
-    logger.emit(step="matrix-sync-build", status="start", genomes=len(genomes), matrix_dir=matrix_dir)
+    selected_genomes = _dedupe_preserving_order(genomes) if genomes is not None else db.genomes_with_complete_samples(conn)
+    logger.emit(step="matrix-sync-build", status="start", genomes=len(selected_genomes), matrix_dir=matrix_dir)
 
     built = appended = up_to_date = skipped = failed = 0
-    for genome in genomes:
+    for genome in selected_genomes:
         matrix_file = matrix_dir / f"{_safe_file_stem(genome)}.h5"
         logger.emit(step="matrix-sync-build", status="genome-start", genome=genome, matrix=matrix_file)
         try:
@@ -301,7 +302,7 @@ def sync_build_matrices(
     logger.emit(
         step="matrix-sync-build",
         status="done",
-        genomes=len(genomes),
+        genomes=len(selected_genomes),
         built=built,
         appended=appended,
         up_to_date=up_to_date,
@@ -309,7 +310,7 @@ def sync_build_matrices(
         failed=failed,
     )
     return MatrixSyncBuildSummary(
-        genomes=len(genomes),
+        genomes=len(selected_genomes),
         built=built,
         appended=appended,
         up_to_date=up_to_date,
@@ -372,6 +373,17 @@ def discover_matrix_files(matrix_dir: Path) -> list[Path]:
 
 def _safe_file_stem(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_") or "matrix"
+
+
+def _dedupe_preserving_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        clean = value.strip()
+        if clean and clean not in seen:
+            seen.add(clean)
+            result.append(clean)
+    return result
 
 
 def _per_genome_file_or_fallback(*, genome: str, directory: Path | None, suffix: str, fallback: Path | None) -> Path:

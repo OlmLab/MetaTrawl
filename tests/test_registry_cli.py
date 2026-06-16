@@ -1603,6 +1603,66 @@ def test_matrix_sync_build_builds_missing_and_appends_existing_matrices(tmp_path
     assert "appended=1" in result.output
 
 
+def test_matrix_sync_build_can_target_one_genome(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR1"), add_run=True)
+    with registry.connect(db_file) as conn:
+        conn.execute("INSERT INTO genome_stats VALUES ('SRR1', 'genome_b', 3.0, 0.8, 0.7)")
+    matrix_dir = tmp_path / "matrices"
+    matrix_dir.mkdir()
+    (matrix_dir / "genome_a.h5").write_text("matrix")
+    bed_dir = tmp_path / "beds"
+    stb_dir = tmp_path / "stb"
+    bed_dir.mkdir()
+    stb_dir.mkdir()
+    (bed_dir / "genome_b.bed").write_text("contig\t0\t4\n")
+    (stb_dir / "genome_b.stb").write_text("contig\tgenome_b\n")
+    calls: list[tuple[str, str]] = []
+
+    def build_matrix_from_database(conn, **kwargs):
+        calls.append(("build", kwargs["genome"]))
+        Path(kwargs["output_file"]).write_text("matrix")
+        return registry.MatrixStore(
+            matrix_id=Path(kwargs["output_file"]).stem,
+            genome=kwargs["genome"],
+            matrix_file=Path(kwargs["output_file"]),
+            profile_count=1,
+            storage_layout="dense",
+        )
+
+    def append_matrix_from_database(conn, **kwargs):
+        calls.append(("append", Path(kwargs["matrix_file"]).stem))
+        return 1
+
+    monkeypatch.setattr(workflows, "build_matrix_from_database", build_matrix_from_database)
+    monkeypatch.setattr(workflows, "append_matrix_from_database", append_matrix_from_database)
+
+    result = runner.invoke(
+        cli.cli,
+        [
+            "matrix",
+            "sync-build",
+            "--db",
+            str(db_file),
+            "--matrix-dir",
+            str(matrix_dir),
+            "--genome",
+            "genome_b",
+            "--bed-dir",
+            str(bed_dir),
+            "--stb-dir",
+            str(stb_dir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [("build", "genome_b")]
+    assert "genomes=1" in result.output
+    assert "built=1" in result.output
+    assert "appended=0" in result.output
+
+
 def test_matrix_sync_build_reports_existing_matrix_without_new_samples_as_up_to_date(tmp_path: Path, monkeypatch) -> None:
     runner = CliRunner()
     db_file = tmp_path / "metatrawl.duckdb"

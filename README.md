@@ -208,6 +208,19 @@ For each genome:
   the HDF5 file;
 - if no new samples are available, the genome is reported as up to date.
 
+To sync only one genome, add `--genome`:
+
+```bash
+metatrawl matrix sync-build \
+  --db metatrawl.duckdb \
+  --matrix-dir matrices \
+  --genome GCF_000269965.1 \
+  --bed-dir cache/beds \
+  --stb-dir cache/stb \
+  --gene-range-dir cache/gene_ranges \
+  --sparse
+```
+
 The HDF5 matrix file is the durable handle. The old matrix registry is not
 required for normal sync behavior.
 
