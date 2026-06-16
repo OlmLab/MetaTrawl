@@ -285,7 +285,7 @@ def test_cache_prepare_reuses_cached_genome_and_gene_fasta(tmp_path: Path) -> No
     genomes_dir.mkdir(parents=True)
     genes_dir.mkdir(parents=True)
     (genomes_dir / "GCF_1.fna").write_text(">g1\nACGT\n")
-    (genes_dir / "GCF_1.genes.fna").write_text(">gene1\nAC\n")
+    (genes_dir / "GCF_1.genes.fna").write_text(">g1_1 # 1 # 2 # 1 # ID=1\nAC\n")
     accessions = tmp_path / "accessions.csv"
     accessions.write_text("accession\nGCF_1\n")
 
@@ -296,7 +296,7 @@ def test_cache_prepare_reuses_cached_genome_and_gene_fasta(tmp_path: Path) -> No
 
     assert result.exit_code == 0, result.output
     assert ">g1" in (tmp_path / "ref" / "reference.fna").read_text()
-    assert ">gene1" in (tmp_path / "ref" / "genes.fna").read_text()
+    assert ">g1_1" in (tmp_path / "ref" / "genes.fna").read_text()
     assert (tmp_path / "ref" / "reference.stb").read_text() == "g1\tGCF_1\n"
 
 
@@ -397,6 +397,32 @@ def test_cache_sync_matrix_files_cli_uses_standard_cache_layout(tmp_path: Path) 
     genes.mkdir(parents=True)
     (genomes / "GCF_1.fna").write_text(">contig_1\nACGT\n")
     (genes / "GCF_1.genes.fna").write_text(">contig_1_1 # 1 # 4 # 1 # ID=1\nACGT\n")
+
+    result = CliRunner().invoke(
+        cli.cli,
+        [
+            "cache",
+            "sync-matrix-files",
+            "--cache-dir",
+            str(cache_dir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert '"accessions": 1' in result.output
+    assert (cache_dir / "beds" / "GCF_1.bed").read_text() == "contig_1\t0\t4\n"
+    assert (cache_dir / "stb" / "GCF_1.stb").read_text() == "contig_1\tGCF_1\n"
+    assert (cache_dir / "gene_ranges" / "GCF_1.gene_ranges.tsv").read_text() == "contig_1_1\tcontig_1\t1\t4\n"
+
+
+def test_cache_sync_matrix_files_can_also_write_legacy_unified_files(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+    genomes = cache_dir / "genomes"
+    genes = cache_dir / "genes"
+    genomes.mkdir(parents=True)
+    genes.mkdir(parents=True)
+    (genomes / "GCF_1.fna").write_text(">contig_1\nACGT\n")
+    (genes / "GCF_1.genes.fna").write_text(">contig_1_1 # 1 # 4 # 1 # ID=1\nACGT\n")
     output = cache_dir / "matrix_reference"
 
     result = CliRunner().invoke(
@@ -412,7 +438,6 @@ def test_cache_sync_matrix_files_cli_uses_standard_cache_layout(tmp_path: Path) 
     )
 
     assert result.exit_code == 0, result.output
-    assert '"accessions": 1' in result.output
     assert (output / "genomes_bed_file.bed").read_text() == "contig_1\t0\t4\n"
     assert (output / "reference.stb").read_text() == "contig_1\tGCF_1\n"
     assert (output / "gene_range_table.tsv").read_text() == "contig_1_1\tcontig_1\t1\t4\n"
@@ -538,7 +563,7 @@ def test_reference_preparation_skips_unavailable_accessions(tmp_path: Path) -> N
         output.write_text(f">{accession}_contig\nACGT\n")
 
     def prodigal(genome: Path, output: Path) -> None:
-        output.write_text(">gene\nACGT\n")
+        output.write_text(">GCF_AVAILABLE_contig_1 # 1 # 4 # 1 # ID=1\nACGT\n")
 
     manager = cache.GenomeCache(
         tmp_path / "cache",
@@ -601,7 +626,7 @@ def test_duplicate_accession_requests_share_one_preparation_job(tmp_path: Path) 
     def prodigal(genome: Path, output: Path) -> None:
         calls["prodigal"] += 1
         time.sleep(0.05)
-        output.write_text(">gene\nAC\n")
+        output.write_text(">GCF_1_1 # 1 # 2 # 1 # ID=1\nAC\n")
 
     manager = cache.GenomeCache(tmp_path / "cache", downloader=downloader, prodigal_runner=prodigal)
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -609,6 +634,34 @@ def test_duplicate_accession_requests_share_one_preparation_job(tmp_path: Path) 
 
     assert results[0] == results[1]
     assert calls == {"download": 1, "prodigal": 1}
+
+
+def test_prepare_accession_writes_per_genome_matrix_helper_tables(tmp_path: Path) -> None:
+    def downloader(accession: str, output: Path) -> None:
+        output.write_text(f">{accession}_contig\nACGT\n")
+
+    def prodigal(genome: Path, output: Path) -> None:
+        output.write_text(f">{genome.stem}_contig_1 # 1 # 4 # 1 # ID=1\nACGT\n")
+
+    manager = cache.GenomeCache(tmp_path / "cache", downloader=downloader, prodigal_runner=prodigal)
+
+    manager.prepare_accession("GCF_1")
+
+    assert manager.bed_file_path("GCF_1").read_text() == "GCF_1_contig\t0\t4\n"
+    assert manager.stb_file_path("GCF_1").read_text() == "GCF_1_contig\tGCF_1\n"
+    assert manager.gene_range_table_path("GCF_1").read_text() == "GCF_1_contig_1\tGCF_1_contig\t1\t4\n"
+
+
+def test_prepare_accession_backfills_missing_matrix_helper_tables_for_cached_fastas(tmp_path: Path) -> None:
+    manager = cache.GenomeCache(tmp_path / "cache")
+    manager.genome_fasta_path("GCF_1").write_text(">contig\nACGT\n")
+    manager.gene_fasta_path("GCF_1").write_text(">contig_1 # 1 # 4 # 1 # ID=1\nACGT\n")
+
+    manager.prepare_accession("GCF_1")
+
+    assert manager.bed_file_path("GCF_1").read_text() == "contig\t0\t4\n"
+    assert manager.stb_file_path("GCF_1").read_text() == "contig\tGCF_1\n"
+    assert manager.gene_range_table_path("GCF_1").read_text() == "contig_1\tcontig\t1\t4\n"
 
 
 def test_prodigal_runner_only_requests_nucleotide_gene_fasta(tmp_path: Path, monkeypatch) -> None:
@@ -1446,15 +1499,29 @@ def test_matrix_sync_build_builds_missing_and_appends_existing_matrices(tmp_path
     _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR1"), add_run=True)
     with registry.connect(db_file) as conn:
         conn.execute("INSERT INTO genome_stats VALUES ('SRR1', 'genome_b', 3.0, 0.8, 0.7)")
-    bed_file, stb_file = _matrix_contract_files(tmp_path)
     matrix_dir = tmp_path / "matrices"
     matrix_dir.mkdir()
     existing_matrix = matrix_dir / "genome_a.h5"
     existing_matrix.write_text("matrix")
+    gene_range_dir = tmp_path / "gene_ranges"
+    gene_range_dir.mkdir()
+    (gene_range_dir / "genome_b.gene_ranges.tsv").write_text("gene\tcontig\t1\t4\n")
+    bed_dir = tmp_path / "beds"
+    stb_dir = tmp_path / "stb"
+    bed_dir.mkdir()
+    stb_dir.mkdir()
+    (bed_dir / "genome_b.bed").write_text("contig\t0\t4\n")
+    (stb_dir / "genome_b.stb").write_text("contig\tgenome_b\n")
     calls: list[tuple[str, str | Path]] = []
+    bed_files: dict[str, Path] = {}
+    stb_files: dict[str, Path] = {}
+    gene_range_tables: dict[str, Path | None] = {}
 
     def build_matrix_from_database(conn, **kwargs):
         calls.append(("build", kwargs["genome"]))
+        bed_files[kwargs["genome"]] = kwargs["bed_file"]
+        stb_files[kwargs["genome"]] = kwargs["stb_file"]
+        gene_range_tables[kwargs["genome"]] = kwargs["gene_range_table"]
         Path(kwargs["output_file"]).write_text("matrix")
         return registry.MatrixStore(
             matrix_id=Path(kwargs["output_file"]).stem,
@@ -1480,10 +1547,12 @@ def test_matrix_sync_build_builds_missing_and_appends_existing_matrices(tmp_path
             str(db_file),
             "--matrix-dir",
             str(matrix_dir),
-            "--bed-file",
-            str(bed_file),
-            "--stb-file",
-            str(stb_file),
+            "--bed-dir",
+            str(bed_dir),
+            "--stb-dir",
+            str(stb_dir),
+            "--gene-range-dir",
+            str(gene_range_dir),
             "--sparse",
         ],
     )
@@ -1491,6 +1560,9 @@ def test_matrix_sync_build_builds_missing_and_appends_existing_matrices(tmp_path
     assert result.exit_code == 0, result.output
     assert ("append", "genome_a.h5") in calls
     assert ("build", "genome_b") in calls
+    assert bed_files["genome_b"] == bed_dir / "genome_b.bed"
+    assert stb_files["genome_b"] == stb_dir / "genome_b.stb"
+    assert gene_range_tables["genome_b"] == gene_range_dir / "genome_b.gene_ranges.tsv"
     assert (matrix_dir / "genome_b.h5").exists()
     assert "built=1" in result.output
     assert "appended=1" in result.output

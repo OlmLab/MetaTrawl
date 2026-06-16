@@ -59,6 +59,16 @@ class MatrixReferenceFiles:
     accessions: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class MatrixRequirementSync:
+    """Per-accession matrix helper files refreshed from an existing cache."""
+
+    accessions: tuple[str, ...]
+    bed_dir: Path
+    stb_dir: Path
+    gene_range_dir: Path
+
+
 class GenomeCache:
     """Single-process authoritative writer for genome/prodigal cache files."""
 
@@ -73,8 +83,14 @@ class GenomeCache:
         self.cache_dir = Path(cache_dir)
         self.genomes_dir = self.cache_dir / "genomes"
         self.genes_dir = self.cache_dir / "genes"
+        self.beds_dir = self.cache_dir / "beds"
+        self.stb_dir = self.cache_dir / "stb"
+        self.gene_ranges_dir = self.cache_dir / "gene_ranges"
         self.genomes_dir.mkdir(parents=True, exist_ok=True)
         self.genes_dir.mkdir(parents=True, exist_ok=True)
+        self.beds_dir.mkdir(parents=True, exist_ok=True)
+        self.stb_dir.mkdir(parents=True, exist_ok=True)
+        self.gene_ranges_dir.mkdir(parents=True, exist_ok=True)
         self.downloader = downloader or download_genome_with_datasets
         self.prodigal_runner = prodigal_runner or run_prodigal_gene_fasta
         self.logger = logger or WorkflowLogger()
@@ -90,7 +106,10 @@ class GenomeCache:
             raise ValueError("Empty accession requested from genome cache.")
         genome_fasta = self.genome_fasta_path(accession)
         gene_fasta = self.gene_fasta_path(accession)
-        if genome_fasta.exists() and gene_fasta.exists():
+        bed_file = self.bed_file_path(accession)
+        stb_file = self.stb_file_path(accession)
+        gene_range_table = self.gene_range_table_path(accession)
+        if genome_fasta.exists() and gene_fasta.exists() and bed_file.exists() and stb_file.exists() and gene_range_table.exists():
             self.logger.emit(accession=accession, step="cache", status="cached")
             return genome_fasta, gene_fasta
         with self._lock:
@@ -156,9 +175,21 @@ class GenomeCache:
     def gene_fasta_path(self, accession: str) -> Path:
         return self.genes_dir / f"{_safe_name(accession)}.genes.fna"
 
+    def bed_file_path(self, accession: str) -> Path:
+        return self.beds_dir / f"{_safe_name(accession)}.bed"
+
+    def stb_file_path(self, accession: str) -> Path:
+        return self.stb_dir / f"{_safe_name(accession)}.stb"
+
+    def gene_range_table_path(self, accession: str) -> Path:
+        return self.gene_ranges_dir / f"{_safe_name(accession)}.gene_ranges.tsv"
+
     def _prepare_accession_uncached(self, accession: str) -> tuple[Path, Path]:
         genome_fasta = self.genome_fasta_path(accession)
         gene_fasta = self.gene_fasta_path(accession)
+        bed_file = self.bed_file_path(accession)
+        stb_file = self.stb_file_path(accession)
+        gene_range_table = self.gene_range_table_path(accession)
         if not genome_fasta.exists():
             self.logger.emit(accession=accession, step="download", status="start")
             tmp_genome = genome_fasta.with_suffix(".tmp.fna")
@@ -173,7 +204,58 @@ class GenomeCache:
                 self.prodigal_runner(genome_fasta, tmp_gene)
             _atomic_publish(tmp_gene, gene_fasta)
             self.logger.emit(accession=accession, step="prodigal", status="done", file=gene_fasta)
+        if not bed_file.exists():
+            self.logger.emit(accession=accession, step="bed", status="start")
+            _write_bed_file([genome_fasta], bed_file, max_interval=500_000)
+            self.logger.emit(accession=accession, step="bed", status="done", file=bed_file)
+        if not stb_file.exists():
+            self.logger.emit(accession=accession, step="stb", status="start")
+            _write_stb_file([(accession, genome_fasta)], stb_file)
+            self.logger.emit(accession=accession, step="stb", status="done", file=stb_file)
+        if not gene_range_table.exists():
+            self.logger.emit(accession=accession, step="gene-range", status="start")
+            _write_gene_range_table([gene_fasta], gene_range_table)
+            self.logger.emit(accession=accession, step="gene-range", status="done", file=gene_range_table)
         return genome_fasta, gene_fasta
+
+
+def sync_matrix_requirement_files(
+    *,
+    cache_dir: Path,
+    accessions: list[str] | None = None,
+    genome: str | None = None,
+    max_bed_interval: int = 500_000,
+) -> MatrixRequirementSync:
+    """Refresh per-genome BED, STB, and gene-range files from cached FASTAs."""
+    if genome is not None and accessions is not None:
+        raise ValueError("Use either genome or accessions, not both")
+    if max_bed_interval <= 0:
+        raise ValueError("max_bed_interval must be greater than zero")
+
+    manager = GenomeCache(cache_dir)
+    cached = _cached_genome_accessions(manager.genomes_dir)
+    selected = _dedupe([genome]) if genome is not None else (_dedupe(accessions) if accessions is not None else cached)
+    if not selected:
+        raise ValueError(f"No genome FASTA files found in: {manager.genomes_dir}")
+
+    missing_genomes = [accession for accession in selected if not manager.genome_fasta_path(accession).exists()]
+    missing_genes = [accession for accession in selected if not manager.gene_fasta_path(accession).exists()]
+    if missing_genomes:
+        raise FileNotFoundError("Missing genome FASTA for: " + ", ".join(missing_genomes))
+    if missing_genes:
+        raise FileNotFoundError("Missing Prodigal gene FASTA for: " + ", ".join(missing_genes))
+
+    for accession in selected:
+        _write_bed_file([manager.genome_fasta_path(accession)], manager.bed_file_path(accession), max_interval=max_bed_interval)
+        _write_stb_file([(accession, manager.genome_fasta_path(accession))], manager.stb_file_path(accession))
+        _write_gene_range_table([manager.gene_fasta_path(accession)], manager.gene_range_table_path(accession))
+
+    return MatrixRequirementSync(
+        accessions=tuple(selected),
+        bed_dir=manager.beds_dir,
+        stb_dir=manager.stb_dir,
+        gene_range_dir=manager.gene_ranges_dir,
+    )
 
 
 def prepare_cache_reference(
@@ -264,6 +346,14 @@ def read_accessions_file(accessions_file: Path) -> list[str]:
         column = "accession" if "accession" in df.columns else df.columns[0]
         return [str(value) for value in df[column].to_list()]
     return [line.strip().split()[0] for line in path.read_text().splitlines() if line.strip()]
+
+
+def _cached_genome_accessions(genome_dir: Path) -> list[str]:
+    return [
+        path.name.removesuffix(".fna")
+        for path in sorted(Path(genome_dir).glob("*.fna"))
+        if not path.name.endswith(".genes.fna")
+    ]
 
 
 def download_genome_with_datasets(

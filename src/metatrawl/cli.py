@@ -212,7 +212,7 @@ def cache_build_matrix_files(
 
 @cache_group.command("sync-matrix-files")
 @click.option("--cache-dir", required=True, type=click.Path(path_type=Path), help="MetaTrawl cache directory containing genomes/ and genes/.")
-@click.option("--output-dir", required=True, type=click.Path(path_type=Path), help="Directory for cache-wide matrix reference files.")
+@click.option("--output-dir", type=click.Path(path_type=Path), help="Optional legacy directory for unified matrix reference files.")
 @click.option("--genome", help="Build files for one genome accession.")
 @click.option("--accessions", "accessions_file", type=click.Path(path_type=Path), help="Optional accession list; defaults to every cached genome.")
 def cache_sync_matrix_files(
@@ -221,33 +221,43 @@ def cache_sync_matrix_files(
     genome: str | None,
     accessions_file: Path | None,
 ) -> None:
-    """Refresh cache-wide BED, STB, and gene-range files from the current cache."""
+    """Refresh per-genome BED, STB, and gene-range files from the current cache."""
     if genome is not None and accessions_file is not None:
         raise click.UsageError("Use either --genome or --accessions, not both.")
     accessions = cache.read_accessions_file(accessions_file) if accessions_file is not None else None
     cache_dir = Path(cache_dir)
     try:
-        files = cache.build_matrix_reference_files(
-            genome_dir=cache_dir / "genomes",
-            gene_dir=cache_dir / "genes",
-            output_dir=output_dir,
+        synced = cache.sync_matrix_requirement_files(
+            cache_dir=cache_dir,
             accessions=accessions,
             genome=genome,
         )
+        legacy_files = (
+            cache.build_matrix_reference_files(
+                genome_dir=cache_dir / "genomes",
+                gene_dir=cache_dir / "genes",
+                output_dir=output_dir,
+                accessions=accessions,
+                genome=genome,
+            )
+            if output_dir is not None
+            else None
+        )
     except (FileNotFoundError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(
-        json.dumps(
-            {
-                "accessions": len(files.accessions),
-                "reference_fasta": str(files.reference_fasta),
-                "gene_fasta": str(files.gene_fasta),
-                "bed_file": str(files.bed_file),
-                "stb_file": str(files.stb_file),
-                "gene_range_table": str(files.gene_range_table),
-            }
-        )
-    )
+    payload = {
+        "accessions": len(synced.accessions),
+        "bed_dir": str(synced.bed_dir),
+        "stb_dir": str(synced.stb_dir),
+        "gene_range_dir": str(synced.gene_range_dir),
+    }
+    if legacy_files is not None:
+        payload["legacy_reference_fasta"] = str(legacy_files.reference_fasta)
+        payload["legacy_gene_fasta"] = str(legacy_files.gene_fasta)
+        payload["legacy_bed_file"] = str(legacy_files.bed_file)
+        payload["legacy_stb_file"] = str(legacy_files.stb_file)
+        payload["legacy_gene_range_table"] = str(legacy_files.gene_range_table)
+    click.echo(json.dumps(payload))
 
 
 @cache_group.command("serve")
@@ -446,9 +456,12 @@ def matrix_build(
 @matrix_group.command("sync-build")
 @click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
 @click.option("--matrix-dir", required=True, type=click.Path(path_type=Path), help="Directory for per-genome HDF5 matrices.")
-@click.option("--bed-file", required=True, type=click.Path(path_type=Path), help="Cache-wide BED file defining scaffold extents.")
-@click.option("--stb-file", required=True, type=click.Path(path_type=Path), help="Cache-wide STB file defining scaffold-to-genome mapping.")
+@click.option("--bed-file", type=click.Path(path_type=Path), help="Optional cache-wide BED fallback file.")
+@click.option("--stb-file", type=click.Path(path_type=Path), help="Optional cache-wide STB fallback file.")
+@click.option("--bed-dir", type=click.Path(path_type=Path), help="Optional directory with per-genome ACCESSION.bed files.")
+@click.option("--stb-dir", type=click.Path(path_type=Path), help="Optional directory with per-genome ACCESSION.stb files.")
 @click.option("--gene-range-table", type=click.Path(path_type=Path), help="Optional cache-wide gene range table for gene ANI.")
+@click.option("--gene-range-dir", type=click.Path(path_type=Path), help="Optional directory with per-genome ACCESSION.gene_ranges.tsv files.")
 @click.option("--sparse", is_flag=True, help="Build missing matrices using ZipStrain's sparse HDF5 layout.")
 @click.option("--min-coverage", type=float, default=None)
 @click.option("--min-breadth", type=float, default=None)
@@ -461,7 +474,10 @@ def matrix_sync_build(
     matrix_dir: Path,
     bed_file: Path,
     stb_file: Path,
+    bed_dir: Path | None,
+    stb_dir: Path | None,
     gene_range_table: Path | None,
+    gene_range_dir: Path | None,
     sparse: bool,
     min_coverage: float | None,
     min_breadth: float | None,
@@ -484,7 +500,10 @@ def matrix_sync_build(
                 matrix_dir=matrix_dir,
                 bed_file=bed_file,
                 stb_file=stb_file,
+                bed_dir=bed_dir,
+                stb_dir=stb_dir,
                 gene_range_table=gene_range_table,
+                gene_range_dir=gene_range_dir,
                 filters=filters,
                 sparse=sparse,
                 memory_limit_gb=memory_limit_gb,

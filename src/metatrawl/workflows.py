@@ -203,9 +203,12 @@ def sync_build_matrices(
     conn,
     *,
     matrix_dir: Path,
-    bed_file: Path,
-    stb_file: Path,
+    bed_file: Path | None = None,
+    stb_file: Path | None = None,
+    bed_dir: Path | None = None,
+    stb_dir: Path | None = None,
     gene_range_table: Path | None = None,
+    gene_range_dir: Path | None = None,
     filters: db.MatrixFilters | None = None,
     sparse: bool = False,
     memory_limit_gb: float = 16.0,
@@ -253,9 +256,23 @@ def sync_build_matrices(
                     conn,
                     output_file=matrix_file,
                     genome=genome,
-                    bed_file=bed_file,
-                    stb_file=stb_file,
-                    gene_range_table=gene_range_table,
+                    bed_file=_per_genome_file_or_fallback(
+                        genome=genome,
+                        directory=bed_dir,
+                        suffix=".bed",
+                        fallback=bed_file,
+                    ),
+                    stb_file=_per_genome_file_or_fallback(
+                        genome=genome,
+                        directory=stb_dir,
+                        suffix=".stb",
+                        fallback=stb_file,
+                    ),
+                    gene_range_table=_gene_range_table_for_genome(
+                        genome=genome,
+                        gene_range_dir=gene_range_dir,
+                        fallback=gene_range_table,
+                    ),
                     filters=filters,
                     sparse=sparse,
                     memory_limit_gb=memory_limit_gb,
@@ -355,6 +372,26 @@ def discover_matrix_files(matrix_dir: Path) -> list[Path]:
 
 def _safe_file_stem(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_") or "matrix"
+
+
+def _per_genome_file_or_fallback(*, genome: str, directory: Path | None, suffix: str, fallback: Path | None) -> Path:
+    if directory is None:
+        if fallback is None:
+            raise FileNotFoundError(f"No per-genome {suffix} directory or fallback file was provided for genome: {genome}")
+        return fallback
+    candidate = Path(directory) / f"{_safe_file_stem(genome)}{suffix}"
+    if candidate.exists():
+        return candidate
+    if fallback is not None:
+        return fallback
+    raise FileNotFoundError(f"Missing per-genome matrix requirement file: {candidate}")
+
+
+def _gene_range_table_for_genome(*, genome: str, gene_range_dir: Path | None, fallback: Path | None) -> Path | None:
+    if gene_range_dir is None:
+        return fallback
+    candidate = Path(gene_range_dir) / f"{_safe_file_stem(genome)}.gene_ranges.tsv"
+    return candidate if candidate.exists() else fallback
 
 
 def resolve_matrix_store(conn, *, matrix_id: str | None = None, matrix_file: Path | None = None) -> db.MatrixStore:
