@@ -73,21 +73,176 @@ is missing:
 metatrawl check
 ```
 
-## Database Workflow
+## Tutorial: SRA IDs To Comparisons
 
-Initialize a project database:
+This is the normal MetaTrawl workflow. It starts from SRA run IDs and ends with
+one comparison database per genome.
+
+### 1. Create An Empty Project
 
 ```bash
 metatrawl init --db metatrawl.duckdb
 ```
 
-Add SRA run IDs:
+This creates the DuckDB project store. The database tracks SRA runs, imported
+profile rows, genome stats, gene stats, Sylph abundance, and matrix/compare
+bookkeeping.
+
+### 2. Add SRA Runs
 
 ```bash
-metatrawl runs add --db metatrawl.duckdb SRR000001 SRR000002
+metatrawl runs add \
+  --db metatrawl.duckdb \
+  SRR000001 SRR000002 SRR000003
 ```
 
-Export only runs that are not yet complete:
+Check what is registered:
+
+```bash
+metatrawl runs list --db metatrawl.duckdb
+```
+
+Check the whole project status:
+
+```bash
+metatrawl status --db metatrawl.duckdb
+```
+
+The status output is intentionally small: active runs, completed samples,
+remaining profiles, profile rows, matrices, and compares.
+
+### 3. Profile Remaining Runs And Import Them
+
+Use `sync-profile` for the high-level profile sync. It finds remaining SRA runs,
+downloads reads, runs Sylph, prepares the genome cache, aligns reads, runs
+ZipStrain profiling, imports completed outputs into DuckDB, and removes
+per-sample scratch/results after successful import.
+
+```bash
+metatrawl sync-profile \
+  --db metatrawl.duckdb \
+  --cache-dir cache \
+  --scratch-dir scratch \
+  --output-dir outputs \
+  --sylph-db /full/path/to/gtdb-r220-c200-dbv1.syldb \
+  --threads 16
+```
+
+`sync-profile` checkpoints each sample independently. If one sample fails,
+successful samples are still imported and cleaned. Failed or incomplete runs stay
+pending, so rerunning the same command retries only remaining work.
+
+During profiling, MetaTrawl logs compact lines that work well in terminal and
+cluster logs:
+
+```text
+METATRAWL sample=SRR123 step=sylph status=done genomes=12 elapsed=4.2s
+METATRAWL sample=SRR123 step=cache status=done accessions=10 elapsed=28.9s
+METATRAWL sample=SRR123 step=cleanup status=done removed=scratch/SRR123
+```
+
+Use an absolute `--sylph-db` path when possible. MetaTrawl validates the file
+before launching workers.
+
+### 4. Sync Matrix Requirement Files
+
+When genomes are downloaded, MetaTrawl automatically creates per-genome matrix
+requirement files:
+
+```text
+cache/genomes/GCF_xxx.fna
+cache/genes/GCF_xxx.genes.fna
+cache/beds/GCF_xxx.bed
+cache/stb/GCF_xxx.stb
+cache/gene_ranges/GCF_xxx.gene_ranges.tsv
+```
+
+For older caches, or if you want to force-refresh these derived files, run:
+
+```bash
+metatrawl cache sync-matrix-files \
+  --cache-dir cache
+```
+
+For one genome only:
+
+```bash
+metatrawl cache sync-matrix-files \
+  --cache-dir cache \
+  --genome GCF_000269965.1
+```
+
+For legacy ZipStrain-style unified reference files, add `--output-dir`:
+
+```bash
+metatrawl cache sync-matrix-files \
+  --cache-dir cache \
+  --output-dir cache/matrix_reference
+```
+
+That still writes the per-genome files, plus legacy unified files in
+`cache/matrix_reference`.
+
+### 5. Sync Genome Matrices
+
+Build or update one ZipStrain HDF5 matrix per genome represented in the database:
+
+```bash
+metatrawl matrix sync-build \
+  --db metatrawl.duckdb \
+  --matrix-dir matrices \
+  --bed-dir cache/beds \
+  --stb-dir cache/stb \
+  --gene-range-dir cache/gene_ranges \
+  --sparse \
+  --min-coverage 1 \
+  --min-breadth 0.2 \
+  --min-ber 0.77 \
+  --min-sylph-abundance 0.001
+```
+
+For each genome:
+
+- if `matrices/<genome>.h5` does not exist, MetaTrawl builds it;
+- if it already exists, MetaTrawl appends eligible samples that are not yet in
+  the HDF5 file;
+- if no new samples are available, the genome is reported as up to date.
+
+The HDF5 matrix file is the durable handle. The old matrix registry is not
+required for normal sync behavior.
+
+### 6. Sync Comparisons
+
+Run resumable comparison for every matrix in `matrices/`:
+
+```bash
+metatrawl matrix sync-compare \
+  --db metatrawl.duckdb \
+  --matrix-dir matrices \
+  --compare-dir compares \
+  --calculate all \
+  --backend numpy \
+  --memory-limit-gb 16
+```
+
+This writes one comparison DuckDB per matrix:
+
+```text
+compares/GCF_xxx.duckdb
+```
+
+Rerunning `sync-compare` is safe. ZipStrain resumes incomplete comparison
+databases and skips completed pairs.
+
+### 7. Inspect Progress
+
+At any point:
+
+```bash
+metatrawl status --db metatrawl.duckdb
+```
+
+To see which SRA runs still need profile imports:
 
 ```bash
 metatrawl profiles remaining \
@@ -95,69 +250,10 @@ metatrawl profiles remaining \
   --output-file remaining_runs.csv
 ```
 
-The CSV contains one column:
+## Manual Import And Lower-Level Commands
 
-```csv
-run_id
-SRR000001
-SRR000002
-```
-
-Run the high-level sync. This gets remaining runs from DuckDB, runs the SRA
-profiling lifecycle, finds completed profile outputs, imports them into DuckDB,
-deletes the imported per-sample files, and logs each step:
-
-```bash
-metatrawl sync \
-  --db metatrawl.duckdb \
-  --cache-dir cache \
-  --scratch-dir scratch \
-  --sylph-db /path/to/gtdb-r220-c200-dbv1.syldb \
-  --output-dir outputs \
-  --threads 16
-```
-
-`sync` checkpoints each sample independently. If one worker fails, completed
-samples are still imported and cleaned, failed runs remain in the pending set,
-and the command exits non-zero with a summary. Rerun the same command to retry
-only incomplete samples.
-
-MetaTrawl runs `sylph profile` for each sample, saves the abundance table as
-`SRR000001.sylph.tsv`, extracts nonzero `GCF_...`/`GCA_...` accessions from it,
-and asks the shared cache to prepare those genomes. It then runs
-`zipstrain utilities prepare_profiling`, builds a Bowtie2 index, aligns reads
-with `bowtie2 | samtools`, and runs `zipstrain utilities profile-single` to
-produce the profile and stats files that are imported into DuckDB.
-
-Use an absolute `--sylph-db` path when possible. MetaTrawl validates the file
-before launching SRA workers.
-
-`--accessions-dir` is still available as a manual override. It should contain
-one accession list per run, produced by Sylph or another genome preselection
-step:
-
-```text
-accessions/SRR000001.accessions.txt
-accessions/SRR000002.accessions.csv
-```
-
-Each file can be a plain one-accession-per-line text file or a CSV with an
-`accession` column.
-
-`sync` expects per-run outputs in `--output-dir` using these conventional names:
-
-```text
-SRR000001.profile.parquet
-SRR000001.genome_stats.parquet
-SRR000001.gene_stats.parquet      # optional
-SRR000001.sylph.csv               # csv, tsv, or parquet
-```
-
-After a successful import, these per-sample outputs are removed because DuckDB is
-the durable project store. The durable cache is left intact. Use
-`--keep-profile-outputs` only when debugging a failed or suspicious run.
-
-After profiling, import completed outputs into DuckDB tables:
+Most users should use `sync-profile`. If an external workflow produced profile
+files, import them directly:
 
 ```bash
 metatrawl profiles import \
@@ -187,113 +283,22 @@ SRR000001,/path/profile.parquet,/path/genome_stats.parquet,/path/gene_stats.parq
 `gene_stats_file` is optional. A run is complete after profile positions, genome
 stats, and Sylph abundance have been imported.
 
-## Cache Workflow
-
-Prepare one sample reference from accessions using a shared cache:
-
-```bash
-metatrawl cache prepare \
-  --cache-dir cache \
-  --accessions accessions.csv \
-  --output-dir scratch/SRR000001/reference
-```
-
-For parallel workers, start a local cache server:
+You can still run the lower-level worker command if you want to manage the
+remaining-runs CSV yourself:
 
 ```bash
-metatrawl cache serve \
-  --cache-dir cache \
-  --host 127.0.0.1 \
-  --port 8765
-```
+metatrawl profiles remaining \
+  --db metatrawl.duckdb \
+  --output-file remaining_runs.csv
 
-The cache keeps only durable per-accession files:
-
-```text
-cache/genomes/GCF_xxx.fna
-cache/genes/GCF_xxx.genes.fna
-```
-
-Per-sample concatenated references are scratch outputs and should be deleted
-after import.
-
-## SRA Worker Lifecycle
-
-`profile-sra` wires the worker lifecycle around remaining runs and scratch
-cleanup:
-
-```bash
 metatrawl profile-sra \
   --db metatrawl.duckdb \
   --remaining-csv remaining_runs.csv \
   --cache-dir cache \
   --scratch-dir scratch \
+  --output-dir outputs \
+  --sylph-db /full/path/to/gtdb-r220-c200-dbv1.syldb \
   --threads 8
-```
-
-Long-running steps emit compact cluster-friendly logs:
-
-```text
-METATRAWL sample=SRR123 step=sylph status=done genomes=12 elapsed=4.2s
-METATRAWL sample=SRR123 step=cache status=done accessions=10 elapsed=28.9s
-METATRAWL sample=SRR123 step=cleanup status=done removed=scratch/SRR123
-```
-
-## Matrix Workflow
-
-Build reusable matrix inputs from the genome and Prodigal gene cache:
-
-```bash
-metatrawl cache build-matrix-files \
-  --genome-dir cache/genomes \
-  --gene-dir cache/genes \
-  --output-dir cache/matrix_reference
-```
-
-For one genome only:
-
-```bash
-metatrawl cache build-matrix-files \
-  --genome-dir cache/genomes \
-  --gene-dir cache/genes \
-  --genome GCF_000269965.1 \
-  --output-dir cache/matrix_reference/GCF_000269965.1
-```
-
-Build a ZipStrain matrix from complete DuckDB samples. Thresholds are applied
-before temporary profile parquets are exported:
-
-```bash
-metatrawl matrix build \
-  --db metatrawl.duckdb \
-  --genome GCF_000269965.1_ASM26996v1_genomic.fna \
-  --bed-file cache/matrix_reference/genomes_bed_file.bed \
-  --stb-file cache/matrix_reference/reference.stb \
-  --gene-range-table cache/matrix_reference/gene_range_table.tsv \
-  --output-file matrices/binfantis.h5 \
-  --min-coverage 1 \
-  --min-breadth 0.2 \
-  --min-ber 0.77 \
-  --min-sylph-abundance 0.001 \
-  --sparse
-```
-
-Append newly imported complete samples to a registered matrix:
-
-```bash
-metatrawl matrix append \
-  --db metatrawl.duckdb \
-  --matrix-file matrices/binfantis.h5
-```
-
-Compare a registered matrix:
-
-```bash
-metatrawl matrix compare \
-  --db metatrawl.duckdb \
-  --matrix-file matrices/binfantis.h5 \
-  --output-file compares/binfantis.duckdb \
-  --calculate all
 ```
 
 ## Python Query API

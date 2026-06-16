@@ -990,7 +990,7 @@ def test_sync_profiles_remaining_runs_and_imports_outputs(tmp_path: Path, monkey
     result = runner.invoke(
         cli.cli,
         [
-            "sync",
+            "sync-profile",
             "--db",
             str(db_file),
             "--cache-dir",
@@ -1016,6 +1016,41 @@ def test_sync_profiles_remaining_runs_and_imports_outputs(tmp_path: Path, monkey
     assert not (output_dir / "SRR2.sylph.csv").exists()
 
 
+def test_sync_profile_runs_profile_sync(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    output_dir = tmp_path / "outputs"
+    assert runner.invoke(cli.cli, ["runs", "add", "--db", str(db_file), "SRR1"]).exit_code == 0
+
+    def fake_profile_sra_runs(**kwargs) -> None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        bundle = _write_bundle_files(output_dir, "SRR1")
+        bundle.profile_file.rename(output_dir / "SRR1.profile.parquet")
+
+    monkeypatch.setattr(workflows, "profile_sra_runs", fake_profile_sra_runs)
+
+    result = runner.invoke(
+        cli.cli,
+        [
+            "sync-profile",
+            "--db",
+            str(db_file),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--scratch-dir",
+            str(tmp_path / "scratch"),
+            "--output-dir",
+            str(output_dir),
+            "--skip-dependency-check",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "requested=1" in result.output
+    with duckdb.connect(str(db_file)) as conn:
+        assert conn.execute("SELECT sample_id FROM samples").fetchall() == [("SRR1",)]
+
+
 def test_sync_can_keep_profile_outputs_for_debugging(tmp_path: Path, monkeypatch) -> None:
     runner = CliRunner()
     db_file = tmp_path / "metatrawl.duckdb"
@@ -1032,7 +1067,7 @@ def test_sync_can_keep_profile_outputs_for_debugging(tmp_path: Path, monkeypatch
     result = runner.invoke(
         cli.cli,
         [
-            "sync",
+            "sync-profile",
             "--db",
             str(db_file),
             "--cache-dir",
@@ -1074,7 +1109,7 @@ def test_sync_checkpoints_successful_samples_before_reporting_failures(tmp_path:
     result = runner.invoke(
         cli.cli,
         [
-            "sync",
+            "sync-profile",
             "--db",
             str(db_file),
             "--cache-dir",

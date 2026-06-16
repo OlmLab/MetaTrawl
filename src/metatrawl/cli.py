@@ -337,7 +337,7 @@ def profile_sra(
     )
 
 
-@cli.command("sync")
+@cli.command("sync-profile")
 @click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
 @click.option("--cache-dir", required=True, type=click.Path(path_type=Path), help="Shared genome cache directory.")
 @click.option("--scratch-dir", required=True, type=click.Path(path_type=Path), help="Disposable worker scratch directory.")
@@ -347,7 +347,7 @@ def profile_sra(
 @click.option("--threads", type=int, default=8, show_default=True)
 @click.option("--skip-dependency-check", is_flag=True, help="Do not preflight external tools before syncing.")
 @click.option("--keep-profile-outputs", is_flag=True, help="Keep imported profile/stat/Sylph files on disk for debugging.")
-def sync(
+def sync_profile(
     db_file: Path,
     cache_dir: Path,
     scratch_dir: Path,
@@ -375,7 +375,7 @@ def sync(
     except (FileNotFoundError, RuntimeError, ValueError, healthcheck.DependencyCheckError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(
-        f"sync requested={summary.requested} imported={summary.imported} "
+        f"sync-profile requested={summary.requested} imported={summary.imported} "
         f"skipped={summary.skipped} failed={summary.failed} "
         f"cleaned_files={summary.cleaned_files}"
     )
