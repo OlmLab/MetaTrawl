@@ -210,6 +210,46 @@ def cache_build_matrix_files(
     )
 
 
+@cache_group.command("sync-matrix-files")
+@click.option("--cache-dir", required=True, type=click.Path(path_type=Path), help="MetaTrawl cache directory containing genomes/ and genes/.")
+@click.option("--output-dir", required=True, type=click.Path(path_type=Path), help="Directory for cache-wide matrix reference files.")
+@click.option("--genome", help="Build files for one genome accession.")
+@click.option("--accessions", "accessions_file", type=click.Path(path_type=Path), help="Optional accession list; defaults to every cached genome.")
+def cache_sync_matrix_files(
+    cache_dir: Path,
+    output_dir: Path,
+    genome: str | None,
+    accessions_file: Path | None,
+) -> None:
+    """Refresh cache-wide BED, STB, and gene-range files from the current cache."""
+    if genome is not None and accessions_file is not None:
+        raise click.UsageError("Use either --genome or --accessions, not both.")
+    accessions = cache.read_accessions_file(accessions_file) if accessions_file is not None else None
+    cache_dir = Path(cache_dir)
+    try:
+        files = cache.build_matrix_reference_files(
+            genome_dir=cache_dir / "genomes",
+            gene_dir=cache_dir / "genes",
+            output_dir=output_dir,
+            accessions=accessions,
+            genome=genome,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        json.dumps(
+            {
+                "accessions": len(files.accessions),
+                "reference_fasta": str(files.reference_fasta),
+                "gene_fasta": str(files.gene_fasta),
+                "bed_file": str(files.bed_file),
+                "stb_file": str(files.stb_file),
+                "gene_range_table": str(files.gene_range_table),
+            }
+        )
+    )
+
+
 @cache_group.command("serve")
 @click.option("--cache-dir", required=True, type=click.Path(path_type=Path), help="Shared genome cache directory.")
 @click.option("--host", default="127.0.0.1", show_default=True)

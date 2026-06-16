@@ -389,6 +389,35 @@ def test_cache_build_matrix_files_cli_can_select_one_genome(tmp_path: Path) -> N
     assert ">contig_1" not in (output / "reference.fna").read_text()
 
 
+def test_cache_sync_matrix_files_cli_uses_standard_cache_layout(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+    genomes = cache_dir / "genomes"
+    genes = cache_dir / "genes"
+    genomes.mkdir(parents=True)
+    genes.mkdir(parents=True)
+    (genomes / "GCF_1.fna").write_text(">contig_1\nACGT\n")
+    (genes / "GCF_1.genes.fna").write_text(">contig_1_1 # 1 # 4 # 1 # ID=1\nACGT\n")
+    output = cache_dir / "matrix_reference"
+
+    result = CliRunner().invoke(
+        cli.cli,
+        [
+            "cache",
+            "sync-matrix-files",
+            "--cache-dir",
+            str(cache_dir),
+            "--output-dir",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert '"accessions": 1' in result.output
+    assert (output / "genomes_bed_file.bed").read_text() == "contig_1\t0\t4\n"
+    assert (output / "reference.stb").read_text() == "contig_1\tGCF_1\n"
+    assert (output / "gene_range_table.tsv").read_text() == "contig_1_1\tcontig_1\t1\t4\n"
+
+
 def test_cache_build_matrix_files_rejects_genome_and_accession_list(tmp_path: Path) -> None:
     accessions = tmp_path / "accessions.txt"
     accessions.write_text("GCF_1\n")
