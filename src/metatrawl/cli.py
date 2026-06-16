@@ -403,6 +403,65 @@ def matrix_build(
     click.echo(f"matrix_id={store.matrix_id} wrote={store.matrix_file} profiles={store.profile_count}")
 
 
+@matrix_group.command("sync-build")
+@click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
+@click.option("--matrix-dir", required=True, type=click.Path(path_type=Path), help="Directory for per-genome HDF5 matrices.")
+@click.option("--bed-file", required=True, type=click.Path(path_type=Path), help="Cache-wide BED file defining scaffold extents.")
+@click.option("--stb-file", required=True, type=click.Path(path_type=Path), help="Cache-wide STB file defining scaffold-to-genome mapping.")
+@click.option("--gene-range-table", type=click.Path(path_type=Path), help="Optional cache-wide gene range table for gene ANI.")
+@click.option("--sparse", is_flag=True, help="Build missing matrices using ZipStrain's sparse HDF5 layout.")
+@click.option("--min-coverage", type=float, default=None)
+@click.option("--min-breadth", type=float, default=None)
+@click.option("--min-ber", type=float, default=None)
+@click.option("--min-sylph-abundance", type=float, default=None)
+@click.option("--memory-limit-gb", type=float, default=16.0, show_default=True)
+@click.option("--export-batch-mb", type=float, default=128.0, show_default=True)
+def matrix_sync_build(
+    db_file: Path,
+    matrix_dir: Path,
+    bed_file: Path,
+    stb_file: Path,
+    gene_range_table: Path | None,
+    sparse: bool,
+    min_coverage: float | None,
+    min_breadth: float | None,
+    min_ber: float | None,
+    min_sylph_abundance: float | None,
+    memory_limit_gb: float,
+    export_batch_mb: float,
+) -> None:
+    """Build missing per-genome matrices and append newly imported samples."""
+    filters = registry.MatrixFilters(
+        min_coverage=min_coverage,
+        min_breadth=min_breadth,
+        min_ber=min_ber,
+        min_sylph_abundance=min_sylph_abundance,
+    )
+    try:
+        with registry.connect(db_file) as conn:
+            summary = workflows.sync_build_matrices(
+                conn,
+                matrix_dir=matrix_dir,
+                bed_file=bed_file,
+                stb_file=stb_file,
+                gene_range_table=gene_range_table,
+                filters=filters,
+                sparse=sparse,
+                memory_limit_gb=memory_limit_gb,
+                export_batch_mb=export_batch_mb,
+                logger=WorkflowLogger(),
+            )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        f"matrix-sync-build genomes={summary.genomes} built={summary.built} "
+        f"appended={summary.appended} up_to_date={summary.up_to_date} "
+        f"skipped={summary.skipped} failed={summary.failed}"
+    )
+    if summary.failed:
+        raise click.ClickException("Matrix sync build completed with failures. Check the genome-level logs above.")
+
+
 @matrix_group.command("append")
 @click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
 @click.option("--matrix-id", help="Registered matrix ID.")
@@ -463,6 +522,46 @@ def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | Non
     except (FileNotFoundError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"compare_id={compare_id} matrix_file={resolved_matrix_file} wrote={output_file}")
+
+
+@matrix_group.command("sync-compare")
+@click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
+@click.option("--matrix-dir", required=True, type=click.Path(path_type=Path), help="Directory containing per-genome HDF5 matrices.")
+@click.option("--compare-dir", required=True, type=click.Path(path_type=Path), help="Directory for per-genome compare DuckDB files.")
+@click.option("--calculate", default="all", show_default=True, help="Metrics to calculate.")
+@click.option("--genome", default="all", show_default=True, help="Optional compare genome scope.")
+@click.option("--backend", default="numpy", show_default=True, help="ZipStrain matrix backend.")
+@click.option("--memory-limit-gb", type=float, default=16.0, show_default=True)
+def matrix_sync_compare(
+    db_file: Path,
+    matrix_dir: Path,
+    compare_dir: Path,
+    calculate: str,
+    genome: str,
+    backend: str,
+    memory_limit_gb: float,
+) -> None:
+    """Run resumable compare for every matrix file in a directory."""
+    try:
+        with registry.connect(db_file) as conn:
+            summary = workflows.sync_compare_matrices(
+                conn,
+                matrix_dir=matrix_dir,
+                compare_dir=compare_dir,
+                calculate=calculate,
+                genome=genome,
+                backend=backend,
+                memory_limit_gb=memory_limit_gb,
+                logger=WorkflowLogger(),
+            )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        f"matrix-sync-compare matrices={summary.matrices} "
+        f"compared={summary.compared} failed={summary.failed}"
+    )
+    if summary.failed:
+        raise click.ClickException("Matrix sync compare completed with failures. Check the matrix-level logs above.")
 
 
 @cli.command("status")

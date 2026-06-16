@@ -46,6 +46,27 @@ class MatrixFileContext:
     filters: db.MatrixFilters
 
 
+@dataclass(frozen=True)
+class MatrixSyncBuildSummary:
+    """Result from converging all per-genome matrix files."""
+
+    genomes: int
+    built: int
+    appended: int
+    up_to_date: int
+    skipped: int
+    failed: int
+
+
+@dataclass(frozen=True)
+class MatrixSyncCompareSummary:
+    """Result from converging compare databases for matrix files."""
+
+    matrices: int
+    compared: int
+    failed: int
+
+
 def build_matrix_from_database(
     conn,
     *,
@@ -176,6 +197,164 @@ def append_matrix_from_database(
         db.update_matrix_profile_count(conn, matrix_id=matrix_id)
     logger.emit(step="matrix-append", status="done", matrix=matrix_label, samples=len(sample_ids))
     return len(sample_ids)
+
+
+def sync_build_matrices(
+    conn,
+    *,
+    matrix_dir: Path,
+    bed_file: Path,
+    stb_file: Path,
+    gene_range_table: Path | None = None,
+    filters: db.MatrixFilters | None = None,
+    sparse: bool = False,
+    memory_limit_gb: float = 16.0,
+    export_batch_mb: float = 128.0,
+    logger: WorkflowLogger | None = None,
+) -> MatrixSyncBuildSummary:
+    """Build or append one matrix per genome represented in complete samples."""
+    logger = logger or WorkflowLogger()
+    filters = filters or db.MatrixFilters()
+    matrix_dir = Path(matrix_dir)
+    matrix_dir.mkdir(parents=True, exist_ok=True)
+    genomes = db.genomes_with_complete_samples(conn)
+    logger.emit(step="matrix-sync-build", status="start", genomes=len(genomes), matrix_dir=matrix_dir)
+
+    built = appended = up_to_date = skipped = failed = 0
+    for genome in genomes:
+        matrix_file = matrix_dir / f"{_safe_file_stem(genome)}.h5"
+        logger.emit(step="matrix-sync-build", status="genome-start", genome=genome, matrix=matrix_file)
+        try:
+            if matrix_file.exists():
+                try:
+                    appended_count = append_matrix_from_database(
+                        conn,
+                        matrix_file=matrix_file,
+                        memory_limit_gb=memory_limit_gb,
+                        export_batch_mb=export_batch_mb,
+                        logger=logger,
+                    )
+                except ValueError as exc:
+                    if "No new complete samples" not in str(exc):
+                        raise
+                    up_to_date += 1
+                    logger.emit(step="matrix-sync-build", status="up-to-date", genome=genome, matrix=matrix_file)
+                else:
+                    appended += 1
+                    logger.emit(
+                        step="matrix-sync-build",
+                        status="appended",
+                        genome=genome,
+                        matrix=matrix_file,
+                        samples=appended_count,
+                    )
+            else:
+                store = build_matrix_from_database(
+                    conn,
+                    output_file=matrix_file,
+                    genome=genome,
+                    bed_file=bed_file,
+                    stb_file=stb_file,
+                    gene_range_table=gene_range_table,
+                    filters=filters,
+                    sparse=sparse,
+                    memory_limit_gb=memory_limit_gb,
+                    export_batch_mb=export_batch_mb,
+                    logger=logger,
+                )
+                built += 1
+                logger.emit(
+                    step="matrix-sync-build",
+                    status="built",
+                    genome=genome,
+                    matrix=matrix_file,
+                    samples=store.profile_count,
+                )
+        except ValueError as exc:
+            if "No complete samples passed" in str(exc):
+                skipped += 1
+                logger.emit(step="matrix-sync-build", status="skipped", genome=genome, matrix=matrix_file, error=exc)
+                continue
+            failed += 1
+            logger.emit(step="matrix-sync-build", status="failed", genome=genome, matrix=matrix_file, error=exc)
+        except Exception as exc:
+            failed += 1
+            logger.emit(step="matrix-sync-build", status="failed", genome=genome, matrix=matrix_file, error=exc)
+
+    logger.emit(
+        step="matrix-sync-build",
+        status="done",
+        genomes=len(genomes),
+        built=built,
+        appended=appended,
+        up_to_date=up_to_date,
+        skipped=skipped,
+        failed=failed,
+    )
+    return MatrixSyncBuildSummary(
+        genomes=len(genomes),
+        built=built,
+        appended=appended,
+        up_to_date=up_to_date,
+        skipped=skipped,
+        failed=failed,
+    )
+
+
+def sync_compare_matrices(
+    conn,
+    *,
+    matrix_dir: Path,
+    compare_dir: Path,
+    calculate: str = "all",
+    genome: str = "all",
+    backend: str = "numpy",
+    memory_limit_gb: float = 16.0,
+    logger: WorkflowLogger | None = None,
+) -> MatrixSyncCompareSummary:
+    """Run resumable compare for every HDF5 matrix file in a directory."""
+    logger = logger or WorkflowLogger()
+    matrix_files = discover_matrix_files(matrix_dir)
+    compare_dir = Path(compare_dir)
+    compare_dir.mkdir(parents=True, exist_ok=True)
+    logger.emit(step="matrix-sync-compare", status="start", matrices=len(matrix_files), matrix_dir=matrix_dir)
+
+    compared = failed = 0
+    for matrix_file in matrix_files:
+        output_file = compare_dir / f"{matrix_file.stem}.duckdb"
+        logger.emit(step="matrix-sync-compare", status="matrix-start", matrix=matrix_file, output=output_file)
+        try:
+            compare_matrix_file(
+                conn,
+                matrix_file=matrix_file,
+                output_file=output_file,
+                calculate=calculate,
+                genome=genome,
+                backend=backend,
+                memory_limit_gb=memory_limit_gb,
+                logger=logger,
+            )
+            compared += 1
+            logger.emit(step="matrix-sync-compare", status="compared", matrix=matrix_file, output=output_file)
+        except Exception as exc:
+            failed += 1
+            logger.emit(step="matrix-sync-compare", status="failed", matrix=matrix_file, output=output_file, error=exc)
+
+    logger.emit(step="matrix-sync-compare", status="done", matrices=len(matrix_files), compared=compared, failed=failed)
+    return MatrixSyncCompareSummary(matrices=len(matrix_files), compared=compared, failed=failed)
+
+
+def discover_matrix_files(matrix_dir: Path) -> list[Path]:
+    """Return HDF5-like matrix files from a matrix directory."""
+    matrix_dir = Path(matrix_dir)
+    if not matrix_dir.is_dir():
+        raise FileNotFoundError(f"Matrix directory does not exist: {matrix_dir}")
+    suffixes = {".h5", ".hdf5", ".hd5"}
+    return sorted(path for path in matrix_dir.iterdir() if path.is_file() and path.suffix.lower() in suffixes)
+
+
+def _safe_file_stem(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_") or "matrix"
 
 
 def resolve_matrix_store(conn, *, matrix_id: str | None = None, matrix_file: Path | None = None) -> db.MatrixStore:

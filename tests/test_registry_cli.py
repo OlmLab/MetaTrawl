@@ -1411,6 +1411,136 @@ def test_matrix_append_exports_only_eligible_samples_and_matrix_genome(tmp_path:
     assert staged["SRR_PASS.parquet"]["genome"].unique().to_list() == ["genome_a"]
 
 
+def test_matrix_sync_build_builds_missing_and_appends_existing_matrices(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR1"), add_run=True)
+    with registry.connect(db_file) as conn:
+        conn.execute("INSERT INTO genome_stats VALUES ('SRR1', 'genome_b', 3.0, 0.8, 0.7)")
+    bed_file, stb_file = _matrix_contract_files(tmp_path)
+    matrix_dir = tmp_path / "matrices"
+    matrix_dir.mkdir()
+    existing_matrix = matrix_dir / "genome_a.h5"
+    existing_matrix.write_text("matrix")
+    calls: list[tuple[str, str | Path]] = []
+
+    def build_matrix_from_database(conn, **kwargs):
+        calls.append(("build", kwargs["genome"]))
+        Path(kwargs["output_file"]).write_text("matrix")
+        return registry.MatrixStore(
+            matrix_id=Path(kwargs["output_file"]).stem,
+            genome=kwargs["genome"],
+            matrix_file=Path(kwargs["output_file"]),
+            profile_count=1,
+            storage_layout="sparse",
+        )
+
+    def append_matrix_from_database(conn, **kwargs):
+        calls.append(("append", Path(kwargs["matrix_file"]).name))
+        return 1
+
+    monkeypatch.setattr(workflows, "build_matrix_from_database", build_matrix_from_database)
+    monkeypatch.setattr(workflows, "append_matrix_from_database", append_matrix_from_database)
+
+    result = runner.invoke(
+        cli.cli,
+        [
+            "matrix",
+            "sync-build",
+            "--db",
+            str(db_file),
+            "--matrix-dir",
+            str(matrix_dir),
+            "--bed-file",
+            str(bed_file),
+            "--stb-file",
+            str(stb_file),
+            "--sparse",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert ("append", "genome_a.h5") in calls
+    assert ("build", "genome_b") in calls
+    assert (matrix_dir / "genome_b.h5").exists()
+    assert "built=1" in result.output
+    assert "appended=1" in result.output
+
+
+def test_matrix_sync_build_reports_existing_matrix_without_new_samples_as_up_to_date(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR1"), add_run=True)
+    bed_file, stb_file = _matrix_contract_files(tmp_path)
+    matrix_dir = tmp_path / "matrices"
+    matrix_dir.mkdir()
+    (matrix_dir / "genome_a.h5").write_text("matrix")
+
+    def append_matrix_from_database(conn, **kwargs):
+        raise ValueError("No new complete samples are available to append to matrix: genome_a.h5")
+
+    monkeypatch.setattr(workflows, "append_matrix_from_database", append_matrix_from_database)
+
+    result = runner.invoke(
+        cli.cli,
+        [
+            "matrix",
+            "sync-build",
+            "--db",
+            str(db_file),
+            "--matrix-dir",
+            str(matrix_dir),
+            "--bed-file",
+            str(bed_file),
+            "--stb-file",
+            str(stb_file),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "up_to_date=1" in result.output
+
+
+def test_matrix_sync_compare_runs_all_matrix_files(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    matrix_dir = tmp_path / "matrices"
+    compare_dir = tmp_path / "compares"
+    matrix_dir.mkdir()
+    (matrix_dir / "genome_a.h5").write_text("matrix")
+    (matrix_dir / "genome_b.hdf5").write_text("matrix")
+    (matrix_dir / "ignore.txt").write_text("not a matrix")
+    calls: list[tuple[str, str]] = []
+
+    def compare_matrix_file(conn, **kwargs):
+        calls.append((Path(kwargs["matrix_file"]).name, Path(kwargs["output_file"]).name))
+        Path(kwargs["output_file"]).write_text("compare")
+        return Path(kwargs["output_file"]).stem
+
+    monkeypatch.setattr(workflows, "compare_matrix_file", compare_matrix_file)
+
+    result = runner.invoke(
+        cli.cli,
+        [
+            "matrix",
+            "sync-compare",
+            "--db",
+            str(db_file),
+            "--matrix-dir",
+            str(matrix_dir),
+            "--compare-dir",
+            str(compare_dir),
+            "--calculate",
+            "all",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [("genome_a.h5", "genome_a.duckdb"), ("genome_b.hdf5", "genome_b.duckdb")]
+    assert "matrices=2" in result.output
+    assert "compared=2" in result.output
+
+
 def test_matrix_commands_reject_id_and_file_together(tmp_path: Path) -> None:
     result = CliRunner().invoke(
         cli.cli,
