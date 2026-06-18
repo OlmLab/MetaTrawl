@@ -347,3 +347,25 @@ query = db.genome("GCF_000001").profiles()
 query.sink_parquet("GCF_000001.profiles.parquet")
 filtered = query.lazy().filter(pl.col("sample_id").is_in(selected_samples))
 ```
+
+## Controlling concurrency and execution
+
+`sync-profile` and `profile-sra` accept `--workflow-config` with a TOML or JSON file. This separates the number of samples allowed in flight from the concurrency and CPU allocation of each stage. For example, downloads can remain highly parallel while only one Bowtie index build and two alignments run at once:
+
+```bash
+metatrawl sync-profile \
+  --db metatrawl.duckdb \
+  --cache-dir cache \
+  --scratch-dir scratch \
+  --output-dir outputs \
+  --sylph-db /path/to/gtdb.syldb \
+  --workflow-config examples/workflow.toml
+```
+
+Each stage supports `workers`, `threads`, `execution = "local" | "slurm"`, and an optional `environment` table. Slurm stages also accept `time`, `memory_gb`, `partition`, `account`, and arbitrary `extra` `sbatch` options. MetaTrawl submits Slurm jobs with `sbatch --wait`; checkpointing, output publication, and scratch cleanup therefore happen only after the job completes.
+
+The configurable stages are `sra_download`, `sylph`, `genome_download`, `prodigal`, `prepare_profile`, `bowtie_build`, `alignment`, and `profile`. Without `--workflow-config`, `--threads` retains the previous behavior.
+
+The same file can provide ZipStrain matrix comparison queue and executor controls under `[matrix_compare]`, and can be passed to `matrix compare` or `matrix sync-compare`.
+
+Current ZipStrain profiling receives both `reference.fasta` and `profiling_contract.json`. This preserves the reference-aware profile fields and enables `ref_ani` in imported genome and gene statistics.

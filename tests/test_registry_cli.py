@@ -45,6 +45,7 @@ def _write_bundle_files(tmp_path: Path, run_id: str, *, coverage: float = 2.0, b
             "C": [0.0, 3.0],
             "G": [0.0, 0.0],
             "T": [0.0, 0.0],
+            "ref_base_bitmask": [1, 2],
         }
     ).write_parquet(profile_file)
     pl.DataFrame(
@@ -53,6 +54,7 @@ def _write_bundle_files(tmp_path: Path, run_id: str, *, coverage: float = 2.0, b
             "coverage": [coverage],
             "breadth": [breadth],
             "ber": [ber],
+            "ref_ani": [0.999],
         }
     ).write_parquet(genome_stats_file)
     pl.DataFrame(
@@ -62,6 +64,7 @@ def _write_bundle_files(tmp_path: Path, run_id: str, *, coverage: float = 2.0, b
             "coverage": [coverage],
             "breadth": [breadth],
             "ber": [ber],
+            "ref_ani": [0.998],
         }
     ).write_parquet(gene_stats_file)
     pl.DataFrame(
@@ -183,6 +186,9 @@ def test_profiles_import_stores_profile_stats_gene_and_abundance_tables(tmp_path
         assert conn.execute("SELECT count(*) FROM profile_positions WHERE sample_id = 'SRR1'").fetchone()[0] == 2
         assert conn.execute("SELECT coverage, breadth, ber FROM genome_stats WHERE sample_id = 'SRR1'").fetchone() == (2.0, 0.9, 0.8)
         assert conn.execute("SELECT gene FROM gene_stats WHERE sample_id = 'SRR1'").fetchone() == ("gene1",)
+        assert conn.execute("SELECT ref_ani FROM genome_stats WHERE sample_id = 'SRR1'").fetchone() == (0.999,)
+        assert conn.execute("SELECT ref_ani FROM gene_stats WHERE sample_id = 'SRR1'").fetchone() == (0.998,)
+        assert conn.execute("SELECT ref_base_bitmask FROM profile_positions WHERE sample_id = 'SRR1' ORDER BY pos").fetchall() == [(1,), (2,)]
         assert conn.execute("SELECT accession, abundance FROM sylph_abundance WHERE sample_id = 'SRR1'").fetchone() == ("GCF_1", 0.1)
         assert conn.execute("SELECT status FROM samples WHERE sample_id = 'SRR1'").fetchone() == ("complete",)
         count_types = dict(
@@ -709,14 +715,15 @@ def test_prodigal_retries_signal_crash(tmp_path: Path, monkeypatch) -> None:
 def test_profile_sra_deletes_temporary_reference_files_after_success(tmp_path: Path, monkeypatch) -> None:
     scratch_dir = tmp_path / "scratch"
 
-    def fake_run(cmd: list[str], *, sample: str, step: str) -> None:
+    def fake_run(cmd: list[str], **kwargs):
         if cmd[0] == "fasterq-dump":
-            sample_dir = scratch_dir / sample
+            sample_dir = scratch_dir / "SRR1"
             sample_dir.mkdir(parents=True, exist_ok=True)
             (sample_dir / "accessions.txt").write_text("GCF_1\n")
+        return subprocess.CompletedProcess(cmd, 0)
 
     class FakeGenomeCache:
-        def __init__(self, cache_dir: Path, logger: WorkflowLogger | None = None) -> None:
+        def __init__(self, cache_dir: Path, logger: WorkflowLogger | None = None, **kwargs) -> None:
             self.cache_dir = cache_dir
             self.logger = logger
 
@@ -728,7 +735,7 @@ def test_profile_sra_deletes_temporary_reference_files_after_success(tmp_path: P
             genes.write_text(">gene\nAC\n")
             return cache.PreparedReference(reference_fasta=reference, gene_fasta=genes)
 
-    monkeypatch.setattr(workflows, "_run", fake_run)
+    monkeypatch.setattr(workflows.subprocess, "run", fake_run)
     monkeypatch.setattr(workflows.cache, "GenomeCache", FakeGenomeCache)
 
     workflows.profile_sra_runs(
@@ -749,11 +756,11 @@ def test_profile_sra_uses_per_sample_accessions_dir(tmp_path: Path, monkeypatch)
     (accessions_dir / "SRR1.accessions.txt").write_text("GCF_1\n")
     prepared_accessions: list[list[str]] = []
 
-    def fake_run(cmd: list[str], *, sample: str, step: str) -> None:
-        return None
+    def fake_run(cmd: list[str], **kwargs):
+        return subprocess.CompletedProcess(cmd, 0)
 
     class FakeGenomeCache:
-        def __init__(self, cache_dir: Path, logger: WorkflowLogger | None = None) -> None:
+        def __init__(self, cache_dir: Path, logger: WorkflowLogger | None = None, **kwargs) -> None:
             self.cache_dir = cache_dir
             self.logger = logger
 
@@ -766,7 +773,7 @@ def test_profile_sra_uses_per_sample_accessions_dir(tmp_path: Path, monkeypatch)
             genes.write_text(">gene\nAC\n")
             return cache.PreparedReference(reference_fasta=reference, gene_fasta=genes)
 
-    monkeypatch.setattr(workflows, "_run", fake_run)
+    monkeypatch.setattr(workflows.subprocess, "run", fake_run)
     monkeypatch.setattr(workflows.cache, "GenomeCache", FakeGenomeCache)
 
     workflows.profile_sra_runs(
@@ -789,7 +796,7 @@ def test_profile_sra_runs_sylph_and_extracts_accessions(tmp_path: Path, monkeypa
     sylph_db.write_text("fake syldb")
     prepared_accessions: list[list[str]] = []
 
-    def fake_subprocess_run(cmd, check, capture_output=False, text=False, stdout=None, stderr=None):
+    def fake_subprocess_run(cmd, check, capture_output=False, text=False, stdout=None, stderr=None, **kwargs):
         if cmd[0] == "prefetch":
             return subprocess.CompletedProcess(cmd, 0)
         if cmd[0] == "fasterq-dump":
@@ -804,7 +811,7 @@ def test_profile_sra_runs_sylph_and_extracts_accessions(tmp_path: Path, monkeypa
         raise AssertionError(f"unexpected command: {cmd}")
 
     class FakeGenomeCache:
-        def __init__(self, cache_dir: Path, logger: WorkflowLogger | None = None) -> None:
+        def __init__(self, cache_dir: Path, logger: WorkflowLogger | None = None, **kwargs) -> None:
             self.cache_dir = cache_dir
             self.logger = logger
 
@@ -887,7 +894,8 @@ def test_alignment_and_profile_stage_publishes_outputs(tmp_path: Path, monkeypat
     assert any(call[:2] == ["bowtie2-build", "--threads"] for call in run_calls)
     profile_calls = [call for call in run_calls if call[:3] == ["zipstrain", "utilities", "profile-single"]]
     assert profile_calls
-    assert "--profiling-contract" not in profile_calls[0]
+    assert "--profiling-contract" in profile_calls[0]
+    assert "--reference-fasta" in profile_calls[0]
     assert shell_calls
     assert "bowtie2 -x" in shell_calls[0]
     assert "samtools sort" in shell_calls[0]
@@ -1146,7 +1154,7 @@ def test_matrix_build_filters_samples_exports_selected_and_passes_sparse(tmp_pat
         conn.execute(
             """
             INSERT INTO profile_positions
-            VALUES ('SRR_PASS', 'other_contig', 1, 'other_genome', 'geneX', 1, 0, 0, 0)
+            VALUES ('SRR_PASS', 'other_contig', 1, 'other_genome', 'geneX', 1, 0, 0, 0, NULL)
             """
         )
     bed_file, stb_file = _matrix_contract_files(tmp_path)
@@ -1197,6 +1205,7 @@ def test_matrix_build_filters_samples_exports_selected_and_passes_sparse(tmp_pat
     assert "profiles=1" in result.output
     assert calls[0]["staged"] == ["SRR_PASS.parquet"]
     assert calls[0]["staged_tables"]["SRR_PASS.parquet"]["genome"].unique().to_list() == ["genome_a"]
+    assert "ref_base_bitmask" not in calls[0]["staged_tables"]["SRR_PASS.parquet"].columns
     assert calls[0]["sparse"] is True
     with duckdb.connect(str(db_file)) as conn:
         assert conn.execute("SELECT storage_layout, profile_count FROM matrix_stores").fetchall() == [("sparse", 1)]
@@ -1475,7 +1484,7 @@ def test_matrix_append_exports_only_eligible_samples_and_matrix_genome(tmp_path:
         conn.execute(
             """
             INSERT INTO profile_positions
-            VALUES ('SRR_PASS', 'other_contig', 1, 'other_genome', 'geneX', 1, 0, 0, 0)
+            VALUES ('SRR_PASS', 'other_contig', 1, 'other_genome', 'geneX', 1, 0, 0, 0, NULL)
             """
         )
         registry.register_matrix_store(
@@ -1526,6 +1535,7 @@ def test_matrix_append_exports_only_eligible_samples_and_matrix_genome(tmp_path:
     assert result.exit_code == 0, result.output
     assert sorted(staged) == ["SRR_PASS.parquet"]
     assert staged["SRR_PASS.parquet"]["genome"].unique().to_list() == ["genome_a"]
+    assert "ref_base_bitmask" not in staged["SRR_PASS.parquet"].columns
 
 
 def test_matrix_sync_build_builds_missing_and_appends_existing_matrices(tmp_path: Path, monkeypatch) -> None:
@@ -1533,7 +1543,7 @@ def test_matrix_sync_build_builds_missing_and_appends_existing_matrices(tmp_path
     db_file = tmp_path / "metatrawl.duckdb"
     _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR1"), add_run=True)
     with registry.connect(db_file) as conn:
-        conn.execute("INSERT INTO genome_stats VALUES ('SRR1', 'genome_b', 3.0, 0.8, 0.7)")
+        conn.execute("INSERT INTO genome_stats VALUES ('SRR1', 'genome_b', 3.0, 0.8, 0.7, NULL)")
     matrix_dir = tmp_path / "matrices"
     matrix_dir.mkdir()
     existing_matrix = matrix_dir / "genome_a.h5"
@@ -1608,7 +1618,7 @@ def test_matrix_sync_build_can_target_one_genome(tmp_path: Path, monkeypatch) ->
     db_file = tmp_path / "metatrawl.duckdb"
     _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR1"), add_run=True)
     with registry.connect(db_file) as conn:
-        conn.execute("INSERT INTO genome_stats VALUES ('SRR1', 'genome_b', 3.0, 0.8, 0.7)")
+        conn.execute("INSERT INTO genome_stats VALUES ('SRR1', 'genome_b', 3.0, 0.8, 0.7, NULL)")
     matrix_dir = tmp_path / "matrices"
     matrix_dir.mkdir()
     (matrix_dir / "genome_a.h5").write_text("matrix")

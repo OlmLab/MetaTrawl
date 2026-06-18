@@ -16,6 +16,7 @@ from metatrawl import cache
 from metatrawl import db as registry
 from metatrawl import healthcheck
 from metatrawl import workflows
+from metatrawl.config import load_workflow_config
 from metatrawl.logging import WorkflowLogger
 
 
@@ -312,6 +313,7 @@ def cache_serve(cache_dir: Path, host: str, port: int) -> None:
 @click.option("--output-dir", type=click.Path(path_type=Path), help="Directory where Sylph/profile outputs are written.")
 @click.option("--accessions-dir", type=click.Path(path_type=Path), help="Manual override directory with per-run accession files.")
 @click.option("--threads", type=int, default=8, show_default=True)
+@click.option("--workflow-config", type=click.Path(path_type=Path), help="TOML/JSON stage concurrency and execution policy.")
 def profile_sra(
     db_file: Path,
     remaining_csv: Path,
@@ -321,9 +323,11 @@ def profile_sra(
     output_dir: Path | None,
     accessions_dir: Path | None,
     threads: int,
+    workflow_config: Path | None,
 ) -> None:
     """Run the local SRA profiling lifecycle with scratch cleanup."""
     run_ids = _read_remaining_csv(remaining_csv)
+    execution_config = load_workflow_config(workflow_config, threads=threads, sample_count=len(run_ids))
     workflows.profile_sra_runs(
         run_ids=run_ids,
         db_file=db_file,
@@ -333,6 +337,7 @@ def profile_sra(
         output_dir=output_dir,
         accessions_dir=accessions_dir,
         threads=threads,
+        workflow_config=execution_config,
         logger=WorkflowLogger(),
     )
 
@@ -345,6 +350,7 @@ def profile_sra(
 @click.option("--sylph-db", type=click.Path(path_type=Path), help="Sylph database used to select genomes from reads.")
 @click.option("--accessions-dir", type=click.Path(path_type=Path), help="Manual override directory with per-run accession files.")
 @click.option("--threads", type=int, default=8, show_default=True)
+@click.option("--workflow-config", type=click.Path(path_type=Path), help="TOML/JSON stage concurrency and execution policy.")
 @click.option("--skip-dependency-check", is_flag=True, help="Do not preflight external tools before syncing.")
 @click.option("--keep-profile-outputs", is_flag=True, help="Keep imported profile/stat/Sylph files on disk for debugging.")
 def sync_profile(
@@ -355,11 +361,15 @@ def sync_profile(
     sylph_db: Path | None,
     accessions_dir: Path | None,
     threads: int,
+    workflow_config: Path | None,
     skip_dependency_check: bool,
     keep_profile_outputs: bool,
 ) -> None:
     """Profile all remaining runs and import completed outputs into DuckDB."""
     try:
+        with registry.connect(db_file) as conn:
+            remaining_count = len(registry.remaining_runs(conn))
+        execution_config = load_workflow_config(workflow_config, threads=threads, sample_count=remaining_count)
         summary = workflows.sync_remaining_profiles(
             db_file=db_file,
             cache_dir=cache_dir,
@@ -368,6 +378,7 @@ def sync_profile(
             sylph_db=sylph_db,
             accessions_dir=accessions_dir,
             threads=threads,
+            workflow_config=execution_config,
             check_dependencies=not skip_dependency_check,
             cleanup_outputs=not keep_profile_outputs,
             logger=WorkflowLogger(),
@@ -561,7 +572,8 @@ def matrix_append(db_file: Path, matrix_id: str | None, matrix_file: Path | None
 @click.option("--genome", default="all", show_default=True, help="Optional compare genome scope.")
 @click.option("--backend", default="numpy", show_default=True, help="ZipStrain matrix backend.")
 @click.option("--memory-limit-gb", type=float, default=16.0, show_default=True)
-def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | None, output_file: Path, calculate: str, genome: str, backend: str, memory_limit_gb: float) -> None:
+@click.option("--workflow-config", type=click.Path(path_type=Path), help="TOML/JSON ZipStrain queue/executor controls.")
+def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | None, output_file: Path, calculate: str, genome: str, backend: str, memory_limit_gb: float, workflow_config: Path | None) -> None:
     """Compare a registered matrix store."""
     try:
         with registry.connect(db_file) as conn:
@@ -570,6 +582,7 @@ def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | Non
                 matrix_id=matrix_id,
                 matrix_file=matrix_file,
             )
+            execution_config = load_workflow_config(workflow_config, threads=1, sample_count=1)
             compare_id = workflows.compare_matrix_file(
                 conn,
                 matrix_file=resolved_matrix_file,
@@ -579,6 +592,7 @@ def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | Non
                 genome=genome,
                 backend=backend,
                 memory_limit_gb=memory_limit_gb,
+                compare_config=execution_config.matrix_compare,
                 logger=WorkflowLogger(),
             )
     except (FileNotFoundError, ValueError) as exc:
@@ -594,6 +608,7 @@ def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | Non
 @click.option("--genome", default="all", show_default=True, help="Optional compare genome scope.")
 @click.option("--backend", default="numpy", show_default=True, help="ZipStrain matrix backend.")
 @click.option("--memory-limit-gb", type=float, default=16.0, show_default=True)
+@click.option("--workflow-config", type=click.Path(path_type=Path), help="TOML/JSON ZipStrain queue/executor controls.")
 def matrix_sync_compare(
     db_file: Path,
     matrix_dir: Path,
@@ -602,10 +617,12 @@ def matrix_sync_compare(
     genome: str,
     backend: str,
     memory_limit_gb: float,
+    workflow_config: Path | None,
 ) -> None:
     """Run resumable compare for every matrix file in a directory."""
     try:
         with registry.connect(db_file) as conn:
+            execution_config = load_workflow_config(workflow_config, threads=1, sample_count=1)
             summary = workflows.sync_compare_matrices(
                 conn,
                 matrix_dir=matrix_dir,
@@ -614,6 +631,7 @@ def matrix_sync_compare(
                 genome=genome,
                 backend=backend,
                 memory_limit_gb=memory_limit_gb,
+                compare_config=execution_config.matrix_compare,
                 logger=WorkflowLogger(),
             )
     except (FileNotFoundError, RuntimeError, ValueError) as exc:

@@ -16,6 +16,8 @@ import polars as pl
 from metatrawl import cache
 from metatrawl import db
 from metatrawl import healthcheck
+from metatrawl.config import MatrixCompareConfig, WorkflowConfig
+from metatrawl.execution import WorkflowRuntime
 from metatrawl.logging import ThrottledMatrixLogger, WorkflowLogger
 
 
@@ -328,6 +330,7 @@ def sync_compare_matrices(
     genome: str = "all",
     backend: str = "numpy",
     memory_limit_gb: float = 16.0,
+    compare_config: MatrixCompareConfig | None = None,
     logger: WorkflowLogger | None = None,
 ) -> MatrixSyncCompareSummary:
     """Run resumable compare for every HDF5 matrix file in a directory."""
@@ -350,6 +353,7 @@ def sync_compare_matrices(
                 genome=genome,
                 backend=backend,
                 memory_limit_gb=memory_limit_gb,
+                compare_config=compare_config,
                 logger=logger,
             )
             compared += 1
@@ -490,6 +494,7 @@ def compare_matrix_file(
     backend: str = "numpy",
     memory_limit_gb: float = 16.0,
     matrix_id: str | None = None,
+    compare_config: MatrixCompareConfig | None = None,
     logger: WorkflowLogger | None = None,
 ) -> str:
     """Run ZipStrain matrix compare using the HDF5 file as the durable handle."""
@@ -501,6 +506,7 @@ def compare_matrix_file(
     from zipstrain import matrix_pairs as mp
 
     logger.emit(step="matrix-compare", status="start", matrix=context.matrix_file, calculate=calculate)
+    compare_kwargs = compare_config.kwargs() if compare_config is not None else {}
     mp.matrix_compare(
         matrix_db_file=context.matrix_file,
         output_file=output_file,
@@ -508,6 +514,7 @@ def compare_matrix_file(
         memory_limit_gb=memory_limit_gb,
         backend=backend,
         calculate=calculate,
+        **compare_kwargs,
     )
     compare_id = output_file.stem
     db.register_matrix_compare(
@@ -597,6 +604,7 @@ def profile_sra_runs(
     output_dir: Path | None = None,
     accessions_dir: Path | None = None,
     threads: int = 8,
+    workflow_config: WorkflowConfig | None = None,
     logger: WorkflowLogger | None = None,
     raise_on_error: bool = True,
 ) -> dict[str, str]:
@@ -606,9 +614,26 @@ def profile_sra_runs(
     external-command behavior remains visible and easy to replace in tests.
     """
     logger = logger or WorkflowLogger()
-    cache_manager = cache.GenomeCache(cache_dir, logger=logger)
+    workflow_config = workflow_config or WorkflowConfig.legacy(threads=threads, sample_count=len(run_ids))
+    runtime = WorkflowRuntime(workflow_config, state_dir=Path(scratch_dir), logger=logger, runner=subprocess.run)
+    cache_manager = cache.GenomeCache(
+        cache_dir,
+        logger=logger,
+        downloader=lambda accession, output: cache.download_genome_with_datasets(
+            accession,
+            output,
+            command_runner=lambda command: runtime.run("genome_download", command, sample=accession),
+        ),
+        prodigal_runner=lambda genome, output: cache.run_prodigal_gene_fasta(
+            genome,
+            output,
+            command_runner=lambda command: runtime.run("prodigal", command, sample=genome.stem),
+        ),
+        download_workers=workflow_config.stage("genome_download").workers,
+        prodigal_workers=workflow_config.stage("prodigal").workers,
+    )
     sylph_db = _resolve_existing_sylph_db(sylph_db) if sylph_db is not None else None
-    max_workers = max(1, min(len(run_ids), threads))
+    max_workers = max(1, min(len(run_ids), workflow_config.sample_workers))
     logger.emit(step="profile-sra", status="start", samples=len(run_ids), workers=max_workers, db=db_file)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
@@ -620,7 +645,7 @@ def profile_sra_runs(
                 sylph_db=sylph_db,
                 output_dir=Path(output_dir) if output_dir is not None else None,
                 accessions_dir=Path(accessions_dir) if accessions_dir is not None else None,
-                threads=max(1, threads // max_workers),
+                runtime=runtime,
                 logger=logger,
             ): run_id
             for run_id in run_ids
@@ -655,6 +680,7 @@ def sync_remaining_profiles(
     sylph_db: Path | None = None,
     accessions_dir: Path | None = None,
     threads: int = 8,
+    workflow_config: WorkflowConfig | None = None,
     check_dependencies: bool = True,
     cleanup_outputs: bool = True,
     logger: WorkflowLogger | None = None,
@@ -683,6 +709,7 @@ def sync_remaining_profiles(
         output_dir=output_dir,
         accessions_dir=accessions_dir,
         threads=threads,
+        workflow_config=workflow_config,
         logger=logger,
         raise_on_error=False,
     )
@@ -809,15 +836,20 @@ def _profile_one_sra_run(
     sylph_db: Path | None,
     output_dir: Path | None,
     accessions_dir: Path | None,
-    threads: int,
+    runtime: WorkflowRuntime,
     logger: WorkflowLogger,
 ) -> None:
     sample_scratch = Path(scratch_dir) / run_id
     sample_scratch.mkdir(parents=True, exist_ok=True)
     try:
         logger.emit(sample=run_id, step="download", status="start")
-        _run(["prefetch", run_id], sample=run_id, step="download")
-        _run(["fasterq-dump", run_id, "--outdir", str(sample_scratch), "--threads", str(threads)], sample=run_id, step="download")
+        download_threads = runtime.threads("sra_download")
+        runtime.run("sra_download", ["prefetch", run_id], sample=run_id)
+        runtime.run(
+            "sra_download",
+            ["fasterq-dump", run_id, "--outdir", str(sample_scratch), "--threads", str(download_threads)],
+            sample=run_id,
+        )
         accessions_file = sample_scratch / "accessions.txt"
         if not accessions_file.exists() and accessions_dir is not None:
             source = _find_sample_accessions_file(accessions_dir, run_id)
@@ -836,7 +868,7 @@ def _profile_one_sra_run(
                 sylph_db=sylph_db,
                 sample_scratch=sample_scratch,
                 run_id=run_id,
-                threads=threads,
+                runtime=runtime,
                 output_file=sylph_output,
             )
             accessions = extract_accessions_from_sylph_table(sylph_output)
@@ -867,7 +899,7 @@ def _profile_one_sra_run(
                 sample_scratch=sample_scratch,
                 reference=reference,
                 output_dir=output_dir,
-                threads=threads,
+                runtime=runtime,
                 logger=logger,
             )
     finally:
@@ -885,15 +917,40 @@ def _run(cmd: list[str], *, sample: str, step: str) -> None:
         ) from exc
 
 
+class _DirectRuntime:
+    """Compatibility adapter for direct/private helper use and focused tests."""
+
+    def __init__(self, threads: int) -> None:
+        self._threads = threads
+
+    def threads(self, stage: str) -> int:
+        return self._threads
+
+    def run(self, stage: str, cmd: list[str], *, sample: str, stdout_file: Path | None = None) -> None:
+        if stdout_file is None:
+            _run(cmd, sample=sample, step=stage.replace("_", "-"))
+            return
+        try:
+            with stdout_file.open("w") as handle:
+                subprocess.run(cmd, check=True, stdout=handle, stderr=subprocess.PIPE, text=True)
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(f"sample={sample} step={stage} command failed: {' '.join(cmd)}\n{exc.stderr}") from exc
+
+    def run_shell(self, stage: str, command: str, *, sample: str) -> None:
+        _run_alignment_shell(command=command, sample=sample)
+
+
 def _run_alignment_and_profile(
     *,
     run_id: str,
     sample_scratch: Path,
     reference: cache.PreparedReference,
     output_dir: Path,
-    threads: int,
+    runtime: WorkflowRuntime | _DirectRuntime | None = None,
+    threads: int | None = None,
     logger: WorkflowLogger,
 ) -> None:
+    runtime = runtime or _DirectRuntime(threads or 1)
     if reference.stb_file is None:
         raise ValueError(f"sample={run_id} step=profile missing STB file from cache reference preparation")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -901,7 +958,8 @@ def _run_alignment_and_profile(
     profile_work.mkdir(parents=True, exist_ok=True)
 
     logger.emit(sample=run_id, step="prepare-profile", status="start")
-    _run(
+    runtime.run(
+        "prepare_profile",
         [
             "zipstrain",
             "utilities",
@@ -916,22 +974,27 @@ def _run_alignment_and_profile(
             str(profile_work),
         ],
         sample=run_id,
-        step="prepare-profile",
     )
-    _ensure_null_model(profile_work=profile_work, run_id=run_id, logger=logger)
+    _ensure_null_model(profile_work=profile_work, run_id=run_id, logger=logger, runtime=runtime)
     logger.emit(sample=run_id, step="prepare-profile", status="done")
 
     logger.emit(sample=run_id, step="bowtie2-build", status="start")
-    _run(["bowtie2-build", "--threads", str(threads), str(reference.reference_fasta), str(reference.reference_fasta)], sample=run_id, step="bowtie2-build")
+    bowtie_threads = runtime.threads("bowtie_build")
+    runtime.run(
+        "bowtie_build",
+        ["bowtie2-build", "--threads", str(bowtie_threads), str(reference.reference_fasta), str(reference.reference_fasta)],
+        sample=run_id,
+    )
     logger.emit(sample=run_id, step="bowtie2-build", status="done")
 
     bam_file = sample_scratch / f"{run_id}.bam"
     logger.emit(sample=run_id, step="align", status="start", bam=bam_file)
-    _run_alignment_shell(
-        command=_build_alignment_command(
+    runtime.run_shell(
+        "alignment",
+        _build_alignment_command(
             reference_fasta=reference.reference_fasta,
             fastqs=_sample_fastqs(sample_scratch),
-            threads=threads,
+            threads=runtime.threads("alignment"),
             bam_file=bam_file,
         ),
         sample=run_id,
@@ -939,7 +1002,8 @@ def _run_alignment_and_profile(
     logger.emit(sample=run_id, step="align", status="done", bam=bam_file)
 
     logger.emit(sample=run_id, step="profile", status="start")
-    _run(
+    runtime.run(
+        "profile",
         [
             "zipstrain",
             "utilities",
@@ -954,13 +1018,16 @@ def _run_alignment_and_profile(
             str(profile_work / "null_model.parquet"),
             "--gene-range-table",
             str(profile_work / "gene_range_table.tsv"),
+            "--reference-fasta",
+            str(profile_work / "reference.fasta"),
+            "--profiling-contract",
+            str(profile_work / "profiling_contract.json"),
             "--max-concurrency",
-            str(threads),
+            str(runtime.threads("profile")),
             "--output-dir",
             str(profile_work),
         ],
         sample=run_id,
-        step="profile",
     )
     _publish_profile_outputs(run_id=run_id, profile_work=profile_work, output_dir=output_dir)
     logger.emit(sample=run_id, step="profile", status="done", output_dir=output_dir)
@@ -974,12 +1041,13 @@ def _sample_fastqs(sample_scratch: Path) -> list[Path]:
     return fastqs
 
 
-def _ensure_null_model(*, profile_work: Path, run_id: str, logger: WorkflowLogger) -> Path:
+def _ensure_null_model(*, profile_work: Path, run_id: str, logger: WorkflowLogger, runtime: WorkflowRuntime) -> Path:
     null_model = profile_work / "null_model.parquet"
     if null_model.exists():
         return null_model
     logger.emit(sample=run_id, step="null-model", status="start", output=null_model)
-    _run(
+    runtime.run(
+        "prepare_profile",
         [
             "zipstrain",
             "utilities",
@@ -988,7 +1056,6 @@ def _ensure_null_model(*, profile_work: Path, run_id: str, logger: WorkflowLogge
             str(null_model),
         ],
         sample=run_id,
-        step="null-model",
     )
     logger.emit(sample=run_id, step="null-model", status="done", output=null_model)
     return null_model
@@ -1028,20 +1095,20 @@ def _publish_profile_outputs(*, run_id: str, profile_work: Path, output_dir: Pat
         shutil.copy2(source, destination)
 
 
-def _run_sylph_profile(*, sylph_db: Path, sample_scratch: Path, run_id: str, threads: int, output_file: Path) -> None:
+def _run_sylph_profile(
+    *, sylph_db: Path, sample_scratch: Path, run_id: str,
+    runtime: WorkflowRuntime | _DirectRuntime | None = None, threads: int | None = None, output_file: Path
+) -> None:
+    runtime = runtime or _DirectRuntime(threads or 1)
     fastqs = sorted(sample_scratch.glob("*.fastq")) + sorted(sample_scratch.glob("*.fq"))
     fastqs += sorted(sample_scratch.glob("*.fastq.gz")) + sorted(sample_scratch.glob("*.fq.gz"))
     if not fastqs:
         raise FileNotFoundError(f"sample={run_id} step=sylph found no FASTQ files in {sample_scratch}")
     if len(fastqs) == 2:
-        cmd = ["sylph", "profile", str(sylph_db), "-1", str(fastqs[0]), "-2", str(fastqs[1]), "-t", str(threads)]
+        cmd = ["sylph", "profile", str(sylph_db), "-1", str(fastqs[0]), "-2", str(fastqs[1]), "-t", str(runtime.threads("sylph"))]
     else:
-        cmd = ["sylph", "profile", str(sylph_db), *[str(path) for path in fastqs], "-t", str(threads)]
-    try:
-        with output_file.open("w") as handle:
-            subprocess.run(cmd, check=True, stdout=handle, stderr=subprocess.PIPE, text=True)
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(f"sample={run_id} step=sylph command failed: {' '.join(cmd)}\n{exc.stderr}") from exc
+        cmd = ["sylph", "profile", str(sylph_db), *[str(path) for path in fastqs], "-t", str(runtime.threads("sylph"))]
+    runtime.run("sylph", cmd, sample=run_id, stdout_file=output_file)
 
 
 def _resolve_existing_sylph_db(sylph_db: Path | str) -> Path:

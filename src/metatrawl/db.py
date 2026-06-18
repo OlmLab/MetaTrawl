@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS profile_positions (
     A USMALLINT NOT NULL,
     C USMALLINT NOT NULL,
     G USMALLINT NOT NULL,
-    T USMALLINT NOT NULL
+    T USMALLINT NOT NULL,
+    ref_base_bitmask UTINYINT
 );
 
 CREATE TABLE IF NOT EXISTS genome_stats (
@@ -60,7 +61,8 @@ CREATE TABLE IF NOT EXISTS genome_stats (
     genome VARCHAR NOT NULL,
     coverage DOUBLE,
     breadth DOUBLE,
-    ber DOUBLE
+    ber DOUBLE,
+    ref_ani DOUBLE
 );
 
 CREATE TABLE IF NOT EXISTS gene_stats (
@@ -69,7 +71,8 @@ CREATE TABLE IF NOT EXISTS gene_stats (
     gene VARCHAR NOT NULL,
     coverage DOUBLE,
     breadth DOUBLE,
-    ber DOUBLE
+    ber DOUBLE,
+    ref_ani DOUBLE
 );
 
 CREATE TABLE IF NOT EXISTS sylph_abundance (
@@ -166,6 +169,9 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute(SCHEMA_SQL)
     conn.execute("ALTER TABLE sra_runs ADD COLUMN IF NOT EXISTS status VARCHAR DEFAULT 'added'")
     conn.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS gene_stats_file VARCHAR")
+    conn.execute("ALTER TABLE profile_positions ADD COLUMN IF NOT EXISTS ref_base_bitmask UTINYINT")
+    conn.execute("ALTER TABLE genome_stats ADD COLUMN IF NOT EXISTS ref_ani DOUBLE")
+    conn.execute("ALTER TABLE gene_stats ADD COLUMN IF NOT EXISTS ref_ani DOUBLE")
     conn.execute("ALTER TABLE matrix_stores ADD COLUMN IF NOT EXISTS storage_layout VARCHAR DEFAULT 'dense'")
     conn.execute("ALTER TABLE matrix_stores ADD COLUMN IF NOT EXISTS min_coverage DOUBLE")
     conn.execute("ALTER TABLE matrix_stores ADD COLUMN IF NOT EXISTS min_breadth DOUBLE")
@@ -492,11 +498,12 @@ def export_profile_parquets(
         if genome is not None and genome != "all":
             conditions.append("genome = ?")
             params.append(genome)
+        where_sql = " AND ".join(conditions)
         arrow_table = conn.execute(
             f"""
             SELECT chrom, genome, pos, COALESCE(gene, 'NA') AS gene, A, T, C, G
             FROM profile_positions
-            WHERE {' AND '.join(conditions)}
+            WHERE {where_sql}
             ORDER BY chrom, pos
             """,
             params,
@@ -708,10 +715,20 @@ def _insert_profile_positions(conn: duckdb.DuckDBPyConnection, *, sample_id: str
         pl.col("C").cast(pl.UInt16),
         pl.col("G").cast(pl.UInt16),
         pl.col("T").cast(pl.UInt16),
+        (
+            pl.col("ref_base_bitmask").cast(pl.UInt8)
+            if "ref_base_bitmask" in df.columns
+            else pl.lit(None, dtype=pl.UInt8)
+        ).alias("ref_base_bitmask"),
     )
     conn.register("_metatrawl_profile_positions", df)
     try:
-        conn.execute("INSERT INTO profile_positions SELECT * FROM _metatrawl_profile_positions")
+        conn.execute(
+            """INSERT INTO profile_positions
+               (sample_id, chrom, pos, genome, gene, A, C, G, T, ref_base_bitmask)
+               SELECT sample_id, chrom, pos, genome, gene, A, C, G, T, ref_base_bitmask
+               FROM _metatrawl_profile_positions"""
+        )
     finally:
         conn.unregister("_metatrawl_profile_positions")
 
@@ -727,10 +744,14 @@ def _insert_genome_stats(conn: duckdb.DuckDBPyConnection, *, sample_id: str, sta
         _optional_float_expr(df, ["coverage", "cov", "mean_coverage"]).alias("coverage"),
         _optional_float_expr(df, ["breadth", "breadth_coverage", "breadth_cov"]).alias("breadth"),
         _optional_float_expr(df, ["ber", "BER"]).alias("ber"),
+        _optional_float_expr(df, ["ref_ani", "reference_ani"]).alias("ref_ani"),
     )
     conn.register("_metatrawl_genome_stats", df)
     try:
-        conn.execute("INSERT INTO genome_stats SELECT * FROM _metatrawl_genome_stats")
+        conn.execute(
+            """INSERT INTO genome_stats (sample_id, genome, coverage, breadth, ber, ref_ani)
+               SELECT sample_id, genome, coverage, breadth, ber, ref_ani FROM _metatrawl_genome_stats"""
+        )
     finally:
         conn.unregister("_metatrawl_genome_stats")
 
@@ -748,10 +769,14 @@ def _insert_gene_stats(conn: duckdb.DuckDBPyConnection, *, sample_id: str, stats
         _optional_float_expr(df, ["coverage", "cov", "mean_coverage"]).alias("coverage"),
         _optional_float_expr(df, ["breadth", "breadth_coverage", "breadth_cov"]).alias("breadth"),
         _optional_float_expr(df, ["ber", "BER"]).alias("ber"),
+        _optional_float_expr(df, ["ref_ani", "reference_ani"]).alias("ref_ani"),
     )
     conn.register("_metatrawl_gene_stats", df)
     try:
-        conn.execute("INSERT INTO gene_stats SELECT * FROM _metatrawl_gene_stats")
+        conn.execute(
+            """INSERT INTO gene_stats (sample_id, genome, gene, coverage, breadth, ber, ref_ani)
+               SELECT sample_id, genome, gene, coverage, breadth, ber, ref_ani FROM _metatrawl_gene_stats"""
+        )
     finally:
         conn.unregister("_metatrawl_gene_stats")
 

@@ -130,7 +130,7 @@ class GenomeView:
         return Query(
             self.db_path,
             """
-            SELECT sample_id, genome, coverage, breadth, ber
+            SELECT sample_id, genome, coverage, breadth, ber, ref_ani
             FROM genome_stats
             WHERE genome = ?
             ORDER BY sample_id
@@ -148,7 +148,7 @@ class GenomeView:
         return Query(
             self.db_path,
             f"""
-            SELECT sample_id, genome, gene, coverage, breadth, ber
+            SELECT sample_id, genome, gene, coverage, breadth, ber, ref_ani
             FROM gene_stats
             WHERE {' AND '.join(conditions)}
             ORDER BY sample_id, gene
@@ -166,7 +166,7 @@ class GenomeView:
         return Query(
             self.db_path,
             f"""
-            SELECT sample_id, chrom, pos, genome, gene, A, C, G, T
+            SELECT sample_id, chrom, pos, genome, gene, A, C, G, T, ref_base_bitmask
             FROM profile_positions
             WHERE {' AND '.join(conditions)}
             """,
@@ -198,7 +198,7 @@ class SampleView:
         """Return genome statistics stored for this sample."""
         return self._filtered_query(
             table="genome_stats",
-            columns="sample_id, genome, coverage, breadth, ber",
+            columns="sample_id, genome, coverage, breadth, ber, ref_ani",
             genome=genome,
             order_by="genome",
         )
@@ -207,7 +207,7 @@ class SampleView:
         """Return gene statistics stored for this sample."""
         return self._filtered_query(
             table="gene_stats",
-            columns="sample_id, genome, gene, coverage, breadth, ber",
+            columns="sample_id, genome, gene, coverage, breadth, ber, ref_ani",
             genome=genome,
             gene=gene,
             order_by="genome, gene",
@@ -217,7 +217,7 @@ class SampleView:
         """Return profile positions stored for this sample."""
         return self._filtered_query(
             table="profile_positions",
-            columns="sample_id, chrom, pos, genome, gene, A, C, G, T",
+            columns="sample_id, chrom, pos, genome, gene, A, C, G, T, ref_base_bitmask",
             genome=genome,
             gene=gene,
         )

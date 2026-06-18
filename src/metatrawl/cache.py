@@ -19,6 +19,7 @@ from metatrawl.logging import WorkflowLogger
 
 Downloader = Callable[[str, Path], None]
 ProdigalRunner = Callable[[Path, Path], None]
+CommandRunner = Callable[[list[str]], subprocess.CompletedProcess[str] | None]
 
 DATASETS_RETRY_DELAYS = (5.0, 20.0, 60.0)
 PRODIGAL_RETRY_DELAYS = (2.0, 10.0)
@@ -79,6 +80,8 @@ class GenomeCache:
         downloader: Downloader | None = None,
         prodigal_runner: ProdigalRunner | None = None,
         logger: WorkflowLogger | None = None,
+        download_workers: int = 4,
+        prodigal_workers: int = 1,
     ) -> None:
         self.cache_dir = Path(cache_dir)
         self.genomes_dir = self.cache_dir / "genomes"
@@ -94,9 +97,11 @@ class GenomeCache:
         self.downloader = downloader or download_genome_with_datasets
         self.prodigal_runner = prodigal_runner or run_prodigal_gene_fasta
         self.logger = logger or WorkflowLogger()
-        self._executor = ThreadPoolExecutor(max_workers=4)
+        if download_workers < 1 or prodigal_workers < 1:
+            raise ValueError("Cache worker counts must be positive integers.")
+        self._executor = ThreadPoolExecutor(max_workers=download_workers)
         self._lock = threading.Lock()
-        self._prodigal_lock = threading.Lock()
+        self._prodigal_limit = threading.BoundedSemaphore(prodigal_workers)
         self._in_flight: dict[str, Future[tuple[Path, Path]]] = {}
 
     def prepare_accession(self, accession: str) -> tuple[Path, Path]:
@@ -199,8 +204,7 @@ class GenomeCache:
         if not gene_fasta.exists():
             self.logger.emit(accession=accession, step="prodigal", status="start")
             tmp_gene = gene_fasta.with_suffix(".tmp.fna")
-            # Keep downloads concurrent, but avoid simultaneous Prodigal model training.
-            with self._prodigal_lock:
+            with self._prodigal_limit:
                 self.prodigal_runner(genome_fasta, tmp_gene)
             _atomic_publish(tmp_gene, gene_fasta)
             self.logger.emit(accession=accession, step="prodigal", status="done", file=gene_fasta)
@@ -361,6 +365,7 @@ def download_genome_with_datasets(
     output_fasta: Path,
     *,
     retry_delays: tuple[float, ...] = DATASETS_RETRY_DELAYS,
+    command_runner: CommandRunner | None = None,
 ) -> None:
     """Download a genome FASTA, retrying transient NCBI or network failures."""
     output_fasta.parent.mkdir(parents=True, exist_ok=True)
@@ -373,8 +378,7 @@ def download_genome_with_datasets(
         if output_fasta.exists():
             output_fasta.unlink()
         try:
-            result = subprocess.run(
-                [
+            command = [
                     "datasets",
                     "download",
                     "genome",
@@ -384,10 +388,9 @@ def download_genome_with_datasets(
                     "genome",
                     "--filename",
                     str(archive),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
+                ]
+            result = command_runner(command) if command_runner is not None else subprocess.run(
+                command, check=True, capture_output=True, text=True
             )
         except OSError as exc:
             raise RuntimeError(
@@ -410,6 +413,16 @@ def download_genome_with_datasets(
             raise RuntimeError(
                 f"NCBI Datasets download failed for accession {accession} after {attempts} attempts. "
                 f"Last error: {last_error or 'unknown transient failure'}"
+            ) from exc
+        except RuntimeError as exc:
+            last_error = str(exc)
+            if _is_permanent_datasets_failure(last_error):
+                raise GenomeUnavailableError(f"NCBI Datasets cannot provide accession {accession}: {last_error}") from exc
+            if attempt < attempts:
+                time.sleep(retry_delays[attempt - 1])
+                continue
+            raise RuntimeError(
+                f"NCBI Datasets download failed for accession {accession} after {attempts} attempts. Last error: {last_error}"
             ) from exc
 
         try:
@@ -456,7 +469,9 @@ def _remove_datasets_download_artifacts(archive: Path, tmp_dir: Path) -> None:
         shutil.rmtree(tmp_dir)
 
 
-def _command_output(result: subprocess.CompletedProcess[str]) -> str:
+def _command_output(result: subprocess.CompletedProcess[str] | None) -> str:
+    if result is None:
+        return ""
     return "\n".join(part.strip() for part in (result.stderr, result.stdout) if part and part.strip())
 
 
@@ -479,6 +494,7 @@ def run_prodigal_gene_fasta(
     output_gene_fasta: Path,
     *,
     retry_delays: tuple[float, ...] = PRODIGAL_RETRY_DELAYS,
+    command_runner: CommandRunner | None = None,
 ) -> None:
     """Annotate one assembled genome, retrying transient process crashes."""
     output_gene_fasta.parent.mkdir(parents=True, exist_ok=True)
@@ -488,7 +504,10 @@ def run_prodigal_gene_fasta(
         if output_gene_fasta.exists():
             output_gene_fasta.unlink()
         try:
-            subprocess.run(command, check=True, capture_output=True, text=True)
+            if command_runner is None:
+                subprocess.run(command, check=True, capture_output=True, text=True)
+            else:
+                command_runner(command)
             return
         except OSError:
             raise
@@ -502,6 +521,11 @@ def run_prodigal_gene_fasta(
                 f"Prodigal failed for {genome_fasta} after {attempts} attempts;"
                 f"{signal_detail} last_error={detail}"
             ) from exc
+        except RuntimeError:
+            if attempt < attempts:
+                time.sleep(retry_delays[attempt - 1])
+                continue
+            raise
 
 
 def _concatenate_fastas(inputs: list[Path], output: Path) -> None:

@@ -1,0 +1,56 @@
+# Samples can overlap cheap stages, while expensive stages have independent limits.
+sample_workers = 12
+
+[stages.sra_download]
+workers = 6
+threads = 4
+execution = "local"
+
+[stages.sylph]
+workers = 6
+threads = 2
+execution = "local"
+
+[stages.genome_download]
+workers = 12
+threads = 1
+execution = "local"
+
+[stages.prodigal]
+workers = 2
+threads = 1
+execution = "local"
+
+[stages.prepare_profile]
+workers = 4
+threads = 2
+execution = "local"
+
+[stages.bowtie_build]
+workers = 1
+threads = 12
+execution = "local"
+
+[stages.alignment]
+workers = 2
+threads = 16
+execution = "slurm"
+environment = { OMP_NUM_THREADS = "16" }
+
+[stages.alignment.slurm]
+time = "04:00:00"
+memory_gb = 64
+partition = "compute"
+# account = "project-name"
+
+[stages.profile]
+workers = 2
+threads = 8
+execution = "local"
+
+[matrix_compare]
+anchor_queue_size = 1
+target_queue_size = 2
+result_transfer_batch_size = 512
+loader_executor_kind = "thread"
+writer_executor_kind = "thread"
