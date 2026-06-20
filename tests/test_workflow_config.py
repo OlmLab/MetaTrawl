@@ -22,6 +22,8 @@ time = "03:00:00"
 memory_gb = 48
 partition = "compute"
 [matrix_compare]
+calculate = "ani+ibs"
+memory_limit_gb = 48.5
 target_queue_size = 3
 loader_executor_kind = "process"
 ''')
@@ -31,6 +33,8 @@ loader_executor_kind = "process"
     assert config.stage("bowtie_build").threads == 12
     assert config.stage("bowtie_build").execution == "slurm"
     assert config.stage("bowtie_build").slurm.memory_gb == 48
+    assert config.matrix_compare.calculate == "ani+ibs"
+    assert config.matrix_compare.memory_limit_gb == 48.5
     assert config.matrix_compare.kwargs() == {"target_queue_size": 3, "loader_executor_kind": "process"}
 
 
@@ -47,6 +51,13 @@ def test_config_rejects_unknown_stage(tmp_path: Path) -> None:
     path = tmp_path / "workflow.toml"
     path.write_text("[stages.typo]\nworkers = 2\n")
     with pytest.raises(ValueError, match="Unknown workflow stages: typo"):
+        load_workflow_config(path, threads=2, sample_count=2)
+
+
+def test_config_rejects_nonpositive_matrix_memory_limit(tmp_path: Path) -> None:
+    path = tmp_path / "workflow.toml"
+    path.write_text("[matrix_compare]\nmemory_limit_gb = 0\n")
+    with pytest.raises(ValueError, match="matrix_compare.memory_limit_gb must be a positive number"):
         load_workflow_config(path, threads=2, sample_count=2)
 
 

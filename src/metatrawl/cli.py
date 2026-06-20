@@ -568,12 +568,12 @@ def matrix_append(db_file: Path, matrix_id: str | None, matrix_file: Path | None
 @click.option("--matrix-id", help="Registered matrix ID.")
 @click.option("--matrix-file", type=click.Path(path_type=Path), help="Registered matrix HDF5 file.")
 @click.option("--output-file", required=True, type=click.Path(path_type=Path), help="Output ZipStrain compare DuckDB.")
-@click.option("--calculate", default="all", show_default=True, help="Metrics to calculate.")
+@click.option("--calculate", default=None, help="Metrics to calculate; overrides workflow configuration.")
 @click.option("--genome", default="all", show_default=True, help="Optional compare genome scope.")
 @click.option("--backend", default="numpy", show_default=True, help="ZipStrain matrix backend.")
-@click.option("--memory-limit-gb", type=float, default=16.0, show_default=True)
+@click.option("--memory-limit-gb", type=float, default=None, help="Comparison memory limit; overrides workflow configuration.")
 @click.option("--workflow-config", type=click.Path(path_type=Path), help="TOML/JSON ZipStrain queue/executor controls.")
-def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | None, output_file: Path, calculate: str, genome: str, backend: str, memory_limit_gb: float, workflow_config: Path | None) -> None:
+def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | None, output_file: Path, calculate: str | None, genome: str, backend: str, memory_limit_gb: float | None, workflow_config: Path | None) -> None:
     """Compare a registered matrix store."""
     try:
         with registry.connect(db_file) as conn:
@@ -583,15 +583,21 @@ def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | Non
                 matrix_file=matrix_file,
             )
             execution_config = load_workflow_config(workflow_config, threads=1, sample_count=1)
+            resolved_calculate = calculate or execution_config.matrix_compare.calculate or "all"
+            resolved_memory_limit_gb = (
+                memory_limit_gb
+                if memory_limit_gb is not None
+                else execution_config.matrix_compare.memory_limit_gb or 16.0
+            )
             compare_id = workflows.compare_matrix_file(
                 conn,
                 matrix_file=resolved_matrix_file,
                 matrix_id=resolved_matrix_id,
                 output_file=output_file,
-                calculate=calculate,
+                calculate=resolved_calculate,
                 genome=genome,
                 backend=backend,
-                memory_limit_gb=memory_limit_gb,
+                memory_limit_gb=resolved_memory_limit_gb,
                 compare_config=execution_config.matrix_compare,
                 logger=WorkflowLogger(),
             )
@@ -604,33 +610,39 @@ def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | Non
 @click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
 @click.option("--matrix-dir", required=True, type=click.Path(path_type=Path), help="Directory containing per-genome HDF5 matrices.")
 @click.option("--compare-dir", required=True, type=click.Path(path_type=Path), help="Directory for per-genome compare DuckDB files.")
-@click.option("--calculate", default="all", show_default=True, help="Metrics to calculate.")
+@click.option("--calculate", default=None, help="Metrics to calculate; overrides workflow configuration.")
 @click.option("--genome", default="all", show_default=True, help="Optional compare genome scope.")
 @click.option("--backend", default="numpy", show_default=True, help="ZipStrain matrix backend.")
-@click.option("--memory-limit-gb", type=float, default=16.0, show_default=True)
+@click.option("--memory-limit-gb", type=float, default=None, help="Comparison memory limit; overrides workflow configuration.")
 @click.option("--workflow-config", type=click.Path(path_type=Path), help="TOML/JSON ZipStrain queue/executor controls.")
 def matrix_sync_compare(
     db_file: Path,
     matrix_dir: Path,
     compare_dir: Path,
-    calculate: str,
+    calculate: str | None,
     genome: str,
     backend: str,
-    memory_limit_gb: float,
+    memory_limit_gb: float | None,
     workflow_config: Path | None,
 ) -> None:
     """Run resumable compare for every matrix file in a directory."""
     try:
         with registry.connect(db_file) as conn:
             execution_config = load_workflow_config(workflow_config, threads=1, sample_count=1)
+            resolved_calculate = calculate or execution_config.matrix_compare.calculate or "all"
+            resolved_memory_limit_gb = (
+                memory_limit_gb
+                if memory_limit_gb is not None
+                else execution_config.matrix_compare.memory_limit_gb or 16.0
+            )
             summary = workflows.sync_compare_matrices(
                 conn,
                 matrix_dir=matrix_dir,
                 compare_dir=compare_dir,
-                calculate=calculate,
+                calculate=resolved_calculate,
                 genome=genome,
                 backend=backend,
-                memory_limit_gb=memory_limit_gb,
+                memory_limit_gb=resolved_memory_limit_gb,
                 compare_config=execution_config.matrix_compare,
                 logger=WorkflowLogger(),
             )

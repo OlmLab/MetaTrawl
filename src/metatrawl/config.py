@@ -26,6 +26,8 @@ class StageConfig:
 
 @dataclass(frozen=True)
 class MatrixCompareConfig:
+    calculate: str | None = None
+    memory_limit_gb: float | None = None
     anchor_queue_size: int | None = None
     target_queue_size: int | None = None
     result_transfer_batch_size: int | None = None
@@ -118,6 +120,8 @@ def _parse(raw: dict[str, Any], *, threads: int, sample_count: int) -> WorkflowC
     if not isinstance(compare, dict):
         raise ValueError("matrix_compare must be a table/object.")
     return WorkflowConfig(sample_workers=sample_workers, stages=stages, matrix_compare=MatrixCompareConfig(
+        calculate=_optional_string(compare.get("calculate")),
+        memory_limit_gb=_optional_positive_float(compare.get("memory_limit_gb"), "matrix_compare.memory_limit_gb"),
         anchor_queue_size=_optional_positive(compare.get("anchor_queue_size"), "matrix_compare.anchor_queue_size"),
         target_queue_size=_optional_positive(compare.get("target_queue_size"), "matrix_compare.target_queue_size"),
         result_transfer_batch_size=_optional_positive(compare.get("result_transfer_batch_size"), "matrix_compare.result_transfer_batch_size"),
@@ -136,6 +140,17 @@ def _positive(value: Any, key: str) -> int:
 
 def _optional_positive(value: Any, key: str) -> int | None:
     return None if value is None else _positive(value, key)
+
+def _optional_positive_float(value: Any, key: str) -> float | None:
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a positive number.") from exc
+    if result <= 0:
+        raise ValueError(f"{key} must be a positive number.")
+    return result
 
 def _optional_string(value: Any) -> str | None:
     return None if value in (None, "") else str(value)

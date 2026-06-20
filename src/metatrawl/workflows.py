@@ -10,6 +10,7 @@ import shlex
 import shutil
 import subprocess
 from tempfile import TemporaryDirectory
+from typing import Callable
 
 import polars as pl
 
@@ -607,11 +608,13 @@ def profile_sra_runs(
     workflow_config: WorkflowConfig | None = None,
     logger: WorkflowLogger | None = None,
     raise_on_error: bool = True,
+    completion_callback: Callable[[str], None] | None = None,
 ) -> dict[str, str]:
-    """Download/profile SRA runs, import outputs, and delete per-sample scratch.
+    """Profile SRA runs, retaining failed stage outputs for resumable retries.
 
-    This is intentionally conservative: it wires the lifecycle and cleanup, while
-    external-command behavior remains visible and easy to replace in tests.
+    ``completion_callback`` runs serially in the coordinator thread as soon as a
+    sample finishes. Sync uses it to import each sample before its scratch data is
+    removed, avoiding concurrent DuckDB writers and batch-wide import delays.
     """
     logger = logger or WorkflowLogger()
     workflow_config = workflow_config or WorkflowConfig.legacy(threads=threads, sample_count=len(run_ids))
@@ -655,9 +658,21 @@ def profile_sra_runs(
             run_id = futures[future]
             try:
                 future.result()
+                if completion_callback is not None:
+                    completion_callback(run_id)
+                sample_scratch = Path(scratch_dir) / run_id
+                if sample_scratch.exists():
+                    shutil.rmtree(sample_scratch)
+                    logger.emit(sample=run_id, step="cleanup", status="done", removed=sample_scratch)
             except Exception as exc:
                 failures[run_id] = str(exc)
                 logger.emit(sample=run_id, step="profile-sra", status="failed", error=exc)
+                logger.emit(
+                    sample=run_id,
+                    step="checkpoint",
+                    status="retained",
+                    path=Path(scratch_dir) / run_id,
+                )
     logger.emit(
         step="profile-sra",
         status="done",
@@ -700,41 +715,42 @@ def sync_remaining_profiles(
         return SyncSummary(requested=0, imported=0, skipped=0, failed=0, cleaned_files=0)
 
     logger.emit(step="sync", status="start", remaining=len(run_ids), output_dir=output_dir)
-    failures = profile_sra_runs(
-        run_ids=run_ids,
-        db_file=db_file,
-        cache_dir=cache_dir,
-        scratch_dir=scratch_dir,
-        sylph_db=sylph_db,
-        output_dir=output_dir,
-        accessions_dir=accessions_dir,
-        threads=threads,
-        workflow_config=workflow_config,
-        logger=logger,
-        raise_on_error=False,
-    )
-    failures = failures or {}
-
     imported = 0
     skipped = 0
     cleaned_files = 0
     with db.connect(db_file) as conn:
-        for run_id in run_ids:
+        def import_completed_sample(run_id: str) -> None:
+            nonlocal imported, cleaned_files
             try:
                 bundle = discover_profile_bundle(output_dir=output_dir, run_id=run_id)
             except FileNotFoundError as exc:
-                skipped += 1
                 logger.emit(sample=run_id, step="import", status="missing-output", error=exc)
-                db.mark_run_failed(conn, run_id=run_id, error=failures.get(run_id, str(exc)))
-                continue
+                raise
             logger.emit(sample=run_id, step="import", status="start")
             db.import_profile_bundle(conn, bundle)
             imported += 1
-            logger.emit(sample=run_id, step="import", status="done")
+            logger.emit(sample=run_id, step="import", status="done", imported=imported)
             if cleanup_outputs:
                 removed = cleanup_profile_bundle(bundle)
                 cleaned_files += removed
                 logger.emit(sample=run_id, step="cleanup", status="done", removed_files=removed)
+
+        failures = profile_sra_runs(
+            run_ids=run_ids,
+            db_file=db_file,
+            cache_dir=cache_dir,
+            scratch_dir=scratch_dir,
+            sylph_db=sylph_db,
+            output_dir=output_dir,
+            accessions_dir=accessions_dir,
+            threads=threads,
+            workflow_config=workflow_config,
+            logger=logger,
+            raise_on_error=False,
+            completion_callback=import_completed_sample,
+        ) or {}
+        for run_id, error in failures.items():
+            db.mark_run_failed(conn, run_id=run_id, error=error)
 
     failed = len(failures)
     logger.emit(
@@ -841,71 +857,103 @@ def _profile_one_sra_run(
 ) -> None:
     sample_scratch = Path(scratch_dir) / run_id
     sample_scratch.mkdir(parents=True, exist_ok=True)
-    try:
+    reads_dir = sample_scratch / "reads"
+    reads_dir.mkdir(parents=True, exist_ok=True)
+    sra_dir = sample_scratch / "sra"
+    sra_archive = sra_dir / run_id / f"{run_id}.sra"
+
+    if not _sample_fastqs(sample_scratch, required=False):
         logger.emit(sample=run_id, step="download", status="start")
         download_threads = runtime.threads("sra_download")
-        runtime.run("sra_download", ["prefetch", run_id], sample=run_id)
+        if not _valid_file(sra_archive):
+            sra_dir.mkdir(parents=True, exist_ok=True)
+            runtime.run(
+                "sra_download",
+                ["prefetch", "--output-directory", str(sra_dir), run_id],
+                sample=run_id,
+            )
+        else:
+            logger.emit(sample=run_id, step="prefetch", status="cached", file=sra_archive)
         runtime.run(
             "sra_download",
-            ["fasterq-dump", run_id, "--outdir", str(sample_scratch), "--threads", str(download_threads)],
+            ["fasterq-dump", str(sra_archive), "--outdir", str(reads_dir), "--threads", str(download_threads)],
             sample=run_id,
         )
-        accessions_file = sample_scratch / "accessions.txt"
-        if not accessions_file.exists() and accessions_dir is not None:
-            source = _find_sample_accessions_file(accessions_dir, run_id)
-            if source is not None:
-                shutil.copy2(source, accessions_file)
-                logger.emit(sample=run_id, step="sylph", status="using-accessions-file", file=source)
-        sylph_output = sample_scratch / f"{run_id}.sylph.tsv"
-        if not accessions_file.exists():
-            if sylph_db is None:
-                raise FileNotFoundError(
-                    f"sample={run_id} step=sylph missing accession list and no Sylph database was provided. "
-                    "Pass --sylph-db so MetaTrawl can run `sylph profile`, or pass --accessions-dir as a manual override."
-                )
-            logger.emit(sample=run_id, step="sylph", status="start", syldb=sylph_db)
-            _run_sylph_profile(
-                sylph_db=sylph_db,
-                sample_scratch=sample_scratch,
-                run_id=run_id,
-                runtime=runtime,
-                output_file=sylph_output,
-            )
-            accessions = extract_accessions_from_sylph_table(sylph_output)
-            if not accessions:
-                raise ValueError(f"sample={run_id} step=sylph produced no nonzero genome accessions: {sylph_output}")
-            _write_accessions_file(accessions_file, accessions)
-            logger.emit(sample=run_id, step="sylph", status="done", genomes=len(accessions), output=sylph_output)
-            if output_dir is not None:
-                output_dir.mkdir(parents=True, exist_ok=True)
-                published_sylph = output_dir / f"{run_id}.sylph.tsv"
-                shutil.copy2(sylph_output, published_sylph)
-                logger.emit(sample=run_id, step="sylph", status="published", file=published_sylph)
-        if not accessions_file.exists():
+        logger.emit(sample=run_id, step="download", status="done", fastqs=len(_sample_fastqs(sample_scratch)))
+    else:
+        logger.emit(sample=run_id, step="download", status="cached", fastqs=len(_sample_fastqs(sample_scratch)))
+
+    accessions_file = sample_scratch / "accessions.txt"
+    if not accessions_file.exists() and accessions_dir is not None:
+        source = _find_sample_accessions_file(accessions_dir, run_id)
+        if source is not None:
+            shutil.copy2(source, accessions_file)
+            logger.emit(sample=run_id, step="sylph", status="using-accessions-file", file=source)
+    sylph_output = sample_scratch / f"{run_id}.sylph.tsv"
+    if not accessions_file.exists():
+        if sylph_db is None:
             raise FileNotFoundError(
-                f"sample={run_id} step=sylph missing accession list. "
-                f"Expected scratch file: {accessions_file}"
+                f"sample={run_id} step=sylph missing accession list and no Sylph database was provided. "
+                "Pass --sylph-db so MetaTrawl can run `sylph profile`, or pass --accessions-dir as a manual override."
             )
-        accessions = cache.read_accessions_file(accessions_file)
+        logger.emit(sample=run_id, step="sylph", status="start", syldb=sylph_db)
+        _run_sylph_profile(
+            sylph_db=sylph_db,
+            sample_scratch=sample_scratch,
+            run_id=run_id,
+            runtime=runtime,
+            output_file=sylph_output,
+        )
+        accessions = extract_accessions_from_sylph_table(sylph_output)
+        if not accessions:
+            raise ValueError(f"sample={run_id} step=sylph produced no nonzero genome accessions: {sylph_output}")
+        _write_accessions_file(accessions_file, accessions)
+        logger.emit(sample=run_id, step="sylph", status="done", genomes=len(accessions), output=sylph_output)
+    else:
+        logger.emit(sample=run_id, step="sylph", status="cached", file=accessions_file)
+    if output_dir is not None and _valid_file(sylph_output):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        published_sylph = output_dir / f"{run_id}.sylph.tsv"
+        if not _valid_file(published_sylph):
+            shutil.copy2(sylph_output, published_sylph)
+            logger.emit(sample=run_id, step="sylph", status="published", file=published_sylph)
+
+    accessions = cache.read_accessions_file(accessions_file)
+    reference_dir = sample_scratch / "reference"
+    reference = _cached_reference(reference_dir)
+    if reference is None:
         reference = cache_manager.prepare_reference(
             accessions=accessions,
-            output_dir=sample_scratch / "reference",
+            output_dir=reference_dir,
             sample=run_id,
         )
-        logger.emit(sample=run_id, step="profile", status="ready", reference=reference.reference_fasta)
-        if output_dir is not None:
-            _run_alignment_and_profile(
-                run_id=run_id,
-                sample_scratch=sample_scratch,
-                reference=reference,
-                output_dir=output_dir,
-                runtime=runtime,
-                logger=logger,
-            )
-    finally:
-        if sample_scratch.exists():
-            shutil.rmtree(sample_scratch)
-            logger.emit(sample=run_id, step="cleanup", status="done", removed=sample_scratch)
+    else:
+        logger.emit(sample=run_id, step="cache", status="cached-reference", reference=reference.reference_fasta)
+    logger.emit(sample=run_id, step="profile", status="ready", reference=reference.reference_fasta)
+    if output_dir is not None:
+        _run_alignment_and_profile(
+            run_id=run_id,
+            sample_scratch=sample_scratch,
+            reference=reference,
+            output_dir=output_dir,
+            runtime=runtime,
+            logger=logger,
+        )
+
+
+def _valid_file(path: Path) -> bool:
+    return path.is_file() and path.stat().st_size > 0
+
+
+def _cached_reference(reference_dir: Path) -> cache.PreparedReference | None:
+    reference = cache.PreparedReference(
+        reference_fasta=reference_dir / "reference.fna",
+        gene_fasta=reference_dir / "genes.fna",
+        stb_file=reference_dir / "reference.stb",
+    )
+    if all(_valid_file(path) for path in (reference.reference_fasta, reference.gene_fasta, reference.stb_file)):
+        return reference
+    return None
 
 
 def _run(cmd: list[str], *, sample: str, step: str) -> None:
@@ -957,88 +1005,128 @@ def _run_alignment_and_profile(
     profile_work = sample_scratch / "zipstrain_profile"
     profile_work.mkdir(parents=True, exist_ok=True)
 
-    logger.emit(sample=run_id, step="prepare-profile", status="start")
-    runtime.run(
-        "prepare_profile",
-        [
-            "zipstrain",
-            "utilities",
-            "prepare_profiling",
-            "--reference-fasta",
-            str(reference.reference_fasta),
-            "--gene-fasta",
-            str(reference.gene_fasta),
-            "--stb-file",
-            str(reference.stb_file),
-            "--output-dir",
-            str(profile_work),
-        ],
-        sample=run_id,
+    prepared_outputs = (
+        profile_work / "genomes_bed_file.bed",
+        profile_work / "gene_range_table.tsv",
+        profile_work / "profiling_contract.json",
     )
+    if not all(_valid_file(path) for path in prepared_outputs):
+        logger.emit(sample=run_id, step="prepare-profile", status="start")
+        runtime.run(
+            "prepare_profile",
+            [
+                "zipstrain",
+                "utilities",
+                "prepare_profiling",
+                "--reference-fasta",
+                str(reference.reference_fasta),
+                "--gene-fasta",
+                str(reference.gene_fasta),
+                "--stb-file",
+                str(reference.stb_file),
+                "--output-dir",
+                str(profile_work),
+            ],
+            sample=run_id,
+        )
+        logger.emit(sample=run_id, step="prepare-profile", status="done")
+    else:
+        logger.emit(sample=run_id, step="prepare-profile", status="cached")
     _ensure_null_model(profile_work=profile_work, run_id=run_id, logger=logger, runtime=runtime)
-    logger.emit(sample=run_id, step="prepare-profile", status="done")
 
-    logger.emit(sample=run_id, step="bowtie2-build", status="start")
-    bowtie_threads = runtime.threads("bowtie_build")
-    runtime.run(
-        "bowtie_build",
-        ["bowtie2-build", "--threads", str(bowtie_threads), str(reference.reference_fasta), str(reference.reference_fasta)],
-        sample=run_id,
-    )
-    logger.emit(sample=run_id, step="bowtie2-build", status="done")
+    if not _bowtie_index_complete(reference.reference_fasta):
+        logger.emit(sample=run_id, step="bowtie2-build", status="start")
+        bowtie_threads = runtime.threads("bowtie_build")
+        runtime.run(
+            "bowtie_build",
+            ["bowtie2-build", "--threads", str(bowtie_threads), str(reference.reference_fasta), str(reference.reference_fasta)],
+            sample=run_id,
+        )
+        logger.emit(sample=run_id, step="bowtie2-build", status="done")
+    else:
+        logger.emit(sample=run_id, step="bowtie2-build", status="cached")
 
     bam_file = sample_scratch / f"{run_id}.bam"
-    logger.emit(sample=run_id, step="align", status="start", bam=bam_file)
-    runtime.run_shell(
-        "alignment",
-        _build_alignment_command(
-            reference_fasta=reference.reference_fasta,
-            fastqs=_sample_fastqs(sample_scratch),
-            threads=runtime.threads("alignment"),
-            bam_file=bam_file,
-        ),
-        sample=run_id,
-    )
-    logger.emit(sample=run_id, step="align", status="done", bam=bam_file)
+    if not _valid_file(bam_file):
+        logger.emit(sample=run_id, step="align", status="start", bam=bam_file)
+        temporary_bam = bam_file.with_suffix(".bam.tmp")
+        temporary_bam.unlink(missing_ok=True)
+        runtime.run_shell(
+            "alignment",
+            _build_alignment_command(
+                reference_fasta=reference.reference_fasta,
+                fastqs=_sample_fastqs(sample_scratch),
+                threads=runtime.threads("alignment"),
+                bam_file=temporary_bam,
+            ),
+            sample=run_id,
+        )
+        if not _valid_file(temporary_bam):
+            raise RuntimeError(f"sample={run_id} step=align did not produce a non-empty BAM: {temporary_bam}")
+        temporary_bam.replace(bam_file)
+        logger.emit(sample=run_id, step="align", status="done", bam=bam_file)
+    else:
+        logger.emit(sample=run_id, step="align", status="cached", bam=bam_file)
 
-    logger.emit(sample=run_id, step="profile", status="start")
-    runtime.run(
-        "profile",
-        [
-            "zipstrain",
-            "utilities",
-            "profile-single",
-            "--bam-file",
-            str(bam_file),
-            "--bed-file",
-            str(profile_work / "genomes_bed_file.bed"),
-            "--stb-file",
-            str(reference.stb_file),
-            "--null-model",
-            str(profile_work / "null_model.parquet"),
-            "--gene-range-table",
-            str(profile_work / "gene_range_table.tsv"),
-            "--reference-fasta",
-            str(profile_work / "reference.fasta"),
-            "--profiling-contract",
-            str(profile_work / "profiling_contract.json"),
-            "--max-concurrency",
-            str(runtime.threads("profile")),
-            "--output-dir",
-            str(profile_work),
-        ],
-        sample=run_id,
-    )
-    _publish_profile_outputs(run_id=run_id, profile_work=profile_work, output_dir=output_dir)
-    logger.emit(sample=run_id, step="profile", status="done", output_dir=output_dir)
+    if not _published_profile_bundle_complete(run_id=run_id, output_dir=output_dir):
+        logger.emit(sample=run_id, step="profile", status="start")
+        runtime.run(
+            "profile",
+            [
+                "zipstrain",
+                "utilities",
+                "profile-single",
+                "--bam-file",
+                str(bam_file),
+                "--bed-file",
+                str(profile_work / "genomes_bed_file.bed"),
+                "--stb-file",
+                str(reference.stb_file),
+                "--null-model",
+                str(profile_work / "null_model.parquet"),
+                "--gene-range-table",
+                str(profile_work / "gene_range_table.tsv"),
+                "--reference-fasta",
+                str(profile_work / "reference.fasta"),
+                "--profiling-contract",
+                str(profile_work / "profiling_contract.json"),
+                "--max-concurrency",
+                str(runtime.threads("profile")),
+                "--output-dir",
+                str(profile_work),
+            ],
+            sample=run_id,
+        )
+        _publish_profile_outputs(run_id=run_id, profile_work=profile_work, output_dir=output_dir)
+        logger.emit(sample=run_id, step="profile", status="done", output_dir=output_dir)
+    else:
+        logger.emit(sample=run_id, step="profile", status="cached", output_dir=output_dir)
 
 
-def _sample_fastqs(sample_scratch: Path) -> list[Path]:
-    fastqs = sorted(sample_scratch.glob("*.fastq")) + sorted(sample_scratch.glob("*.fq"))
-    fastqs += sorted(sample_scratch.glob("*.fastq.gz")) + sorted(sample_scratch.glob("*.fq.gz"))
-    if not fastqs:
+def _sample_fastqs(sample_scratch: Path, *, required: bool = True) -> list[Path]:
+    fastqs: list[Path] = []
+    for pattern in ("*.fastq", "*.fq", "*.fastq.gz", "*.fq.gz"):
+        fastqs.extend(sorted(sample_scratch.rglob(pattern)))
+    fastqs = [path for path in fastqs if _valid_file(path)]
+    if required and not fastqs:
         raise FileNotFoundError(f"step=align found no FASTQ files in {sample_scratch}")
     return fastqs
+
+
+def _bowtie_index_complete(reference_fasta: Path) -> bool:
+    small = [Path(f"{reference_fasta}.{suffix}.bt2") for suffix in ("1", "2", "3", "4", "rev.1", "rev.2")]
+    large = [Path(f"{reference_fasta}.{suffix}.bt2l") for suffix in ("1", "2", "3", "4", "rev.1", "rev.2")]
+    return all(_valid_file(path) for path in small) or all(_valid_file(path) for path in large)
+
+
+def _published_profile_bundle_complete(*, run_id: str, output_dir: Path) -> bool:
+    required = (
+        output_dir / f"{run_id}.profile.parquet",
+        output_dir / f"{run_id}.genome_stats.parquet",
+        output_dir / f"{run_id}.gene_stats.parquet",
+        output_dir / f"{run_id}.sylph.tsv",
+    )
+    return all(_valid_file(path) for path in required)
 
 
 def _ensure_null_model(*, profile_work: Path, run_id: str, logger: WorkflowLogger, runtime: WorkflowRuntime) -> Path:
@@ -1100,10 +1188,7 @@ def _run_sylph_profile(
     runtime: WorkflowRuntime | _DirectRuntime | None = None, threads: int | None = None, output_file: Path
 ) -> None:
     runtime = runtime or _DirectRuntime(threads or 1)
-    fastqs = sorted(sample_scratch.glob("*.fastq")) + sorted(sample_scratch.glob("*.fq"))
-    fastqs += sorted(sample_scratch.glob("*.fastq.gz")) + sorted(sample_scratch.glob("*.fq.gz"))
-    if not fastqs:
-        raise FileNotFoundError(f"sample={run_id} step=sylph found no FASTQ files in {sample_scratch}")
+    fastqs = _sample_fastqs(sample_scratch)
     if len(fastqs) == 2:
         cmd = ["sylph", "profile", str(sylph_db), "-1", str(fastqs[0]), "-2", str(fastqs[1]), "-t", str(runtime.threads("sylph"))]
     else:

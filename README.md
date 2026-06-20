@@ -366,6 +366,168 @@ Each stage supports `workers`, `threads`, `execution = "local" | "slurm"`, and a
 
 The configurable stages are `sra_download`, `sylph`, `genome_download`, `prodigal`, `prepare_profile`, `bowtie_build`, `alignment`, and `profile`. Without `--workflow-config`, `--threads` retains the previous behavior.
 
-The same file can provide ZipStrain matrix comparison queue and executor controls under `[matrix_compare]`, and can be passed to `matrix compare` or `matrix sync-compare`.
+The same file can configure `calculate`, `memory_limit_gb`, and ZipStrain queue/executor controls under `[matrix_compare]`; pass it to `matrix compare` or `matrix sync-compare`. Explicit `--calculate` and `--memory-limit-gb` CLI values override the TOML values.
+
+### Complete TOML template
+
+The following template contains every currently supported workflow option. A
+stage with `execution = "local"` ignores its `[stages.<name>.slurm]` table, so
+those tables can remain in one reusable configuration while you switch selected
+stages between local and Slurm execution.
+
+```toml
+# Maximum number of samples progressing through the workflow concurrently.
+sample_workers = 12
+
+[stages.sra_download]
+workers = 6
+threads = 4
+execution = "local" # "local" or "slurm"
+
+[stages.sra_download.environment]
+VDB_CONFIG = "/path/to/vdb-config"
+
+[stages.sra_download.slurm]
+time = "02:00:00"
+memory_gb = 16
+partition = "compute"
+account = "project-name"
+
+[stages.sra_download.slurm.extra]
+constraint = "nvme"
+
+[stages.sylph]
+workers = 6
+threads = 2
+execution = "local"
+
+[stages.sylph.environment]
+OMP_NUM_THREADS = "2"
+
+[stages.sylph.slurm]
+time = "01:00:00"
+memory_gb = 16
+partition = "compute"
+account = "project-name"
+
+[stages.sylph.slurm.extra]
+qos = "normal"
+
+[stages.genome_download]
+workers = 12
+threads = 1
+execution = "local"
+
+[stages.genome_download.environment]
+NCBI_API_KEY = "replace-if-used"
+
+[stages.genome_download.slurm]
+time = "01:00:00"
+memory_gb = 8
+partition = "compute"
+account = "project-name"
+
+[stages.genome_download.slurm.extra]
+qos = "normal"
+
+[stages.prodigal]
+workers = 2
+threads = 1
+execution = "local"
+
+[stages.prodigal.environment]
+OMP_NUM_THREADS = "1"
+
+[stages.prodigal.slurm]
+time = "01:00:00"
+memory_gb = 8
+partition = "compute"
+account = "project-name"
+
+[stages.prodigal.slurm.extra]
+qos = "normal"
+
+[stages.prepare_profile]
+workers = 4
+threads = 2
+execution = "local"
+
+[stages.prepare_profile.environment]
+POLARS_MAX_THREADS = "2"
+
+[stages.prepare_profile.slurm]
+time = "01:00:00"
+memory_gb = 16
+partition = "compute"
+account = "project-name"
+
+[stages.prepare_profile.slurm.extra]
+qos = "normal"
+
+[stages.bowtie_build]
+workers = 1
+threads = 12
+execution = "local"
+
+[stages.bowtie_build.environment]
+OMP_NUM_THREADS = "12"
+
+[stages.bowtie_build.slurm]
+time = "02:00:00"
+memory_gb = 32
+partition = "compute"
+account = "project-name"
+
+[stages.bowtie_build.slurm.extra]
+qos = "normal"
+
+[stages.alignment]
+workers = 2
+threads = 16
+execution = "slurm"
+
+[stages.alignment.environment]
+OMP_NUM_THREADS = "16"
+
+[stages.alignment.slurm]
+time = "04:00:00"
+memory_gb = 64
+partition = "compute"
+account = "project-name"
+
+[stages.alignment.slurm.extra]
+qos = "normal"
+
+[stages.profile]
+workers = 2
+threads = 8
+execution = "local"
+
+[stages.profile.environment]
+POLARS_MAX_THREADS = "8"
+
+[stages.profile.slurm]
+time = "02:00:00"
+memory_gb = 32
+partition = "compute"
+account = "project-name"
+
+[stages.profile.slurm.extra]
+qos = "normal"
+
+[matrix_compare]
+calculate = "all"
+memory_limit_gb = 32
+anchor_queue_size = 1
+target_queue_size = 2
+result_transfer_batch_size = 512
+loader_executor_kind = "thread"
+writer_executor_kind = "thread"
+```
+
+Remove environment variables that your installation does not use, especially
+the placeholder `NCBI_API_KEY`. The values above are an example allocation, not
+universal defaults; tune workers, threads, memory, partitions, and accounts for
+your machine or cluster.
 
 Current ZipStrain profiling receives both `reference.fasta` and `profiling_contract.json`. This preserves the reference-aware profile fields and enables `ref_ani` in imported genome and gene statistics.

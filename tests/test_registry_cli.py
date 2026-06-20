@@ -720,6 +720,7 @@ def test_profile_sra_deletes_temporary_reference_files_after_success(tmp_path: P
             sample_dir = scratch_dir / "SRR1"
             sample_dir.mkdir(parents=True, exist_ok=True)
             (sample_dir / "accessions.txt").write_text("GCF_1\n")
+            (sample_dir / "SRR1.fastq").write_text("@r1\nACGT\n+\n!!!!\n")
         return subprocess.CompletedProcess(cmd, 0)
 
     class FakeGenomeCache:
@@ -757,6 +758,10 @@ def test_profile_sra_uses_per_sample_accessions_dir(tmp_path: Path, monkeypatch)
     prepared_accessions: list[list[str]] = []
 
     def fake_run(cmd: list[str], **kwargs):
+        if cmd[0] == "fasterq-dump":
+            reads_dir = Path(cmd[cmd.index("--outdir") + 1])
+            reads_dir.mkdir(parents=True, exist_ok=True)
+            (reads_dir / "SRR1.fastq").write_text("@r1\nACGT\n+\n!!!!\n")
         return subprocess.CompletedProcess(cmd, 0)
 
     class FakeGenomeCache:
@@ -878,6 +883,7 @@ def test_alignment_and_profile_stage_publishes_outputs(tmp_path: Path, monkeypat
 
     def fake_shell(*, command: str, sample: str) -> None:
         shell_calls.append(command)
+        (sample_scratch / "SRR1.bam.tmp").write_text("bam")
 
     monkeypatch.setattr(workflows, "_run", fake_run)
     monkeypatch.setattr(workflows, "_run_alignment_shell", fake_shell)
@@ -936,7 +942,11 @@ def test_alignment_profile_builds_null_model_when_prepare_does_not(tmp_path: Pat
             (output_dir / "SRR1_gene_stats.parquet").write_text("gene")
 
     monkeypatch.setattr(workflows, "_run", fake_run)
-    monkeypatch.setattr(workflows, "_run_alignment_shell", lambda **kwargs: None)
+    monkeypatch.setattr(
+        workflows,
+        "_run_alignment_shell",
+        lambda **kwargs: (sample_scratch / "SRR1.bam.tmp").write_text("bam"),
+    )
 
     workflows._run_alignment_and_profile(
         run_id="SRR1",
@@ -992,6 +1002,9 @@ def test_sync_profiles_remaining_runs_and_imports_outputs(tmp_path: Path, monkey
         output_dir.mkdir(parents=True, exist_ok=True)
         bundle = _write_bundle_files(output_dir, "SRR2")
         bundle.profile_file.rename(output_dir / "SRR2.profile.parquet")
+        kwargs["completion_callback"]("SRR2")
+        with registry.connect(db_file) as conn:
+            assert conn.execute("SELECT status FROM sra_runs WHERE run_id = 'SRR2'").fetchone() == ("complete",)
 
     monkeypatch.setattr(workflows, "profile_sra_runs", fake_profile_sra_runs)
 
@@ -1024,6 +1037,81 @@ def test_sync_profiles_remaining_runs_and_imports_outputs(tmp_path: Path, monkey
     assert not (output_dir / "SRR2.sylph.csv").exists()
 
 
+def test_profile_sra_scopes_prefetch_to_sample_scratch_and_retains_failed_work(tmp_path: Path, monkeypatch) -> None:
+    scratch_dir = tmp_path / "scratch"
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs):
+        calls.append(cmd)
+        if cmd[0] == "fasterq-dump":
+            reads_dir = Path(cmd[cmd.index("--outdir") + 1])
+            reads_dir.mkdir(parents=True, exist_ok=True)
+            (reads_dir / "SRR1.fastq").write_text("@r1\nACGT\n+\n!!!!\n")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(workflows.subprocess, "run", fake_run)
+
+    failures = workflows.profile_sra_runs(
+        run_ids=["SRR1"],
+        db_file=tmp_path / "metatrawl.duckdb",
+        cache_dir=tmp_path / "cache",
+        scratch_dir=scratch_dir,
+        raise_on_error=False,
+        logger=WorkflowLogger(),
+    )
+
+    prefetch = next(call for call in calls if call[0] == "prefetch")
+    assert prefetch == [
+        "prefetch",
+        "--output-directory",
+        str(scratch_dir / "SRR1" / "sra"),
+        "SRR1",
+    ]
+    assert "SRR1" in failures
+    assert (scratch_dir / "SRR1" / "reads" / "SRR1.fastq").exists()
+
+
+def test_profile_sra_reuses_downloaded_reads_on_retry(tmp_path: Path, monkeypatch) -> None:
+    scratch_dir = tmp_path / "scratch"
+    sample_dir = scratch_dir / "SRR1"
+    reads_dir = sample_dir / "reads"
+    reads_dir.mkdir(parents=True)
+    (reads_dir / "SRR1.fastq").write_text("@r1\nACGT\n+\n!!!!\n")
+    (sample_dir / "accessions.txt").write_text("GCF_1\n")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    class FakeGenomeCache:
+        def __init__(self, cache_dir: Path, **kwargs) -> None:
+            pass
+
+        def prepare_reference(self, *, accessions: list[str], output_dir: Path, sample: str | None = None):
+            output_dir.mkdir(parents=True, exist_ok=True)
+            reference = output_dir / "reference.fna"
+            genes = output_dir / "genes.fna"
+            stb = output_dir / "reference.stb"
+            reference.write_text(">g\nACGT\n")
+            genes.write_text(">gene\nAC\n")
+            stb.write_text("g\tGCF_1\n")
+            return cache.PreparedReference(reference, genes, stb)
+
+    monkeypatch.setattr(workflows.subprocess, "run", fake_run)
+    monkeypatch.setattr(workflows.cache, "GenomeCache", FakeGenomeCache)
+
+    workflows.profile_sra_runs(
+        run_ids=["SRR1"],
+        db_file=tmp_path / "metatrawl.duckdb",
+        cache_dir=tmp_path / "cache",
+        scratch_dir=scratch_dir,
+        logger=WorkflowLogger(),
+    )
+
+    assert not any(call[0] in {"prefetch", "fasterq-dump"} for call in calls)
+
+
 def test_sync_profile_runs_profile_sync(tmp_path: Path, monkeypatch) -> None:
     runner = CliRunner()
     db_file = tmp_path / "metatrawl.duckdb"
@@ -1034,6 +1122,7 @@ def test_sync_profile_runs_profile_sync(tmp_path: Path, monkeypatch) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
         bundle = _write_bundle_files(output_dir, "SRR1")
         bundle.profile_file.rename(output_dir / "SRR1.profile.parquet")
+        kwargs["completion_callback"]("SRR1")
 
     monkeypatch.setattr(workflows, "profile_sra_runs", fake_profile_sra_runs)
 
@@ -1069,6 +1158,7 @@ def test_sync_can_keep_profile_outputs_for_debugging(tmp_path: Path, monkeypatch
         output_dir.mkdir(parents=True, exist_ok=True)
         bundle = _write_bundle_files(output_dir, "SRR1")
         bundle.profile_file.rename(output_dir / "SRR1.profile.parquet")
+        kwargs["completion_callback"]("SRR1")
 
     monkeypatch.setattr(workflows, "profile_sra_runs", fake_profile_sra_runs)
 
@@ -1110,6 +1200,7 @@ def test_sync_checkpoints_successful_samples_before_reporting_failures(tmp_path:
         output_dir.mkdir(parents=True, exist_ok=True)
         bundle = _write_bundle_files(output_dir, "SRR_GOOD")
         bundle.profile_file.rename(output_dir / "SRR_GOOD.profile.parquet")
+        kwargs["completion_callback"]("SRR_GOOD")
         return {"SRR_BAD": "prodigal crashed"}
 
     monkeypatch.setattr(workflows, "profile_sra_runs", fake_profile_sra_runs)
@@ -1294,6 +1385,8 @@ def test_matrix_compare_uses_registered_matrix_store(tmp_path: Path, monkeypatch
     db_file = tmp_path / "metatrawl.duckdb"
     matrix_file = tmp_path / "matrix.h5"
     matrix_file.write_text("matrix")
+    workflow_config = tmp_path / "workflow.toml"
+    workflow_config.write_text('[matrix_compare]\ncalculate = "ani+gene"\nmemory_limit_gb = 24\n')
     calls: list[dict[str, object]] = []
 
     with registry.connect(db_file) as conn:
@@ -1338,16 +1431,18 @@ def test_matrix_compare_uses_registered_matrix_store(tmp_path: Path, monkeypatch
             "genome_a",
             "--output-file",
             str(tmp_path / "compare.duckdb"),
-            "--calculate",
-            "all",
+            "--workflow-config",
+            str(workflow_config),
         ],
     )
 
     assert result.exit_code == 0, result.output
     assert "compare_id=compare" in result.output
     assert calls[0]["matrix_db_file"] == matrix_file
+    assert calls[0]["calculate"] == "ani+gene"
+    assert calls[0]["memory_limit_gb"] == 24.0
     with duckdb.connect(str(db_file)) as conn:
-        assert conn.execute("SELECT compare_id, matrix_id, calculate FROM matrix_compares").fetchall() == [("compare", "genome_a", "all")]
+        assert conn.execute("SELECT compare_id, matrix_id, calculate FROM matrix_compares").fetchall() == [("compare", "genome_a", "ani+gene")]
 
 
 def test_matrix_compare_accepts_registered_matrix_file(tmp_path: Path, monkeypatch) -> None:

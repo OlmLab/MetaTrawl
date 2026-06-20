@@ -49,6 +49,8 @@ threads = 8
 execution = "local"
 
 [matrix_compare]
+calculate = "all"
+memory_limit_gb = 32
 anchor_queue_size = 1
 target_queue_size = 2
 result_transfer_batch_size = 512
