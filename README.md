@@ -52,26 +52,62 @@ intermediate outputs live in scratch space and are deleted after successful
 import. The DuckDB database, genome cache, matrix stores, and comparison
 databases remain durable.
 
-## Install For Development
+## Installation
+
+### Recommended: Bioconda
+
+For the complete workflow, Conda is the recommended installation method:
 
 ```bash
-pip install -e ".[test]"
+conda install bioconda::metatrawl
 ```
 
-MetaTrawl checks for the external tools used by the full workflow:
-`zipstrain`, `sylph`, `samtools`, `bowtie2`, `prefetch`, `fasterq-dump`,
-`datasets`, and `prodigal`.
+The Bioconda package installs MetaTrawl together with the external tools used by
+the pipeline, including ZipStrain, Sylph, Bowtie2, Samtools, Prodigal, SRA
+Toolkit, and NCBI Datasets.
+
+Installing into a dedicated environment keeps the workflow isolated:
+
+```bash
+conda create -n metatrawl bioconda::metatrawl
+conda activate metatrawl
+```
+
+### PyPI
+
+MetaTrawl is also available from PyPI:
+
+```bash
+pip install metatrawl
+```
+
+The PyPI package installs MetaTrawl and its Python dependencies. It does not
+install the external command-line tools required by the complete SRA profiling
+workflow. Use Bioconda unless those tools are already installed independently.
+
+### Verify The Installation
+
+Check the installed Python packages and external executables:
 
 ```bash
 metatrawl test
 ```
 
-Use the strict checker before long jobs. It exits non-zero if anything required
-is missing:
+Use the strict check before starting a long workflow. It exits non-zero when a
+required dependency is unavailable:
 
 ```bash
 metatrawl check
 ```
+
+### Development Installation
+
+```bash
+pip install -e ".[test]"
+```
+
+This installs the local checkout with the test dependencies. External workflow
+tools must still be available in the active environment.
 
 ## Tutorial: SRA IDs To Comparisons
 
@@ -370,10 +406,9 @@ The same file can configure `calculate`, `memory_limit_gb`, and ZipStrain queue/
 
 ### Complete TOML template
 
-The following template contains every currently supported workflow option. A
-stage with `execution = "local"` ignores its `[stages.<name>.slurm]` table, so
-those tables can remain in one reusable configuration while you switch selected
-stages between local and Slurm execution.
+This copy-ready template configures every pipeline stage. Only alignment uses
+Slurm in this example; all other stages run locally. Change a stage's
+`execution` to `"slurm"` and give it a corresponding Slurm table when needed.
 
 ```toml
 # Maximum number of samples progressing through the workflow concurrently.
@@ -384,110 +419,35 @@ workers = 6
 threads = 4
 execution = "local" # "local" or "slurm"
 
-[stages.sra_download.environment]
-VDB_CONFIG = "/path/to/vdb-config"
-
-[stages.sra_download.slurm]
-time = "02:00:00"
-memory_gb = 16
-partition = "compute"
-account = "project-name"
-
-[stages.sra_download.slurm.extra]
-constraint = "nvme"
-
 [stages.sylph]
 workers = 6
 threads = 2
 execution = "local"
-
-[stages.sylph.environment]
-OMP_NUM_THREADS = "2"
-
-[stages.sylph.slurm]
-time = "01:00:00"
-memory_gb = 16
-partition = "compute"
-account = "project-name"
-
-[stages.sylph.slurm.extra]
-qos = "normal"
 
 [stages.genome_download]
 workers = 12
 threads = 1
 execution = "local"
 
-[stages.genome_download.environment]
-NCBI_API_KEY = "replace-if-used"
-
-[stages.genome_download.slurm]
-time = "01:00:00"
-memory_gb = 8
-partition = "compute"
-account = "project-name"
-
-[stages.genome_download.slurm.extra]
-qos = "normal"
-
 [stages.prodigal]
 workers = 2
 threads = 1
 execution = "local"
-
-[stages.prodigal.environment]
-OMP_NUM_THREADS = "1"
-
-[stages.prodigal.slurm]
-time = "01:00:00"
-memory_gb = 8
-partition = "compute"
-account = "project-name"
-
-[stages.prodigal.slurm.extra]
-qos = "normal"
 
 [stages.prepare_profile]
 workers = 4
 threads = 2
 execution = "local"
 
-[stages.prepare_profile.environment]
-POLARS_MAX_THREADS = "2"
-
-[stages.prepare_profile.slurm]
-time = "01:00:00"
-memory_gb = 16
-partition = "compute"
-account = "project-name"
-
-[stages.prepare_profile.slurm.extra]
-qos = "normal"
-
 [stages.bowtie_build]
 workers = 1
 threads = 12
 execution = "local"
 
-[stages.bowtie_build.environment]
-OMP_NUM_THREADS = "12"
-
-[stages.bowtie_build.slurm]
-time = "02:00:00"
-memory_gb = 32
-partition = "compute"
-account = "project-name"
-
-[stages.bowtie_build.slurm.extra]
-qos = "normal"
-
 [stages.alignment]
 workers = 2
 threads = 16
 execution = "slurm"
-
-[stages.alignment.environment]
-OMP_NUM_THREADS = "16"
 
 [stages.alignment.slurm]
 time = "04:00:00"
@@ -495,25 +455,10 @@ memory_gb = 64
 partition = "compute"
 account = "project-name"
 
-[stages.alignment.slurm.extra]
-qos = "normal"
-
 [stages.profile]
 workers = 2
 threads = 8
 execution = "local"
-
-[stages.profile.environment]
-POLARS_MAX_THREADS = "8"
-
-[stages.profile.slurm]
-time = "02:00:00"
-memory_gb = 32
-partition = "compute"
-account = "project-name"
-
-[stages.profile.slurm.extra]
-qos = "normal"
 
 [matrix_compare]
 calculate = "all"
@@ -525,9 +470,10 @@ loader_executor_kind = "thread"
 writer_executor_kind = "thread"
 ```
 
-Remove environment variables that your installation does not use, especially
-the placeholder `NCBI_API_KEY`. The values above are an example allocation, not
-universal defaults; tune workers, threads, memory, partitions, and accounts for
-your machine or cluster.
+The values above are an example allocation, not universal defaults. Tune
+workers, threads, memory, partition, and account for your machine or cluster.
+MetaTrawl also accepts optional per-stage `environment` and `slurm.extra` tables
+when a real tool or cluster requires them; they are intentionally omitted here
+because the standard pipeline does not require any.
 
 Current ZipStrain profiling receives both `reference.fasta` and `profiling_contract.json`. This preserves the reference-aware profile fields and enables `ref_ani` in imported genome and gene statistics.
