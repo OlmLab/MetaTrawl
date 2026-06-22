@@ -195,7 +195,9 @@ def test_connect_normalizes_existing_sylph_genome_paths(tmp_path: Path) -> None:
 def test_database_lists_distinct_genomes_and_samples(tmp_path: Path) -> None:
     database = open_database(_database(tmp_path))
 
-    assert database.genomes().collect()["genome"].to_list() == ["genome_1", "genome_2"]
+    genomes = database.genomes()
+    assert "profile_positions" not in genomes.sql
+    assert genomes.collect()["genome"].to_list() == ["genome_1", "genome_2"]
     samples = database.samples().collect()
     assert samples["sample_id"].to_list() == ["sample_a", "sample_b"]
     assert samples["status"].to_list() == ["complete", "complete"]

@@ -21,12 +21,12 @@ just lists it as a run dependency — only **one** recipe to submit.
 
 The recipe is `noarch: python`, built from the PyPI sdist:
 
-- `metatrawl` 0.1.4 — `sha256 883cc9af585f2f152a03a730a4231dca70201e542090fc00fac3d7ddbc90dac6`
+- `metatrawl` 0.1.5 — `sha256 3ec0a9d37732d979865b029255a93a214f381d88144864b97055c3c604fba90c`
   (hash of the locally built sdist; valid if you publish that exact artifact)
 
 ## Blockers to clear before submitting
 
-1. **Re-release MetaTrawl as 0.1.4.** The MIT `LICENSE` and the
+1. **Release MetaTrawl as 0.1.5.** The MIT `LICENSE` and the
    `license`/`license-files` fields are now in the repo, but the **0.1.3 sdist
    already on PyPI does not contain `LICENSE`**. Bioconda needs the
    `license_file` inside the sdist, so a fresh release is required (Poetry):
@@ -34,9 +34,9 @@ The recipe is `noarch: python`, built from the PyPI sdist:
    cd MetaTrawl
    rm -rf dist
    poetry build --format sdist                          # already built once; rebuild is fine
-   tar tzf dist/metatrawl-0.1.4.tar.gz | grep LICENSE   # must print a match
+   tar tzf dist/metatrawl-0.1.5.tar.gz | grep LICENSE   # must print a match
    poetry publish                                       # uploads the existing dist/ artifact
-   shasum -a 256 dist/metatrawl-0.1.4.tar.gz            # must match meta.yaml sha256
+   shasum -a 256 dist/metatrawl-0.1.5.tar.gz            # must match meta.yaml sha256
    ```
    Publish the artifact you hashed; if you rebuild before uploading, refresh the
    `sha256` in `metatrawl/meta.yaml`.

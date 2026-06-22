@@ -27,7 +27,11 @@ class MetaTrawlDatabase:
         return SampleView(self.path, _required_text(sample_id, "sample_id"))
 
     def genomes(self, pattern: str | None = None) -> Query:
-        """Return distinct genomes, optionally filtered by a regular expression."""
+        """Return profiled genomes, optionally filtered by a regular expression.
+
+        Genome statistics contain one compact row per sample and genome. Using
+        them as the catalog avoids scanning the position-level profile table.
+        """
         condition = ""
         parameters: tuple[Any, ...] = ()
         if pattern is not None:
@@ -36,16 +40,8 @@ class MetaTrawlDatabase:
         return Query(
             self.path,
             f"""
-            SELECT genome
-            FROM (
-                SELECT genome FROM genome_stats
-                UNION
-                SELECT genome FROM gene_stats WHERE genome IS NOT NULL
-                UNION
-                SELECT genome FROM profile_positions
-                UNION
-                SELECT genome FROM sylph_abundance WHERE genome IS NOT NULL
-            )
+            SELECT DISTINCT genome
+            FROM genome_stats
             WHERE genome IS NOT NULL
               {condition}
             ORDER BY genome
