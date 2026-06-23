@@ -871,10 +871,13 @@ def test_alignment_and_profile_stage_publishes_outputs(tmp_path: Path, monkeypat
         if cmd[:3] == ["zipstrain", "utilities", "prepare_profiling"]:
             output_dir = Path(cmd[cmd.index("--output-dir") + 1])
             output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "reference.fasta").write_text(">contig\nACGT\n")
             (output_dir / "genomes_bed_file.bed").write_text("contig\t1\t4\n")
             (output_dir / "gene_range_table.tsv").write_text("gene\tcontig\t1\t2\n")
             (output_dir / "null_model.parquet").write_text("null")
             (output_dir / "profiling_contract.json").write_text("{}")
+        if cmd[:2] == ["samtools", "faidx"]:
+            Path(str(cmd[2]) + ".fai").write_text("contig\t4\t8\t4\t5\n")
         if cmd[:3] == ["zipstrain", "utilities", "profile-single"]:
             output_dir = Path(cmd[cmd.index("--output-dir") + 1])
             (output_dir / "SRR1_profile.parquet").write_text("profile")
@@ -898,6 +901,9 @@ def test_alignment_and_profile_stage_publishes_outputs(tmp_path: Path, monkeypat
     )
 
     assert any(call[:2] == ["bowtie2-build", "--threads"] for call in run_calls)
+    faidx_index = next(index for index, call in enumerate(run_calls) if call[:2] == ["samtools", "faidx"])
+    profile_index = next(index for index, call in enumerate(run_calls) if call[:3] == ["zipstrain", "utilities", "profile-single"])
+    assert faidx_index < profile_index
     profile_calls = [call for call in run_calls if call[:3] == ["zipstrain", "utilities", "profile-single"]]
     assert profile_calls
     assert "--profiling-contract" in profile_calls[0]
@@ -931,10 +937,13 @@ def test_alignment_profile_builds_null_model_when_prepare_does_not(tmp_path: Pat
         if cmd[:3] == ["zipstrain", "utilities", "prepare_profiling"]:
             output_dir = Path(cmd[cmd.index("--output-dir") + 1])
             output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "reference.fasta").write_text(">contig\nACGT\n")
             (output_dir / "genomes_bed_file.bed").write_text("contig\t1\t4\n")
             (output_dir / "gene_range_table.tsv").write_text("gene\tcontig\t1\t2\n")
         if cmd[:3] == ["zipstrain", "utilities", "build-null-model"]:
             Path(cmd[cmd.index("--output-file") + 1]).write_text("null")
+        if cmd[:2] == ["samtools", "faidx"]:
+            Path(str(cmd[2]) + ".fai").write_text("contig\t4\t8\t4\t5\n")
         if cmd[:3] == ["zipstrain", "utilities", "profile-single"]:
             output_dir = Path(cmd[cmd.index("--output-dir") + 1])
             (output_dir / "SRR1_profile.parquet").write_text("profile")

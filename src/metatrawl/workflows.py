@@ -1033,6 +1033,7 @@ def _run_alignment_and_profile(
     else:
         logger.emit(sample=run_id, step="prepare-profile", status="cached")
     _ensure_null_model(profile_work=profile_work, run_id=run_id, logger=logger, runtime=runtime)
+    _ensure_reference_fai(profile_work=profile_work, run_id=run_id, logger=logger, runtime=runtime)
 
     if not _bowtie_index_complete(reference.reference_fasta):
         logger.emit(sample=run_id, step="bowtie2-build", status="start")
@@ -1147,6 +1148,25 @@ def _ensure_null_model(*, profile_work: Path, run_id: str, logger: WorkflowLogge
     )
     logger.emit(sample=run_id, step="null-model", status="done", output=null_model)
     return null_model
+
+
+def _ensure_reference_fai(*, profile_work: Path, run_id: str, logger: WorkflowLogger, runtime: WorkflowRuntime) -> Path:
+    """Build the FASTA index once before concurrent mpileup workers can race on it."""
+    reference_fasta = profile_work / "reference.fasta"
+    if not reference_fasta.exists():
+        raise FileNotFoundError(f"sample={run_id} step=reference-index missing reference FASTA: {reference_fasta}")
+    fai_file = Path(str(reference_fasta) + ".fai")
+    logger.emit(sample=run_id, step="reference-index", status="start", reference=reference_fasta)
+    fai_file.unlink(missing_ok=True)
+    runtime.run(
+        "prepare_profile",
+        ["samtools", "faidx", str(reference_fasta)],
+        sample=run_id,
+    )
+    if not _valid_file(fai_file):
+        raise RuntimeError(f"sample={run_id} step=reference-index did not produce FASTA index: {fai_file}")
+    logger.emit(sample=run_id, step="reference-index", status="done", index=fai_file)
+    return fai_file
 
 
 def _build_alignment_command(*, reference_fasta: Path, fastqs: list[Path], threads: int, bam_file: Path) -> str:
