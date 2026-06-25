@@ -1250,7 +1250,9 @@ def test_matrix_build_filters_samples_exports_selected_and_passes_sparse(tmp_pat
     assert runner.invoke(cli.cli, ["runs", "add", "--db", str(db_file), "SRR_PASS", "SRR_FAIL"]).exit_code == 0
     _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR_PASS", coverage=5, breadth=0.95, ber=0.9, abundance=0.2))
     _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR_FAIL", coverage=0.1, breadth=0.2, ber=0.1, abundance=0.001))
+    _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR_STATS_ONLY", coverage=5, breadth=0.95, ber=0.9, abundance=0.2), add_run=True)
     with registry.connect(db_file) as conn:
+        conn.execute("UPDATE profile_positions SET genome = 'other_genome' WHERE sample_id = 'SRR_STATS_ONLY'")
         conn.execute(
             """
             INSERT INTO profile_positions
@@ -1310,6 +1312,55 @@ def test_matrix_build_filters_samples_exports_selected_and_passes_sparse(tmp_pat
     with duckdb.connect(str(db_file)) as conn:
         assert conn.execute("SELECT storage_layout, profile_count FROM matrix_stores").fetchall() == [("sparse", 1)]
         assert conn.execute("SELECT sample_id FROM matrix_store_samples").fetchall() == [("SRR_PASS",)]
+
+
+def test_matrix_build_ignores_stats_only_sample_without_matching_profile_rows(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR_GOOD", coverage=5, breadth=0.95, ber=0.9), add_run=True)
+    _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR_STATS_ONLY", coverage=5, breadth=0.95, ber=0.9), add_run=True)
+    with registry.connect(db_file) as conn:
+        conn.execute("UPDATE profile_positions SET genome = 'other_genome' WHERE sample_id = 'SRR_STATS_ONLY'")
+    bed_file, stb_file = _matrix_contract_files(tmp_path)
+    staged: dict[str, pl.DataFrame] = {}
+
+    def build_matrix_hdf5(**kwargs):
+        profile_dir = Path(kwargs["profile_dir"])
+        staged.update({path.name: pl.read_parquet(path) for path in profile_dir.glob("*.parquet")})
+        Path(kwargs["output_file"]).write_text("matrix")
+
+    zipstrain_module = types.ModuleType("zipstrain")
+    matrix_pairs_module = types.ModuleType("zipstrain.matrix_pairs")
+    matrix_pairs_module.build_matrix_hdf5 = build_matrix_hdf5
+    monkeypatch.setitem(sys.modules, "zipstrain", zipstrain_module)
+    monkeypatch.setitem(sys.modules, "zipstrain.matrix_pairs", matrix_pairs_module)
+    monkeypatch.setattr(zipstrain_module, "matrix_pairs", matrix_pairs_module, raising=False)
+    monkeypatch.setattr(workflows, "_write_matrix_hdf5_metatrawl_metadata", lambda *args, **kwargs: None)
+
+    result = runner.invoke(
+        cli.cli,
+        [
+            "matrix",
+            "build",
+            "--db",
+            str(db_file),
+            "--genome",
+            "genome_a",
+            "--bed-file",
+            str(bed_file),
+            "--stb-file",
+            str(stb_file),
+            "--output-file",
+            str(tmp_path / "matrix.h5"),
+            "--min-coverage",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "profiles=1" in result.output
+    assert sorted(staged) == ["SRR_GOOD.parquet"]
+    assert staged["SRR_GOOD.parquet"]["genome"].unique().to_list() == ["genome_a"]
 
 
 def test_matrix_build_fails_when_no_complete_profiles_exist(tmp_path: Path) -> None:
@@ -1395,7 +1446,7 @@ def test_matrix_compare_uses_registered_matrix_store(tmp_path: Path, monkeypatch
     matrix_file = tmp_path / "matrix.h5"
     matrix_file.write_text("matrix")
     workflow_config = tmp_path / "workflow.toml"
-    workflow_config.write_text('[matrix_compare]\ncalculate = "ani+gene"\nmemory_limit_gb = 24\n')
+    workflow_config.write_text('[matrix_compare]\ncalculate = "ani+gene"\ngenome = "genome_scope"\nbackend = "mps"\nmemory_limit_gb = 24\n')
     calls: list[dict[str, object]] = []
 
     with registry.connect(db_file) as conn:
@@ -1449,6 +1500,8 @@ def test_matrix_compare_uses_registered_matrix_store(tmp_path: Path, monkeypatch
     assert "compare_id=compare" in result.output
     assert calls[0]["matrix_db_file"] == matrix_file
     assert calls[0]["calculate"] == "ani+gene"
+    assert calls[0]["genome"] == "genome_scope"
+    assert calls[0]["backend"] == "mps"
     assert calls[0]["memory_limit_gb"] == 24.0
     with duckdb.connect(str(db_file)) as conn:
         assert conn.execute("SELECT compare_id, matrix_id, calculate FROM matrix_compares").fetchall() == [("compare", "genome_a", "ani+gene")]
@@ -1584,7 +1637,14 @@ def test_matrix_append_exports_only_eligible_samples_and_matrix_genome(tmp_path:
         _write_bundle_files(tmp_path, "SRR_FAIL", coverage=0.1, breadth=0.95, ber=0.9, abundance=0.2),
         add_run=True,
     )
+    _import_bundle(
+        runner,
+        db_file,
+        _write_bundle_files(tmp_path, "SRR_STATS_ONLY", coverage=5, breadth=0.95, ber=0.9, abundance=0.2),
+        add_run=True,
+    )
     with registry.connect(db_file) as conn:
+        conn.execute("UPDATE profile_positions SET genome = 'other_genome' WHERE sample_id = 'SRR_STATS_ONLY'")
         conn.execute(
             """
             INSERT INTO profile_positions
@@ -1849,6 +1909,108 @@ def test_matrix_sync_compare_runs_all_matrix_files(tmp_path: Path, monkeypatch) 
     assert calls == [("genome_a.h5", "genome_a.duckdb"), ("genome_b.hdf5", "genome_b.duckdb")]
     assert "matrices=2" in result.output
     assert "compared=2" in result.output
+
+
+def test_matrix_sync_compare_uses_workflow_config_when_cli_args_are_omitted(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    matrix_dir = tmp_path / "matrices"
+    compare_dir = tmp_path / "compares"
+    workflow_config = tmp_path / "workflow.toml"
+    matrix_dir.mkdir()
+    (matrix_dir / "genome_a.h5").write_text("matrix")
+    workflow_config.write_text(
+        '[matrix_compare]\n'
+        'calculate = "ani+gene"\n'
+        'genome = "genome_scope"\n'
+        'backend = "mps"\n'
+        'memory_limit_gb = 24\n'
+    )
+    calls: list[dict[str, object]] = []
+
+    def compare_matrix_file(conn, **kwargs):
+        calls.append(kwargs)
+        Path(kwargs["output_file"]).write_text("compare")
+        return Path(kwargs["output_file"]).stem
+
+    monkeypatch.setattr(workflows, "compare_matrix_file", compare_matrix_file)
+
+    result = runner.invoke(
+        cli.cli,
+        [
+            "matrix",
+            "sync-compare",
+            "--db",
+            str(db_file),
+            "--matrix-dir",
+            str(matrix_dir),
+            "--compare-dir",
+            str(compare_dir),
+            "--workflow-config",
+            str(workflow_config),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0]["calculate"] == "ani+gene"
+    assert calls[0]["genome"] == "genome_scope"
+    assert calls[0]["backend"] == "mps"
+    assert calls[0]["memory_limit_gb"] == 24.0
+
+
+def test_matrix_sync_compare_cli_args_override_workflow_config(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    matrix_dir = tmp_path / "matrices"
+    compare_dir = tmp_path / "compares"
+    workflow_config = tmp_path / "workflow.toml"
+    matrix_dir.mkdir()
+    (matrix_dir / "genome_a.h5").write_text("matrix")
+    workflow_config.write_text(
+        '[matrix_compare]\n'
+        'calculate = "ani+gene"\n'
+        'genome = "genome_scope"\n'
+        'backend = "mps"\n'
+        'memory_limit_gb = 24\n'
+    )
+    calls: list[dict[str, object]] = []
+
+    def compare_matrix_file(conn, **kwargs):
+        calls.append(kwargs)
+        Path(kwargs["output_file"]).write_text("compare")
+        return Path(kwargs["output_file"]).stem
+
+    monkeypatch.setattr(workflows, "compare_matrix_file", compare_matrix_file)
+
+    result = runner.invoke(
+        cli.cli,
+        [
+            "matrix",
+            "sync-compare",
+            "--db",
+            str(db_file),
+            "--matrix-dir",
+            str(matrix_dir),
+            "--compare-dir",
+            str(compare_dir),
+            "--workflow-config",
+            str(workflow_config),
+            "--calculate",
+            "all",
+            "--genome",
+            "all",
+            "--backend",
+            "numpy",
+            "--memory-limit-gb",
+            "16",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0]["calculate"] == "all"
+    assert calls[0]["genome"] == "all"
+    assert calls[0]["backend"] == "numpy"
+    assert calls[0]["memory_limit_gb"] == 16.0
 
 
 def test_matrix_commands_reject_id_and_file_together(tmp_path: Path) -> None:

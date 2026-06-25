@@ -21,12 +21,16 @@ class StageConfig:
     workers: int = 1
     threads: int = 1
     execution: str = "local"
+    retries: int = 0
+    retry_delay_seconds: float = 0.0
     environment: dict[str, str] = field(default_factory=dict)
     slurm: SlurmConfig = field(default_factory=SlurmConfig)
 
 @dataclass(frozen=True)
 class MatrixCompareConfig:
     calculate: str | None = None
+    genome: str | None = None
+    backend: str | None = None
     memory_limit_gb: float | None = None
     anchor_queue_size: int | None = None
     target_queue_size: int | None = None
@@ -107,6 +111,11 @@ def _parse(raw: dict[str, Any], *, threads: int, sample_count: int) -> WorkflowC
             workers=_positive(value.get("workers", default.workers), f"stages.{name}.workers"),
             threads=_positive(value.get("threads", default.threads), f"stages.{name}.threads"),
             execution=execution,
+            retries=_nonnegative_int(value.get("retries", default.retries), f"stages.{name}.retries"),
+            retry_delay_seconds=_nonnegative_float(
+                value.get("retry_delay_seconds", default.retry_delay_seconds),
+                f"stages.{name}.retry_delay_seconds",
+            ),
             environment=_mapping(value.get("environment", {}), f"stages.{name}.environment"),
             slurm=SlurmConfig(
                 time=str(slurm_value.get("time", "01:00:00")),
@@ -121,6 +130,8 @@ def _parse(raw: dict[str, Any], *, threads: int, sample_count: int) -> WorkflowC
         raise ValueError("matrix_compare must be a table/object.")
     return WorkflowConfig(sample_workers=sample_workers, stages=stages, matrix_compare=MatrixCompareConfig(
         calculate=_optional_string(compare.get("calculate")),
+        genome=_optional_string(compare.get("genome")),
+        backend=_optional_string(compare.get("backend")),
         memory_limit_gb=_optional_positive_float(compare.get("memory_limit_gb"), "matrix_compare.memory_limit_gb"),
         anchor_queue_size=_optional_positive(compare.get("anchor_queue_size"), "matrix_compare.anchor_queue_size"),
         target_queue_size=_optional_positive(compare.get("target_queue_size"), "matrix_compare.target_queue_size"),
@@ -138,8 +149,26 @@ def _positive(value: Any, key: str) -> int:
         raise ValueError(f"{key} must be a positive integer.")
     return result
 
+def _nonnegative_int(value: Any, key: str) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a non-negative integer.") from exc
+    if result < 0:
+        raise ValueError(f"{key} must be a non-negative integer.")
+    return result
+
 def _optional_positive(value: Any, key: str) -> int | None:
     return None if value is None else _positive(value, key)
+
+def _nonnegative_float(value: Any, key: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a non-negative number.") from exc
+    if result < 0:
+        raise ValueError(f"{key} must be a non-negative number.")
+    return result
 
 def _optional_positive_float(value: Any, key: str) -> float | None:
     if value is None:

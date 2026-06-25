@@ -398,11 +398,11 @@ metatrawl sync-profile \
   --workflow-config examples/workflow.toml
 ```
 
-Each stage supports `workers`, `threads`, `execution = "local" | "slurm"`, and an optional `environment` table. Slurm stages also accept `time`, `memory_gb`, `partition`, `account`, and arbitrary `extra` `sbatch` options. MetaTrawl submits Slurm jobs with `sbatch --wait`; checkpointing, output publication, and scratch cleanup therefore happen only after the job completes.
+Each stage supports `workers`, `threads`, `execution = "local" | "slurm"`, `retries`, `retry_delay_seconds`, and an optional `environment` table. Slurm stages also accept `time`, `memory_gb`, `partition`, `account`, and arbitrary `extra` `sbatch` options. MetaTrawl submits Slurm jobs with `sbatch --wait`; checkpointing, output publication, and scratch cleanup therefore happen only after the job completes. If a stage fails, MetaTrawl retries that stage command or Slurm job according to the stage retry settings before marking the sample failed.
 
 The configurable stages are `sra_download`, `sylph`, `genome_download`, `prodigal`, `prepare_profile`, `bowtie_build`, `alignment`, and `profile`. Without `--workflow-config`, `--threads` retains the previous behavior.
 
-The same file can configure `calculate`, `memory_limit_gb`, and ZipStrain queue/executor controls under `[matrix_compare]`; pass it to `matrix compare` or `matrix sync-compare`. Explicit `--calculate` and `--memory-limit-gb` CLI values override the TOML values.
+The same file can configure `calculate`, `genome`, `backend`, `memory_limit_gb`, and ZipStrain queue/executor controls under `[matrix_compare]`; pass it to `matrix compare` or `matrix sync-compare`. Explicit CLI values override the matching TOML values.
 
 ### Complete TOML template
 
@@ -418,36 +418,50 @@ sample_workers = 12
 workers = 6
 threads = 4
 execution = "local" # "local" or "slurm"
+retries = 2
+retry_delay_seconds = 60
 
 [stages.sylph]
 workers = 6
 threads = 2
 execution = "local"
+retries = 2
+retry_delay_seconds = 60
 
 [stages.genome_download]
 workers = 12
 threads = 1
 execution = "local"
+retries = 2
+retry_delay_seconds = 60
 
 [stages.prodigal]
 workers = 2
 threads = 1
 execution = "local"
+retries = 1
+retry_delay_seconds = 30
 
 [stages.prepare_profile]
 workers = 4
 threads = 2
 execution = "local"
+retries = 1
+retry_delay_seconds = 30
 
 [stages.bowtie_build]
 workers = 1
 threads = 12
 execution = "local"
+retries = 1
+retry_delay_seconds = 60
 
 [stages.alignment]
 workers = 2
 threads = 16
 execution = "slurm"
+retries = 3
+retry_delay_seconds = 120
 
 [stages.alignment.slurm]
 time = "04:00:00"
@@ -459,9 +473,13 @@ account = "project-name"
 workers = 2
 threads = 8
 execution = "local"
+retries = 3
+retry_delay_seconds = 120
 
 [matrix_compare]
 calculate = "all"
+genome = "all"
+backend = "numpy"
 memory_limit_gb = 32
 anchor_queue_size = 1
 target_queue_size = 2

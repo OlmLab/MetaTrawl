@@ -508,8 +508,9 @@ def export_profile_parquets(
             """,
             params,
         ).fetch_arrow_table()
-        pl.from_arrow(arrow_table).write_parquet(output_file)
-        paths.append(output_file)
+        if arrow_table.num_rows:
+            pl.from_arrow(arrow_table).write_parquet(output_file)
+            paths.append(output_file)
         if progress_callback is not None:
             progress_callback(
                 {

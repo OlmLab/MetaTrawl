@@ -105,15 +105,21 @@ def build_matrix_from_database(
     logger.emit(step="matrix-build", status="exporting-profiles", samples=len(sample_ids), genome=genome)
     with TemporaryDirectory(prefix="metatrawl_matrix_profiles_") as tmp_dir:
         profile_dir = Path(tmp_dir)
-        db.export_profile_parquets(
+        exported_profiles = db.export_profile_parquets(
             conn,
             sample_ids=sample_ids,
             output_dir=profile_dir,
             genome=None if genome == "all" else genome,
             progress_callback=ThrottledMatrixLogger("METATRAWL-EXPORT", stored_rows=False),
         )
-        logger.emit(step="matrix-build", status="exported-profiles", samples=len(sample_ids), genome=genome)
-        logger.emit(step="matrix-build", status="building", samples=len(sample_ids), sparse=sparse)
+        exported_sample_ids = [path.stem for path in exported_profiles]
+        skipped_empty = len(sample_ids) - len(exported_sample_ids)
+        if not exported_sample_ids:
+            raise ValueError("No complete samples passed the matrix build filters.")
+        if skipped_empty:
+            logger.emit(step="matrix-build", status="skipped-empty-profiles", samples=skipped_empty, genome=genome)
+        logger.emit(step="matrix-build", status="exported-profiles", samples=len(exported_sample_ids), genome=genome)
+        logger.emit(step="matrix-build", status="building", samples=len(exported_sample_ids), sparse=sparse)
         mp.build_matrix_hdf5(
             profile_dir=profile_dir,
             output_file=output_file,
@@ -133,14 +139,14 @@ def build_matrix_from_database(
         matrix_id=chosen_matrix_id,
         genome=genome,
         matrix_file=output_file,
-        profile_count=len(sample_ids),
+        profile_count=len(exported_sample_ids),
         storage_layout="sparse" if sparse else "dense",
-        sample_ids=sample_ids,
+        sample_ids=exported_sample_ids,
         filters=filters,
         overwrite=True,
     )
     _write_matrix_hdf5_metatrawl_metadata(output_file, filters=filters)
-    logger.emit(step="matrix-build", status="done", matrix_id=chosen_matrix_id, samples=len(sample_ids))
+    logger.emit(step="matrix-build", status="done", matrix_id=chosen_matrix_id, samples=len(exported_sample_ids))
     return store
 
 
@@ -180,14 +186,20 @@ def append_matrix_from_database(
     logger.emit(step="matrix-append", status="exporting-profiles", matrix=matrix_label, samples=len(sample_ids))
     with TemporaryDirectory(prefix="metatrawl_matrix_append_") as tmp_dir:
         profile_dir = Path(tmp_dir)
-        db.export_profile_parquets(
+        exported_profiles = db.export_profile_parquets(
             conn,
             sample_ids=sample_ids,
             output_dir=profile_dir,
             genome=None if context.genome == "all" else context.genome,
             progress_callback=ThrottledMatrixLogger("METATRAWL-EXPORT", stored_rows=False),
         )
-        logger.emit(step="matrix-append", status="appending", matrix=matrix_label, samples=len(sample_ids))
+        exported_sample_ids = [path.stem for path in exported_profiles]
+        skipped_empty = len(sample_ids) - len(exported_sample_ids)
+        if not exported_sample_ids:
+            raise ValueError(f"No new complete samples are available to append to matrix: {context.matrix_file}")
+        if skipped_empty:
+            logger.emit(step="matrix-append", status="skipped-empty-profiles", matrix=matrix_label, samples=skipped_empty)
+        logger.emit(step="matrix-append", status="appending", matrix=matrix_label, samples=len(exported_sample_ids))
         mp.append_matrix_hdf5(
             profile_dir=profile_dir,
             matrix_hdf5_file=context.matrix_file,
@@ -196,10 +208,10 @@ def append_matrix_from_database(
             progress_callback=ThrottledMatrixLogger("MATRIX-APPEND"),
         )
     if matrix_id is not None and db.get_matrix_store(conn, matrix_id) is not None:
-        db.add_matrix_store_samples(conn, matrix_id=matrix_id, sample_ids=sample_ids)
+        db.add_matrix_store_samples(conn, matrix_id=matrix_id, sample_ids=exported_sample_ids)
         db.update_matrix_profile_count(conn, matrix_id=matrix_id)
-    logger.emit(step="matrix-append", status="done", matrix=matrix_label, samples=len(sample_ids))
-    return len(sample_ids)
+    logger.emit(step="matrix-append", status="done", matrix=matrix_label, samples=len(exported_sample_ids))
+    return len(exported_sample_ids)
 
 
 def sync_build_matrices(

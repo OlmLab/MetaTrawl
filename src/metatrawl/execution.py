@@ -5,6 +5,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import threading
+import time
 import uuid
 from typing import Callable, Sequence
 
@@ -29,19 +30,62 @@ class WorkflowRuntime:
     def run(self, stage: str, cmd: Sequence[str], *, sample: str, stdout_file: Path | None = None):
         setting = self.config.stage(stage)
         with self._limits[stage]:
-            self.logger.emit(sample=sample, step=stage.replace("_", "-"), status="executing", execution=setting.execution, threads=setting.threads)
-            if setting.execution == "slurm":
-                return self._run_slurm(stage, list(cmd), sample=sample, stdout_file=stdout_file)
-            return self._run_local(stage, list(cmd), sample=sample, stdout_file=stdout_file)
+            return self._run_with_retries(
+                stage,
+                sample=sample,
+                action=lambda: (
+                    self._run_slurm(stage, list(cmd), sample=sample, stdout_file=stdout_file)
+                    if setting.execution == "slurm"
+                    else self._run_local(stage, list(cmd), sample=sample, stdout_file=stdout_file)
+                ),
+            )
 
     def run_shell(self, stage: str, command: str, *, sample: str) -> None:
         setting = self.config.stage(stage)
         with self._limits[stage]:
-            self.logger.emit(sample=sample, step=stage.replace("_", "-"), status="executing", execution=setting.execution, threads=setting.threads)
-            if setting.execution == "slurm":
-                self._run_slurm(stage, command, sample=sample)
-            else:
-                self._invoke(command, sample=sample, stage=stage, shell=True, env=self._environment(stage))
+            self._run_with_retries(
+                stage,
+                sample=sample,
+                action=lambda: (
+                    self._run_slurm(stage, command, sample=sample)
+                    if setting.execution == "slurm"
+                    else self._invoke(command, sample=sample, stage=stage, shell=True, env=self._environment(stage))
+                ),
+            )
+
+    def _run_with_retries(self, stage: str, *, sample: str, action):
+        setting = self.config.stage(stage)
+        attempts = setting.retries + 1
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            self.logger.emit(
+                sample=sample,
+                step=stage.replace("_", "-"),
+                status="executing",
+                execution=setting.execution,
+                threads=setting.threads,
+                attempt=attempt,
+                max_attempts=attempts,
+            )
+            try:
+                return action()
+            except RuntimeError as exc:
+                last_error = exc
+                if attempt >= attempts:
+                    break
+                self.logger.emit(
+                    sample=sample,
+                    step=stage.replace("_", "-"),
+                    status="retrying",
+                    execution=setting.execution,
+                    attempt=attempt,
+                    next_attempt=attempt + 1,
+                    max_attempts=attempts,
+                    error=exc,
+                )
+                if setting.retry_delay_seconds > 0:
+                    time.sleep(setting.retry_delay_seconds)
+        raise last_error if last_error is not None else RuntimeError(f"sample={sample} step={stage} failed")
 
     def _run_local(self, stage: str, cmd: list[str], *, sample: str, stdout_file: Path | None) -> None:
         if stdout_file is None:

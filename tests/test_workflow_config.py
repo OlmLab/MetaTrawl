@@ -16,6 +16,8 @@ sample_workers = 9
 workers = 1
 threads = 12
 execution = "slurm"
+retries = 2
+retry_delay_seconds = 0.5
 environment = { OMP_NUM_THREADS = "12" }
 [stages.bowtie_build.slurm]
 time = "03:00:00"
@@ -23,6 +25,8 @@ memory_gb = 48
 partition = "compute"
 [matrix_compare]
 calculate = "ani+ibs"
+genome = "GCF_1"
+backend = "mps"
 memory_limit_gb = 48.5
 target_queue_size = 3
 loader_executor_kind = "process"
@@ -32,8 +36,12 @@ loader_executor_kind = "process"
     assert config.stage("bowtie_build").workers == 1
     assert config.stage("bowtie_build").threads == 12
     assert config.stage("bowtie_build").execution == "slurm"
+    assert config.stage("bowtie_build").retries == 2
+    assert config.stage("bowtie_build").retry_delay_seconds == 0.5
     assert config.stage("bowtie_build").slurm.memory_gb == 48
     assert config.matrix_compare.calculate == "ani+ibs"
+    assert config.matrix_compare.genome == "GCF_1"
+    assert config.matrix_compare.backend == "mps"
     assert config.matrix_compare.memory_limit_gb == 48.5
     assert config.matrix_compare.kwargs() == {"target_queue_size": 3, "loader_executor_kind": "process"}
 
@@ -58,6 +66,13 @@ def test_config_rejects_nonpositive_matrix_memory_limit(tmp_path: Path) -> None:
     path = tmp_path / "workflow.toml"
     path.write_text("[matrix_compare]\nmemory_limit_gb = 0\n")
     with pytest.raises(ValueError, match="matrix_compare.memory_limit_gb must be a positive number"):
+        load_workflow_config(path, threads=2, sample_count=2)
+
+
+def test_config_rejects_negative_stage_retries(tmp_path: Path) -> None:
+    path = tmp_path / "workflow.toml"
+    path.write_text("[stages.alignment]\nretries = -1\n")
+    with pytest.raises(ValueError, match="stages.alignment.retries must be a non-negative integer"):
         load_workflow_config(path, threads=2, sample_count=2)
 
 
@@ -90,3 +105,32 @@ account = "lab"
     script = Path(command[-1]).read_text()
     assert "export CUDA_VISIBLE_DEVICES=0" in script
     assert "bowtie2 --version | cat" in script
+
+
+def test_slurm_runtime_retries_failed_stage(tmp_path: Path) -> None:
+    path = tmp_path / "workflow.toml"
+    path.write_text('''
+[stages.alignment]
+execution = "slurm"
+workers = 1
+threads = 8
+retries = 2
+retry_delay_seconds = 0
+[stages.alignment.slurm]
+time = "01:00:00"
+memory_gb = 16
+''')
+    config = load_workflow_config(path, threads=1, sample_count=1)
+    calls = []
+
+    def runner(command, **kwargs):
+        calls.append((command, kwargs))
+        if len(calls) < 3:
+            raise subprocess.CalledProcessError(1, command, stderr="PREEMPTED")
+        return subprocess.CompletedProcess(command, 0, stdout="123", stderr="")
+
+    runtime = WorkflowRuntime(config, state_dir=tmp_path, logger=WorkflowLogger(), runner=runner)
+    runtime.run_shell("alignment", "bowtie2 --version", sample="SRR1")
+
+    assert len(calls) == 3
+    assert all(call[0][0] == "sbatch" for call in calls)
