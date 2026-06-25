@@ -402,7 +402,7 @@ Each stage supports `workers`, `threads`, `execution = "local" | "slurm"`, `retr
 
 The configurable stages are `sra_download`, `sylph`, `genome_download`, `prodigal`, `prepare_profile`, `bowtie_build`, `alignment`, and `profile`. Without `--workflow-config`, `--threads` retains the previous behavior.
 
-The same file can configure `calculate`, `genome`, `backend`, `memory_limit_gb`, and ZipStrain queue/executor controls under `[matrix_compare]`; pass it to `matrix compare` or `matrix sync-compare`. Explicit CLI values override the matching TOML values.
+The same file can configure ZipStrain `profile-single` read filters under `[profile]`: `min_mapq`, `min_baseq`, optional `min_read_ani`, and `read_inclusion`. It can also configure `calculate`, `genome`, `backend`, `memory_limit_gb`, and ZipStrain queue/executor controls under `[matrix_compare]`; pass it to `matrix compare` or `matrix sync-compare`. Explicit CLI values override the matching TOML values.
 
 ### Complete TOML template
 
@@ -476,6 +476,13 @@ execution = "local"
 retries = 3
 retry_delay_seconds = 120
 
+
+[profile]
+min_mapq = 0
+min_baseq = 13
+# min_read_ani = 0.97
+read_inclusion = "all-mapped"
+
 [matrix_compare]
 calculate = "all"
 genome = "all"
@@ -494,4 +501,4 @@ MetaTrawl also accepts optional per-stage `environment` and `slurm.extra` tables
 when a real tool or cluster requires them; they are intentionally omitted here
 because the standard pipeline does not require any.
 
-Current ZipStrain profiling receives both `reference.fasta` and `profiling_contract.json`. This preserves the reference-aware profile fields and enables `ref_ani` in imported genome and gene statistics.
+Current ZipStrain profiling receives both `reference.fasta` and `profiling_contract.json`. This preserves the reference-aware profile fields and enables `ref_ani` in imported genome and gene statistics. The `[profile]` section is passed directly to `zipstrain utilities profile-single`; leave `min_read_ani` commented out to disable read-ANI filtering.

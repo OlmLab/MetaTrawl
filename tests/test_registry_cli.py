@@ -18,6 +18,7 @@ from metatrawl import cache
 from metatrawl import cli
 from metatrawl import db as registry
 from metatrawl import workflows
+from metatrawl.config import ProfileConfig
 from metatrawl.logging import WorkflowLogger
 
 
@@ -897,6 +898,12 @@ def test_alignment_and_profile_stage_publishes_outputs(tmp_path: Path, monkeypat
         reference=reference,
         output_dir=tmp_path / "outputs",
         threads=2,
+        profile_config=ProfileConfig(
+            min_mapq=20,
+            min_baseq=25,
+            min_read_ani=0.97,
+            read_inclusion="proper-pairs",
+        ),
         logger=WorkflowLogger(),
     )
 
@@ -906,8 +913,13 @@ def test_alignment_and_profile_stage_publishes_outputs(tmp_path: Path, monkeypat
     assert faidx_index < profile_index
     profile_calls = [call for call in run_calls if call[:3] == ["zipstrain", "utilities", "profile-single"]]
     assert profile_calls
-    assert "--profiling-contract" in profile_calls[0]
-    assert "--reference-fasta" in profile_calls[0]
+    profile_call = profile_calls[0]
+    assert "--profiling-contract" in profile_call
+    assert "--reference-fasta" in profile_call
+    assert profile_call[profile_call.index("--min-mapq") + 1] == "20"
+    assert profile_call[profile_call.index("--min-baseq") + 1] == "25"
+    assert profile_call[profile_call.index("--min-read-ani") + 1] == "0.97"
+    assert profile_call[profile_call.index("--read-inclusion") + 1] == "proper-pairs"
     assert shell_calls
     assert "bowtie2 -x" in shell_calls[0]
     assert "samtools sort" in shell_calls[0]

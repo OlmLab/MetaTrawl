@@ -30,6 +30,11 @@ backend = "mps"
 memory_limit_gb = 48.5
 target_queue_size = 3
 loader_executor_kind = "process"
+[profile]
+min_mapq = 20
+min_baseq = 25
+min_read_ani = 0.97
+read_inclusion = "proper-pairs"
 ''')
     config = load_workflow_config(path, threads=4, sample_count=20)
     assert config.sample_workers == 9
@@ -44,6 +49,10 @@ loader_executor_kind = "process"
     assert config.matrix_compare.backend == "mps"
     assert config.matrix_compare.memory_limit_gb == 48.5
     assert config.matrix_compare.kwargs() == {"target_queue_size": 3, "loader_executor_kind": "process"}
+    assert config.profile.min_mapq == 20
+    assert config.profile.min_baseq == 25
+    assert config.profile.min_read_ani == 0.97
+    assert config.profile.read_inclusion == "proper-pairs"
 
 
 def test_json_config_is_supported(tmp_path: Path) -> None:
@@ -73,6 +82,20 @@ def test_config_rejects_negative_stage_retries(tmp_path: Path) -> None:
     path = tmp_path / "workflow.toml"
     path.write_text("[stages.alignment]\nretries = -1\n")
     with pytest.raises(ValueError, match="stages.alignment.retries must be a non-negative integer"):
+        load_workflow_config(path, threads=2, sample_count=2)
+
+
+def test_config_rejects_invalid_profile_read_ani(tmp_path: Path) -> None:
+    path = tmp_path / "workflow.toml"
+    path.write_text("[profile]\nmin_read_ani = 1.5\n")
+    with pytest.raises(ValueError, match="profile.min_read_ani must be between 0 and 1"):
+        load_workflow_config(path, threads=2, sample_count=2)
+
+
+def test_config_rejects_invalid_profile_read_inclusion(tmp_path: Path) -> None:
+    path = tmp_path / "workflow.toml"
+    path.write_text('[profile]\nread_inclusion = "mapped"\n')
+    with pytest.raises(ValueError, match="profile.read_inclusion must be one of"):
         load_workflow_config(path, threads=2, sample_count=2)
 
 

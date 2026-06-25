@@ -7,6 +7,7 @@ import tomllib
 from typing import Any
 
 STAGE_NAMES = ("sra_download", "sylph", "genome_download", "prodigal", "prepare_profile", "bowtie_build", "alignment", "profile")
+READ_INCLUSION_CHOICES = ("proper-pairs", "paired", "all-mapped")
 
 @dataclass(frozen=True)
 class SlurmConfig:
@@ -49,9 +50,17 @@ class MatrixCompareConfig:
         return {key: value for key, value in values.items() if value is not None}
 
 @dataclass(frozen=True)
+class ProfileConfig:
+    min_mapq: int = 0
+    min_baseq: int = 13
+    min_read_ani: float | None = None
+    read_inclusion: str = "all-mapped"
+
+@dataclass(frozen=True)
 class WorkflowConfig:
     sample_workers: int
     stages: dict[str, StageConfig]
+    profile: ProfileConfig = field(default_factory=ProfileConfig)
     matrix_compare: MatrixCompareConfig = field(default_factory=MatrixCompareConfig)
 
     def stage(self, name: str) -> StageConfig:
@@ -128,7 +137,18 @@ def _parse(raw: dict[str, Any], *, threads: int, sample_count: int) -> WorkflowC
     compare = raw.get("matrix_compare", {})
     if not isinstance(compare, dict):
         raise ValueError("matrix_compare must be a table/object.")
-    return WorkflowConfig(sample_workers=sample_workers, stages=stages, matrix_compare=MatrixCompareConfig(
+    profile = raw.get("profile", {})
+    if not isinstance(profile, dict):
+        raise ValueError("profile must be a table/object.")
+    read_inclusion = str(profile.get("read_inclusion", ProfileConfig.read_inclusion)).strip()
+    if read_inclusion not in READ_INCLUSION_CHOICES:
+        raise ValueError(f"profile.read_inclusion must be one of: {', '.join(READ_INCLUSION_CHOICES)}")
+    return WorkflowConfig(sample_workers=sample_workers, stages=stages, profile=ProfileConfig(
+        min_mapq=_nonnegative_int(profile.get("min_mapq", ProfileConfig.min_mapq), "profile.min_mapq"),
+        min_baseq=_nonnegative_int(profile.get("min_baseq", ProfileConfig.min_baseq), "profile.min_baseq"),
+        min_read_ani=_optional_probability(profile.get("min_read_ani"), "profile.min_read_ani"),
+        read_inclusion=read_inclusion,
+    ), matrix_compare=MatrixCompareConfig(
         calculate=_optional_string(compare.get("calculate")),
         genome=_optional_string(compare.get("genome")),
         backend=_optional_string(compare.get("backend")),
@@ -179,6 +199,17 @@ def _optional_positive_float(value: Any, key: str) -> float | None:
         raise ValueError(f"{key} must be a positive number.") from exc
     if result <= 0:
         raise ValueError(f"{key} must be a positive number.")
+    return result
+
+def _optional_probability(value: Any, key: str) -> float | None:
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be between 0 and 1.") from exc
+    if not 0.0 <= result <= 1.0:
+        raise ValueError(f"{key} must be between 0 and 1.")
     return result
 
 def _optional_string(value: Any) -> str | None:

@@ -17,7 +17,7 @@ import polars as pl
 from metatrawl import cache
 from metatrawl import db
 from metatrawl import healthcheck
-from metatrawl.config import MatrixCompareConfig, WorkflowConfig
+from metatrawl.config import MatrixCompareConfig, ProfileConfig, WorkflowConfig
 from metatrawl.execution import WorkflowRuntime
 from metatrawl.logging import ThrottledMatrixLogger, WorkflowLogger
 
@@ -661,6 +661,7 @@ def profile_sra_runs(
                 output_dir=Path(output_dir) if output_dir is not None else None,
                 accessions_dir=Path(accessions_dir) if accessions_dir is not None else None,
                 runtime=runtime,
+                profile_config=workflow_config.profile,
                 logger=logger,
             ): run_id
             for run_id in run_ids
@@ -865,6 +866,7 @@ def _profile_one_sra_run(
     output_dir: Path | None,
     accessions_dir: Path | None,
     runtime: WorkflowRuntime,
+    profile_config: ProfileConfig,
     logger: WorkflowLogger,
 ) -> None:
     sample_scratch = Path(scratch_dir) / run_id
@@ -949,6 +951,7 @@ def _profile_one_sra_run(
             reference=reference,
             output_dir=output_dir,
             runtime=runtime,
+            profile_config=profile_config,
             logger=logger,
         )
 
@@ -1007,10 +1010,12 @@ def _run_alignment_and_profile(
     reference: cache.PreparedReference,
     output_dir: Path,
     runtime: WorkflowRuntime | _DirectRuntime | None = None,
+    profile_config: ProfileConfig | None = None,
     threads: int | None = None,
     logger: WorkflowLogger,
 ) -> None:
     runtime = runtime or _DirectRuntime(threads or 1)
+    profile_config = profile_config or ProfileConfig()
     if reference.stb_file is None:
         raise ValueError(f"sample={run_id} step=profile missing STB file from cache reference preparation")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1083,31 +1088,40 @@ def _run_alignment_and_profile(
 
     if not _published_profile_bundle_complete(run_id=run_id, output_dir=output_dir):
         logger.emit(sample=run_id, step="profile", status="start")
+        profile_command = [
+            "zipstrain",
+            "utilities",
+            "profile-single",
+            "--bam-file",
+            str(bam_file),
+            "--bed-file",
+            str(profile_work / "genomes_bed_file.bed"),
+            "--stb-file",
+            str(reference.stb_file),
+            "--null-model",
+            str(profile_work / "null_model.parquet"),
+            "--gene-range-table",
+            str(profile_work / "gene_range_table.tsv"),
+            "--reference-fasta",
+            str(profile_work / "reference.fasta"),
+            "--profiling-contract",
+            str(profile_work / "profiling_contract.json"),
+            "--max-concurrency",
+            str(runtime.threads("profile")),
+            "--min-mapq",
+            str(profile_config.min_mapq),
+            "--min-baseq",
+            str(profile_config.min_baseq),
+            "--read-inclusion",
+            profile_config.read_inclusion,
+            "--output-dir",
+            str(profile_work),
+        ]
+        if profile_config.min_read_ani is not None:
+            profile_command.extend(["--min-read-ani", str(profile_config.min_read_ani)])
         runtime.run(
             "profile",
-            [
-                "zipstrain",
-                "utilities",
-                "profile-single",
-                "--bam-file",
-                str(bam_file),
-                "--bed-file",
-                str(profile_work / "genomes_bed_file.bed"),
-                "--stb-file",
-                str(reference.stb_file),
-                "--null-model",
-                str(profile_work / "null_model.parquet"),
-                "--gene-range-table",
-                str(profile_work / "gene_range_table.tsv"),
-                "--reference-fasta",
-                str(profile_work / "reference.fasta"),
-                "--profiling-contract",
-                str(profile_work / "profiling_contract.json"),
-                "--max-concurrency",
-                str(runtime.threads("profile")),
-                "--output-dir",
-                str(profile_work),
-            ],
+            profile_command,
             sample=run_id,
         )
         _publish_profile_outputs(run_id=run_id, profile_work=profile_work, output_dir=output_dir)
