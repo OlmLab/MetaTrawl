@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,7 +17,8 @@ from metatrawl import cache
 from metatrawl import db as registry
 from metatrawl import healthcheck
 from metatrawl import workflows
-from metatrawl.config import load_workflow_config
+from metatrawl.config import WorkflowConfig, load_workflow_config
+from metatrawl.execution import WorkflowRuntime
 from metatrawl.logging import WorkflowLogger
 
 
@@ -481,6 +483,7 @@ def matrix_build(
 @click.option("--min-sylph-abundance", type=float, default=None)
 @click.option("--memory-limit-gb", type=float, default=16.0, show_default=True)
 @click.option("--export-batch-mb", type=float, default=128.0, show_default=True)
+@click.option("--workflow-config", type=click.Path(path_type=Path), help="TOML/JSON stage concurrency and Slurm policy for per-genome build jobs.")
 def matrix_sync_build(
     db_file: Path,
     matrix_dir: Path,
@@ -498,6 +501,7 @@ def matrix_sync_build(
     min_sylph_abundance: float | None,
     memory_limit_gb: float,
     export_batch_mb: float,
+    workflow_config: Path | None,
 ) -> None:
     """Build missing per-genome matrices and append newly imported samples."""
     filters = registry.MatrixFilters(
@@ -508,22 +512,43 @@ def matrix_sync_build(
     )
     try:
         with registry.connect(db_file) as conn:
-            summary = workflows.sync_build_matrices(
-                conn,
-                matrix_dir=matrix_dir,
-                genomes=list(genomes) if genomes else None,
-                bed_file=bed_file,
-                stb_file=stb_file,
-                bed_dir=bed_dir,
-                stb_dir=stb_dir,
-                gene_range_table=gene_range_table,
-                gene_range_dir=gene_range_dir,
-                filters=filters,
-                sparse=sparse,
-                memory_limit_gb=memory_limit_gb,
-                export_batch_mb=export_batch_mb,
-                logger=WorkflowLogger(),
-            )
+            selected_genomes = list(genomes) if genomes else registry.genomes_with_complete_samples(conn)
+            execution_config = load_workflow_config(workflow_config, threads=1, sample_count=max(1, len(selected_genomes)))
+            if workflow_config is not None and _should_dispatch_stage(execution_config, "matrix_build"):
+                summary = _dispatch_matrix_sync_build_jobs(
+                    db_file=db_file,
+                    matrix_dir=matrix_dir,
+                    genomes=selected_genomes,
+                    bed_file=bed_file,
+                    stb_file=stb_file,
+                    bed_dir=bed_dir,
+                    stb_dir=stb_dir,
+                    gene_range_table=gene_range_table,
+                    gene_range_dir=gene_range_dir,
+                    filters=filters,
+                    sparse=sparse,
+                    memory_limit_gb=memory_limit_gb,
+                    export_batch_mb=export_batch_mb,
+                    execution_config=execution_config,
+                    logger=WorkflowLogger(),
+                )
+            else:
+                summary = workflows.sync_build_matrices(
+                    conn,
+                    matrix_dir=matrix_dir,
+                    genomes=selected_genomes,
+                    bed_file=bed_file,
+                    stb_file=stb_file,
+                    bed_dir=bed_dir,
+                    stb_dir=stb_dir,
+                    gene_range_table=gene_range_table,
+                    gene_range_dir=gene_range_dir,
+                    filters=filters,
+                    sparse=sparse,
+                    memory_limit_gb=memory_limit_gb,
+                    export_batch_mb=export_batch_mb,
+                    logger=WorkflowLogger(),
+                )
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(
@@ -664,17 +689,31 @@ def matrix_sync_compare(
                     memory_limit_gb=memory_limit_gb,
                 )
             )
-            summary = workflows.sync_compare_matrices(
-                conn,
-                matrix_dir=matrix_dir,
-                compare_dir=compare_dir,
-                calculate=resolved_calculate,
-                genome=resolved_genome,
-                backend=resolved_backend,
-                memory_limit_gb=resolved_memory_limit_gb,
-                compare_config=execution_config.matrix_compare,
-                logger=WorkflowLogger(),
-            )
+            if workflow_config is not None and _should_dispatch_stage(execution_config, "matrix_compare"):
+                summary = _dispatch_matrix_sync_compare_jobs(
+                    db_file=db_file,
+                    matrix_dir=matrix_dir,
+                    compare_dir=compare_dir,
+                    calculate=resolved_calculate,
+                    genome=resolved_genome,
+                    backend=resolved_backend,
+                    memory_limit_gb=resolved_memory_limit_gb,
+                    workflow_config=workflow_config,
+                    execution_config=execution_config,
+                    logger=WorkflowLogger(),
+                )
+            else:
+                summary = workflows.sync_compare_matrices(
+                    conn,
+                    matrix_dir=matrix_dir,
+                    compare_dir=compare_dir,
+                    calculate=resolved_calculate,
+                    genome=resolved_genome,
+                    backend=resolved_backend,
+                    memory_limit_gb=resolved_memory_limit_gb,
+                    compare_config=execution_config.matrix_compare,
+                    logger=WorkflowLogger(),
+                )
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(
@@ -683,6 +722,200 @@ def matrix_sync_compare(
     )
     if summary.failed:
         raise click.ClickException("Matrix sync compare completed with failures. Check the matrix-level logs above.")
+
+
+def _should_dispatch_stage(config: WorkflowConfig, stage: str) -> bool:
+    setting = config.stage(stage)
+    return setting.execution == "slurm" or setting.workers > 1
+
+
+def _dispatch_matrix_sync_build_jobs(
+    *,
+    db_file: Path,
+    matrix_dir: Path,
+    genomes: list[str],
+    bed_file: Path | None,
+    stb_file: Path | None,
+    bed_dir: Path | None,
+    stb_dir: Path | None,
+    gene_range_table: Path | None,
+    gene_range_dir: Path | None,
+    filters: registry.MatrixFilters,
+    sparse: bool,
+    memory_limit_gb: float,
+    export_batch_mb: float,
+    execution_config: WorkflowConfig,
+    logger: WorkflowLogger,
+) -> workflows.MatrixSyncBuildSummary:
+    runtime = WorkflowRuntime(execution_config, state_dir=matrix_dir, logger=logger)
+    stage = execution_config.stage("matrix_build")
+    logger.emit(
+        step="matrix-sync-build",
+        status="dispatch-start",
+        genomes=len(genomes),
+        execution=stage.execution,
+        workers=stage.workers,
+    )
+    completed = failed = 0
+    with ThreadPoolExecutor(max_workers=max(1, min(len(genomes) or 1, stage.workers))) as executor:
+        futures = {}
+        for genome in genomes:
+            command = _matrix_sync_build_child_command(
+                db_file=db_file,
+                matrix_dir=matrix_dir,
+                genome=genome,
+                bed_file=bed_file,
+                stb_file=stb_file,
+                bed_dir=bed_dir,
+                stb_dir=stb_dir,
+                gene_range_table=gene_range_table,
+                gene_range_dir=gene_range_dir,
+                filters=filters,
+                sparse=sparse,
+                memory_limit_gb=memory_limit_gb,
+                export_batch_mb=export_batch_mb,
+            )
+            futures[executor.submit(runtime.run, "matrix_build", command, sample=genome)] = genome
+        for future in as_completed(futures):
+            genome = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                failed += 1
+                logger.emit(step="matrix-sync-build", status="failed", genome=genome, error=exc)
+            else:
+                completed += 1
+                logger.emit(step="matrix-sync-build", status="completed", genome=genome)
+    logger.emit(step="matrix-sync-build", status="dispatch-done", genomes=len(genomes), completed=completed, failed=failed)
+    return workflows.MatrixSyncBuildSummary(
+        genomes=len(genomes),
+        built=completed,
+        appended=0,
+        up_to_date=0,
+        skipped=0,
+        failed=failed,
+    )
+
+
+def _matrix_sync_build_child_command(
+    *,
+    db_file: Path,
+    matrix_dir: Path,
+    genome: str,
+    bed_file: Path | None,
+    stb_file: Path | None,
+    bed_dir: Path | None,
+    stb_dir: Path | None,
+    gene_range_table: Path | None,
+    gene_range_dir: Path | None,
+    filters: registry.MatrixFilters,
+    sparse: bool,
+    memory_limit_gb: float,
+    export_batch_mb: float,
+) -> list[str]:
+    command = [
+        "metatrawl",
+        "matrix",
+        "sync-build",
+        "--db",
+        str(db_file),
+        "--matrix-dir",
+        str(matrix_dir),
+        "--genome",
+        genome,
+        "--memory-limit-gb",
+        str(memory_limit_gb),
+        "--export-batch-mb",
+        str(export_batch_mb),
+    ]
+    if sparse:
+        command.append("--sparse")
+    _append_path_option(command, "--bed-file", bed_file)
+    _append_path_option(command, "--stb-file", stb_file)
+    _append_path_option(command, "--bed-dir", bed_dir)
+    _append_path_option(command, "--stb-dir", stb_dir)
+    _append_path_option(command, "--gene-range-table", gene_range_table)
+    _append_path_option(command, "--gene-range-dir", gene_range_dir)
+    _append_float_option(command, "--min-coverage", filters.min_coverage)
+    _append_float_option(command, "--min-breadth", filters.min_breadth)
+    _append_float_option(command, "--min-ber", filters.min_ber)
+    _append_float_option(command, "--min-sylph-abundance", filters.min_sylph_abundance)
+    return command
+
+
+def _dispatch_matrix_sync_compare_jobs(
+    *,
+    db_file: Path,
+    matrix_dir: Path,
+    compare_dir: Path,
+    calculate: str,
+    genome: str,
+    backend: str,
+    memory_limit_gb: float,
+    workflow_config: Path,
+    execution_config: WorkflowConfig,
+    logger: WorkflowLogger,
+) -> workflows.MatrixSyncCompareSummary:
+    matrix_files = workflows.discover_matrix_files(matrix_dir)
+    compare_dir.mkdir(parents=True, exist_ok=True)
+    runtime = WorkflowRuntime(execution_config, state_dir=compare_dir, logger=logger)
+    stage = execution_config.stage("matrix_compare")
+    logger.emit(
+        step="matrix-sync-compare",
+        status="dispatch-start",
+        matrices=len(matrix_files),
+        execution=stage.execution,
+        workers=stage.workers,
+    )
+    compared = failed = 0
+    with ThreadPoolExecutor(max_workers=max(1, min(len(matrix_files) or 1, stage.workers))) as executor:
+        futures = {}
+        for matrix_file in matrix_files:
+            output_file = compare_dir / f"{matrix_file.stem}.duckdb"
+            command = [
+                "metatrawl",
+                "matrix",
+                "compare",
+                "--db",
+                str(db_file),
+                "--matrix-file",
+                str(matrix_file),
+                "--output-file",
+                str(output_file),
+                "--calculate",
+                calculate,
+                "--genome",
+                genome,
+                "--backend",
+                backend,
+                "--memory-limit-gb",
+                str(memory_limit_gb),
+                "--workflow-config",
+                str(workflow_config),
+            ]
+            futures[executor.submit(runtime.run, "matrix_compare", command, sample=matrix_file.stem)] = matrix_file
+        for future in as_completed(futures):
+            matrix_file = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                failed += 1
+                logger.emit(step="matrix-sync-compare", status="failed", matrix=matrix_file, error=exc)
+            else:
+                compared += 1
+                logger.emit(step="matrix-sync-compare", status="compared", matrix=matrix_file)
+    logger.emit(step="matrix-sync-compare", status="dispatch-done", matrices=len(matrix_files), compared=compared, failed=failed)
+    return workflows.MatrixSyncCompareSummary(matrices=len(matrix_files), compared=compared, failed=failed)
+
+
+def _append_path_option(command: list[str], option: str, value: Path | None) -> None:
+    if value is not None:
+        command.extend([option, str(value)])
+
+
+def _append_float_option(command: list[str], option: str, value: float | None) -> None:
+    if value is not None:
+        command.extend([option, str(value)])
 
 
 @cli.command("status")

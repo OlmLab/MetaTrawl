@@ -699,6 +699,39 @@ def registry_status(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
 
 
 def _insert_profile_positions(conn: duckdb.DuckDBPyConnection, *, sample_id: str, profile_file: Path) -> None:
+    if profile_file.suffix.lower() != ".parquet":
+        _insert_profile_positions_via_polars(conn, sample_id=sample_id, profile_file=profile_file)
+        return
+
+    columns = _duckdb_parquet_columns(conn, profile_file)
+    required = {"chrom", "pos", "genome", "A", "C", "G", "T"}
+    missing = required - columns
+    if missing:
+        raise ValueError(f"profile_file missing required columns: {', '.join(sorted(missing))}")
+    gene_expr = "CAST(gene AS VARCHAR)" if "gene" in columns else "'NA'"
+    ref_expr = "CAST(ref_base_bitmask AS UTINYINT)" if "ref_base_bitmask" in columns else "CAST(NULL AS UTINYINT)"
+    conn.execute(
+        f"""
+        INSERT INTO profile_positions
+          (sample_id, chrom, pos, genome, gene, A, C, G, T, ref_base_bitmask)
+        SELECT
+          ? AS sample_id,
+          CAST(chrom AS VARCHAR) AS chrom,
+          CAST(pos AS BIGINT) AS pos,
+          CAST(genome AS VARCHAR) AS genome,
+          {gene_expr} AS gene,
+          CAST(A AS USMALLINT) AS A,
+          CAST(C AS USMALLINT) AS C,
+          CAST(G AS USMALLINT) AS G,
+          CAST(T AS USMALLINT) AS T,
+          {ref_expr} AS ref_base_bitmask
+        FROM read_parquet(?)
+        """,
+        [sample_id, str(profile_file)],
+    )
+
+
+def _insert_profile_positions_via_polars(conn: duckdb.DuckDBPyConnection, *, sample_id: str, profile_file: Path) -> None:
     df = pl.read_parquet(profile_file)
     required = {"chrom", "pos", "genome", "A", "C", "G", "T"}
     missing = required - set(df.columns)
@@ -732,6 +765,11 @@ def _insert_profile_positions(conn: duckdb.DuckDBPyConnection, *, sample_id: str
         )
     finally:
         conn.unregister("_metatrawl_profile_positions")
+
+
+def _duckdb_parquet_columns(conn: duckdb.DuckDBPyConnection, path: Path) -> set[str]:
+    rows = conn.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(path)]).fetchall()
+    return {str(row[0]) for row in rows}
 
 
 def _insert_genome_stats(conn: duckdb.DuckDBPyConnection, *, sample_id: str, stats_file: Path) -> None:

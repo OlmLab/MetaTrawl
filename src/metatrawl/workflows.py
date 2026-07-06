@@ -1064,6 +1064,18 @@ def _run_alignment_and_profile(
     else:
         logger.emit(sample=run_id, step="bowtie2-build", status="cached")
 
+    fastqs = _sample_fastqs(sample_scratch)
+    read_inclusion = profile_config.read_inclusion if len(fastqs) == 2 else "all-mapped"
+    if read_inclusion != profile_config.read_inclusion:
+        logger.emit(
+            sample=run_id,
+            step="profile",
+            status="read-inclusion-override",
+            requested=profile_config.read_inclusion,
+            using=read_inclusion,
+            reason="single-end reads",
+        )
+
     bam_file = sample_scratch / f"{run_id}.bam"
     if not _valid_file(bam_file):
         logger.emit(sample=run_id, step="align", status="start", bam=bam_file)
@@ -1073,7 +1085,7 @@ def _run_alignment_and_profile(
             "alignment",
             _build_alignment_command(
                 reference_fasta=reference.reference_fasta,
-                fastqs=_sample_fastqs(sample_scratch),
+                fastqs=fastqs,
                 threads=runtime.threads("alignment"),
                 bam_file=temporary_bam,
             ),
@@ -1113,7 +1125,7 @@ def _run_alignment_and_profile(
             "--min-baseq",
             str(profile_config.min_baseq),
             "--read-inclusion",
-            profile_config.read_inclusion,
+            read_inclusion,
             "--output-dir",
             str(profile_work),
         ]

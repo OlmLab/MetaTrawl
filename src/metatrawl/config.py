@@ -6,7 +6,7 @@ from pathlib import Path
 import tomllib
 from typing import Any
 
-STAGE_NAMES = ("sra_download", "sylph", "genome_download", "prodigal", "prepare_profile", "bowtie_build", "alignment", "profile")
+STAGE_NAMES = ("sra_download", "sylph", "genome_download", "prodigal", "prepare_profile", "bowtie_build", "alignment", "profile", "matrix_build", "matrix_compare")
 READ_INCLUSION_CHOICES = ("proper-pairs", "paired", "all-mapped")
 
 @dataclass(frozen=True)
@@ -76,6 +76,8 @@ class WorkflowConfig:
         stages = {name: StageConfig(workers=sample_workers, threads=stage_threads) for name in STAGE_NAMES}
         stages["genome_download"] = StageConfig(workers=4, threads=1)
         stages["prodigal"] = StageConfig(workers=1, threads=1)
+        stages["matrix_build"] = StageConfig(workers=1, threads=max(1, threads))
+        stages["matrix_compare"] = StageConfig(workers=1, threads=max(1, threads))
         return cls(sample_workers=sample_workers, stages=stages)
 
 def load_workflow_config(path: Path | None, *, threads: int, sample_count: int) -> WorkflowConfig:

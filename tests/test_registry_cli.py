@@ -231,6 +231,25 @@ def test_profiles_import_normalizes_sylph_genome_paths(tmp_path: Path) -> None:
         ).fetchone() == ("GCF_901875305.1", "GCF_901875305.1")
 
 
+def test_profiles_import_streams_profile_parquet_through_duckdb(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    bundle = _write_bundle_files(tmp_path, "SRR1")
+    real_read_parquet = pl.read_parquet
+
+    def fail_on_profile_file(path, *args, **kwargs):
+        if Path(path) == bundle.profile_file:
+            raise AssertionError("profile parquet should be scanned by DuckDB, not loaded into Python")
+        return real_read_parquet(path, *args, **kwargs)
+
+    monkeypatch.setattr(registry.pl, "read_parquet", fail_on_profile_file)
+
+    _import_bundle(runner, db_file, bundle, add_run=True)
+
+    with duckdb.connect(str(db_file)) as conn:
+        assert conn.execute("SELECT count(*) FROM profile_positions WHERE sample_id = 'SRR1'").fetchone()[0] == 2
+
+
 def test_profiles_remaining_after_duckdb_import(tmp_path: Path) -> None:
     runner = CliRunner()
     db_file = tmp_path / "metatrawl.duckdb"
@@ -975,6 +994,7 @@ def test_alignment_profile_builds_null_model_when_prepare_does_not(tmp_path: Pat
         reference=reference,
         output_dir=tmp_path / "outputs",
         threads=1,
+        profile_config=ProfileConfig(read_inclusion="proper-pairs"),
         logger=WorkflowLogger(),
     )
 
@@ -982,6 +1002,7 @@ def test_alignment_profile_builds_null_model_when_prepare_does_not(tmp_path: Pat
     profile_call = next(call for call in run_calls if call[:3] == ["zipstrain", "utilities", "profile-single"])
     assert (sample_scratch / "zipstrain_profile" / "null_model.parquet").exists()
     assert profile_call[profile_call.index("--null-model") + 1].endswith("null_model.parquet")
+    assert profile_call[profile_call.index("--read-inclusion") + 1] == "all-mapped"
 
 
 def test_sylph_single_end_reads_are_positional_not_dash_u(tmp_path: Path, monkeypatch) -> None:
@@ -1849,6 +1870,64 @@ def test_matrix_sync_build_can_target_one_genome(tmp_path: Path, monkeypatch) ->
     assert "appended=0" in result.output
 
 
+def test_matrix_sync_build_dispatches_one_job_per_genome_with_workflow_config(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    matrix_dir = tmp_path / "matrices"
+    workflow_config = tmp_path / "workflow.toml"
+    bed_dir = tmp_path / "beds"
+    stb_dir = tmp_path / "stbs"
+    bed_dir.mkdir()
+    stb_dir.mkdir()
+    _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR1"), add_run=True)
+    with registry.connect(db_file) as conn:
+        conn.execute("INSERT INTO genome_stats VALUES ('SRR1', 'genome_b', 3.0, 0.8, 0.7, NULL)")
+    workflow_config.write_text('[stages.matrix_build]\nworkers = 2\nthreads = 4\n')
+    commands: list[tuple[str, list[str], str]] = []
+
+    class FakeRuntime:
+        def __init__(self, config, *, state_dir, logger, runner=None):
+            pass
+
+        def run(self, stage, command, *, sample, stdout_file=None):
+            commands.append((stage, command, sample))
+
+    monkeypatch.setattr(cli, "WorkflowRuntime", FakeRuntime)
+
+    result = runner.invoke(
+        cli.cli,
+        [
+            "matrix",
+            "sync-build",
+            "--db",
+            str(db_file),
+            "--matrix-dir",
+            str(matrix_dir),
+            "--bed-dir",
+            str(bed_dir),
+            "--stb-dir",
+            str(stb_dir),
+            "--sparse",
+            "--memory-limit-gb",
+            "64",
+            "--export-batch-mb",
+            "512",
+            "--workflow-config",
+            str(workflow_config),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [stage for stage, _, _ in commands] == ["matrix_build", "matrix_build"]
+    command_by_sample = {sample: command for _, command, sample in commands}
+    assert sorted(command_by_sample) == ["genome_a", "genome_b"]
+    assert "--workflow-config" not in command_by_sample["genome_a"]
+    assert command_by_sample["genome_a"][:3] == ["metatrawl", "matrix", "sync-build"]
+    assert command_by_sample["genome_a"][command_by_sample["genome_a"].index("--memory-limit-gb") + 1] == "64.0"
+    assert "--sparse" in command_by_sample["genome_b"]
+    assert "built=2" in result.output
+
+
 def test_matrix_sync_build_reports_existing_matrix_without_new_samples_as_up_to_date(tmp_path: Path, monkeypatch) -> None:
     runner = CliRunner()
     db_file = tmp_path / "metatrawl.duckdb"
@@ -1920,6 +1999,63 @@ def test_matrix_sync_compare_runs_all_matrix_files(tmp_path: Path, monkeypatch) 
     assert result.exit_code == 0, result.output
     assert calls == [("genome_a.h5", "genome_a.duckdb"), ("genome_b.hdf5", "genome_b.duckdb")]
     assert "matrices=2" in result.output
+    assert "compared=2" in result.output
+
+
+def test_matrix_sync_compare_dispatches_one_job_per_matrix_with_workflow_config(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    matrix_dir = tmp_path / "matrices"
+    compare_dir = tmp_path / "compares"
+    workflow_config = tmp_path / "workflow.toml"
+    matrix_dir.mkdir()
+    (matrix_dir / "genome_a.h5").write_text("matrix")
+    (matrix_dir / "genome_b.h5").write_text("matrix")
+    workflow_config.write_text(
+        '[stages.matrix_compare]\n'
+        'workers = 2\n'
+        'threads = 8\n'
+        '[matrix_compare]\n'
+        'calculate = "ani+ibs"\n'
+        'backend = "numpy"\n'
+        'memory_limit_gb = 32\n'
+    )
+    commands: list[tuple[str, list[str], str]] = []
+
+    class FakeRuntime:
+        def __init__(self, config, *, state_dir, logger, runner=None):
+            pass
+
+        def run(self, stage, command, *, sample, stdout_file=None):
+            commands.append((stage, command, sample))
+
+    monkeypatch.setattr(cli, "WorkflowRuntime", FakeRuntime)
+
+    result = runner.invoke(
+        cli.cli,
+        [
+            "matrix",
+            "sync-compare",
+            "--db",
+            str(db_file),
+            "--matrix-dir",
+            str(matrix_dir),
+            "--compare-dir",
+            str(compare_dir),
+            "--workflow-config",
+            str(workflow_config),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [stage for stage, _, _ in commands] == ["matrix_compare", "matrix_compare"]
+    command_by_sample = {sample: command for _, command, sample in commands}
+    assert sorted(command_by_sample) == ["genome_a", "genome_b"]
+    genome_a = command_by_sample["genome_a"]
+    assert genome_a[:3] == ["metatrawl", "matrix", "compare"]
+    assert genome_a[genome_a.index("--calculate") + 1] == "ani+ibs"
+    assert genome_a[genome_a.index("--memory-limit-gb") + 1] == "32.0"
+    assert genome_a[genome_a.index("--workflow-config") + 1] == str(workflow_config)
     assert "compared=2" in result.output
 
 
