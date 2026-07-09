@@ -17,6 +17,7 @@ import polars as pl
 from metatrawl import cache
 from metatrawl import db
 from metatrawl import healthcheck
+from metatrawl import matrix_hdf5
 from metatrawl.config import MatrixCompareConfig, ProfileConfig, WorkflowConfig
 from metatrawl.execution import WorkflowRuntime
 from metatrawl.logging import ThrottledMatrixLogger, WorkflowLogger
@@ -84,14 +85,24 @@ def build_matrix_from_database(
     gene_range_table: Path | None = None,
     memory_limit_gb: float = 16.0,
     export_batch_mb: float = 128.0,
+    duckdb_export_threads: int = 1,
     sparse: bool = False,
+    register: bool = True,
     logger: WorkflowLogger | None = None,
 ) -> db.MatrixStore:
     """Build a ZipStrain matrix store from DuckDB profile rows."""
     logger = logger or WorkflowLogger()
-    sample_ids = db.eligible_sample_ids(conn, genome=genome, filters=filters)
+    candidate_sample_ids = db.eligible_sample_ids(conn, genome=genome, filters=filters)
+    sample_ids = db.sample_ids_with_profile_rows(
+        conn,
+        sample_ids=candidate_sample_ids,
+        genome=None if genome == "all" else genome,
+    )
     if not sample_ids:
         raise ValueError("No complete samples passed the matrix build filters.")
+    skipped_empty = len(candidate_sample_ids) - len(sample_ids)
+    if skipped_empty:
+        logger.emit(step="matrix-build", status="skipped-empty-profiles", samples=skipped_empty, genome=genome)
 
     output_file = Path(output_file)
     if output_file.exists() and not overwrite:
@@ -100,51 +111,44 @@ def build_matrix_from_database(
 
     chosen_matrix_id = matrix_id or output_file.stem
 
-    from zipstrain import matrix_pairs as mp
-
-    logger.emit(step="matrix-build", status="exporting-profiles", samples=len(sample_ids), genome=genome)
-    with TemporaryDirectory(prefix="metatrawl_matrix_profiles_") as tmp_dir:
-        profile_dir = Path(tmp_dir)
-        exported_profiles = db.export_profile_parquets(
-            conn,
-            sample_ids=sample_ids,
-            output_dir=profile_dir,
-            genome=None if genome == "all" else genome,
-            progress_callback=ThrottledMatrixLogger("METATRAWL-EXPORT", stored_rows=False),
-        )
-        exported_sample_ids = [path.stem for path in exported_profiles]
-        skipped_empty = len(sample_ids) - len(exported_sample_ids)
-        if not exported_sample_ids:
-            raise ValueError("No complete samples passed the matrix build filters.")
-        if skipped_empty:
-            logger.emit(step="matrix-build", status="skipped-empty-profiles", samples=skipped_empty, genome=genome)
-        logger.emit(step="matrix-build", status="exported-profiles", samples=len(exported_sample_ids), genome=genome)
-        logger.emit(step="matrix-build", status="building", samples=len(exported_sample_ids), sparse=sparse)
-        mp.build_matrix_hdf5(
-            profile_dir=profile_dir,
-            output_file=output_file,
-            genome=genome,
-            bed_file=bed_file,
-            stb_file=stb_file,
-            gene_range_table=gene_range_table,
-            count_dtype=count_dtype,
-            memory_limit_gb=memory_limit_gb,
-            export_batch_mb=export_batch_mb,
-            sparse=sparse,
-            progress_callback=ThrottledMatrixLogger("MATRIX-BUILD"),
-        )
-
-    store = db.register_matrix_store(
+    logger.emit(step="matrix-build", status="building", samples=len(sample_ids), genome=genome, sparse=sparse)
+    summary = matrix_hdf5.build_matrix_hdf5_from_duckdb(
         conn,
-        matrix_id=chosen_matrix_id,
+        sample_ids=sample_ids,
+        output_file=output_file,
         genome=genome,
-        matrix_file=output_file,
-        profile_count=len(exported_sample_ids),
-        storage_layout="sparse" if sparse else "dense",
-        sample_ids=exported_sample_ids,
-        filters=filters,
-        overwrite=True,
+        bed_file=bed_file,
+        stb_file=stb_file,
+        gene_range_table=gene_range_table,
+        count_dtype=count_dtype,
+        memory_limit_gb=memory_limit_gb,
+        export_batch_mb=export_batch_mb,
+        duckdb_threads=duckdb_export_threads,
+        sparse=sparse,
+        progress_callback=ThrottledMatrixLogger("MATRIX-BUILD"),
     )
+    exported_sample_ids = sample_ids
+
+    if register:
+        store = db.register_matrix_store(
+            conn,
+            matrix_id=chosen_matrix_id,
+            genome=genome,
+            matrix_file=output_file,
+            profile_count=len(exported_sample_ids),
+            storage_layout="sparse" if sparse else "dense",
+            sample_ids=exported_sample_ids,
+            filters=filters,
+            overwrite=True,
+        )
+    else:
+        store = db.MatrixStore(
+            matrix_id=chosen_matrix_id,
+            genome=genome,
+            matrix_file=output_file,
+            profile_count=len(exported_sample_ids),
+            storage_layout="sparse" if sparse else "dense",
+        )
     _write_matrix_hdf5_metatrawl_metadata(output_file, filters=filters)
     logger.emit(step="matrix-build", status="done", matrix_id=chosen_matrix_id, samples=len(exported_sample_ids))
     return store
@@ -157,6 +161,8 @@ def append_matrix_from_database(
     matrix_id: str | None = None,
     memory_limit_gb: float = 16.0,
     export_batch_mb: float = 128.0,
+    duckdb_export_threads: int = 1,
+    register: bool = True,
     logger: WorkflowLogger | None = None,
 ) -> int:
     """Append newly imported complete samples into a matrix store HDF5 file."""
@@ -178,36 +184,25 @@ def append_matrix_from_database(
             filters=context.filters,
         )
     )
+    sample_ids = db.sample_ids_with_profile_rows(
+        conn,
+        sample_ids=sample_ids,
+        genome=None if context.genome == "all" else context.genome,
+    )
     if not sample_ids:
         raise ValueError(f"No new complete samples are available to append to matrix: {context.matrix_file}")
 
-    from zipstrain import matrix_pairs as mp
-
-    logger.emit(step="matrix-append", status="exporting-profiles", matrix=matrix_label, samples=len(sample_ids))
-    with TemporaryDirectory(prefix="metatrawl_matrix_append_") as tmp_dir:
-        profile_dir = Path(tmp_dir)
-        exported_profiles = db.export_profile_parquets(
-            conn,
-            sample_ids=sample_ids,
-            output_dir=profile_dir,
-            genome=None if context.genome == "all" else context.genome,
-            progress_callback=ThrottledMatrixLogger("METATRAWL-EXPORT", stored_rows=False),
-        )
-        exported_sample_ids = [path.stem for path in exported_profiles]
-        skipped_empty = len(sample_ids) - len(exported_sample_ids)
-        if not exported_sample_ids:
-            raise ValueError(f"No new complete samples are available to append to matrix: {context.matrix_file}")
-        if skipped_empty:
-            logger.emit(step="matrix-append", status="skipped-empty-profiles", matrix=matrix_label, samples=skipped_empty)
-        logger.emit(step="matrix-append", status="appending", matrix=matrix_label, samples=len(exported_sample_ids))
-        mp.append_matrix_hdf5(
-            profile_dir=profile_dir,
-            matrix_hdf5_file=context.matrix_file,
-            memory_limit_gb=memory_limit_gb,
-            export_batch_mb=export_batch_mb,
-            progress_callback=ThrottledMatrixLogger("MATRIX-APPEND"),
-        )
-    if matrix_id is not None and db.get_matrix_store(conn, matrix_id) is not None:
+    logger.emit(step="matrix-append", status="appending", matrix=matrix_label, samples=len(sample_ids))
+    matrix_hdf5.append_matrix_hdf5_from_duckdb(
+        conn,
+        sample_ids=sample_ids,
+        matrix_hdf5_file=context.matrix_file,
+        memory_limit_gb=memory_limit_gb,
+        duckdb_threads=duckdb_export_threads,
+        progress_callback=ThrottledMatrixLogger("MATRIX-APPEND"),
+    )
+    exported_sample_ids = sample_ids
+    if register and matrix_id is not None and db.get_matrix_store(conn, matrix_id) is not None:
         db.add_matrix_store_samples(conn, matrix_id=matrix_id, sample_ids=exported_sample_ids)
         db.update_matrix_profile_count(conn, matrix_id=matrix_id)
     logger.emit(step="matrix-append", status="done", matrix=matrix_label, samples=len(exported_sample_ids))
@@ -229,6 +224,8 @@ def sync_build_matrices(
     sparse: bool = False,
     memory_limit_gb: float = 16.0,
     export_batch_mb: float = 128.0,
+    duckdb_export_threads: int = 1,
+    register: bool = True,
     logger: WorkflowLogger | None = None,
 ) -> MatrixSyncBuildSummary:
     """Build or append one matrix per genome represented in complete samples."""
@@ -251,6 +248,8 @@ def sync_build_matrices(
                         matrix_file=matrix_file,
                         memory_limit_gb=memory_limit_gb,
                         export_batch_mb=export_batch_mb,
+                        duckdb_export_threads=duckdb_export_threads,
+                        register=register,
                         logger=logger,
                     )
                 except ValueError as exc:
@@ -293,6 +292,8 @@ def sync_build_matrices(
                     sparse=sparse,
                     memory_limit_gb=memory_limit_gb,
                     export_batch_mb=export_batch_mb,
+                    duckdb_export_threads=duckdb_export_threads,
+                    register=register,
                     logger=logger,
                 )
                 built += 1
@@ -508,6 +509,7 @@ def compare_matrix_file(
     memory_limit_gb: float = 16.0,
     matrix_id: str | None = None,
     compare_config: MatrixCompareConfig | None = None,
+    register: bool = True,
     logger: WorkflowLogger | None = None,
 ) -> str:
     """Run ZipStrain matrix compare using the HDF5 file as the durable handle."""
@@ -530,13 +532,14 @@ def compare_matrix_file(
         **compare_kwargs,
     )
     compare_id = output_file.stem
-    db.register_matrix_compare(
-        conn,
-        compare_id=compare_id,
-        matrix_id=matrix_id or str(context.matrix_file),
-        compare_db_file=output_file,
-        calculate=calculate,
-    )
+    if register:
+        db.register_matrix_compare(
+            conn,
+            compare_id=compare_id,
+            matrix_id=matrix_id or str(context.matrix_file),
+            compare_db_file=output_file,
+            calculate=calculate,
+        )
     logger.emit(step="matrix-compare", status="done", matrix=context.matrix_file, compare_id=compare_id)
     return compare_id
 

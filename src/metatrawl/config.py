@@ -28,6 +28,13 @@ class StageConfig:
     slurm: SlurmConfig = field(default_factory=SlurmConfig)
 
 @dataclass(frozen=True)
+class MatrixBuildConfig:
+    memory_limit_gb: float | None = None
+    export_batch_mb: float | None = None
+    duckdb_export_threads: int | None = None
+
+
+@dataclass(frozen=True)
 class MatrixCompareConfig:
     calculate: str | None = None
     genome: str | None = None
@@ -61,6 +68,7 @@ class WorkflowConfig:
     sample_workers: int
     stages: dict[str, StageConfig]
     profile: ProfileConfig = field(default_factory=ProfileConfig)
+    matrix_build: MatrixBuildConfig = field(default_factory=MatrixBuildConfig)
     matrix_compare: MatrixCompareConfig = field(default_factory=MatrixCompareConfig)
 
     def stage(self, name: str) -> StageConfig:
@@ -136,6 +144,9 @@ def _parse(raw: dict[str, Any], *, threads: int, sample_count: int) -> WorkflowC
                 extra=_mapping(slurm_value.get("extra", {}), f"stages.{name}.slurm.extra"),
             ),
         )
+    build = raw.get("matrix_build", {})
+    if not isinstance(build, dict):
+        raise ValueError("matrix_build must be a table/object.")
     compare = raw.get("matrix_compare", {})
     if not isinstance(compare, dict):
         raise ValueError("matrix_compare must be a table/object.")
@@ -150,6 +161,10 @@ def _parse(raw: dict[str, Any], *, threads: int, sample_count: int) -> WorkflowC
         min_baseq=_nonnegative_int(profile.get("min_baseq", ProfileConfig.min_baseq), "profile.min_baseq"),
         min_read_ani=_optional_probability(profile.get("min_read_ani"), "profile.min_read_ani"),
         read_inclusion=read_inclusion,
+    ), matrix_build=MatrixBuildConfig(
+        memory_limit_gb=_optional_positive_float(build.get("memory_limit_gb"), "matrix_build.memory_limit_gb"),
+        export_batch_mb=_optional_positive_float(build.get("export_batch_mb"), "matrix_build.export_batch_mb"),
+        duckdb_export_threads=_optional_positive(build.get("duckdb_export_threads"), "matrix_build.duckdb_export_threads"),
     ), matrix_compare=MatrixCompareConfig(
         calculate=_optional_string(compare.get("calculate")),
         genome=_optional_string(compare.get("genome")),

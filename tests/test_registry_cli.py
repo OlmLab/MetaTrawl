@@ -25,7 +25,7 @@ from metatrawl.logging import WorkflowLogger
 def _matrix_contract_files(tmp_path: Path) -> tuple[Path, Path]:
     bed_file = tmp_path / "genomes.bed"
     stb_file = tmp_path / "genomes.stb"
-    bed_file.write_text("contigA\t1\t10\tgenome_a\n")
+    bed_file.write_text("contigA\t0\t10\tgenome_a\n")
     stb_file.write_text("contigA\tgenome_a\n")
     return bed_file, stb_file
 
@@ -1293,21 +1293,7 @@ def test_matrix_build_filters_samples_exports_selected_and_passes_sparse(tmp_pat
             """
         )
     bed_file, stb_file = _matrix_contract_files(tmp_path)
-    calls: list[dict[str, object]] = []
-
-    def build_matrix_hdf5(**kwargs):
-        profile_dir = Path(kwargs["profile_dir"])
-        staged_tables = {path.name: pl.read_parquet(path) for path in profile_dir.glob("*.parquet")}
-        calls.append({**kwargs, "staged": sorted(staged_tables), "staged_tables": staged_tables})
-        Path(kwargs["output_file"]).write_text("matrix")
-
-    zipstrain_module = types.ModuleType("zipstrain")
-    matrix_pairs_module = types.ModuleType("zipstrain.matrix_pairs")
-    matrix_pairs_module.build_matrix_hdf5 = build_matrix_hdf5
-    monkeypatch.setitem(sys.modules, "zipstrain", zipstrain_module)
-    monkeypatch.setitem(sys.modules, "zipstrain.matrix_pairs", matrix_pairs_module)
-    monkeypatch.setattr(zipstrain_module, "matrix_pairs", matrix_pairs_module, raising=False)
-    monkeypatch.setattr(workflows, "_write_matrix_hdf5_metatrawl_metadata", lambda *args, **kwargs: None)
+    matrix_file = tmp_path / "matrix.h5"
 
     result = runner.invoke(
         cli.cli,
@@ -1323,7 +1309,7 @@ def test_matrix_build_filters_samples_exports_selected_and_passes_sparse(tmp_pat
             "--stb-file",
             str(stb_file),
             "--output-file",
-            str(tmp_path / "matrix.h5"),
+            str(matrix_file),
             "--min-coverage",
             "1",
             "--min-breadth",
@@ -1338,10 +1324,12 @@ def test_matrix_build_filters_samples_exports_selected_and_passes_sparse(tmp_pat
 
     assert result.exit_code == 0, result.output
     assert "profiles=1" in result.output
-    assert calls[0]["staged"] == ["SRR_PASS.parquet"]
-    assert calls[0]["staged_tables"]["SRR_PASS.parquet"]["genome"].unique().to_list() == ["genome_a"]
-    assert "ref_base_bitmask" not in calls[0]["staged_tables"]["SRR_PASS.parquet"].columns
-    assert calls[0]["sparse"] is True
+    h5py = pytest.importorskip("h5py")
+    with h5py.File(matrix_file, "r") as handle:
+        assert handle["metadata"].attrs["layout"] == "per_genome_sample_major_sparse_indices_matrix_hdf5"
+        assert handle["samples"]["sample_name"].asstr()[...].tolist() == ["SRR_PASS"]
+        assert handle["matrices"]["0"]["indptr"][...].tolist() == [0, 1]
+        assert handle["matrices"]["0"]["indices"][...].tolist() == [0]
     with duckdb.connect(str(db_file)) as conn:
         assert conn.execute("SELECT storage_layout, profile_count FROM matrix_stores").fetchall() == [("sparse", 1)]
         assert conn.execute("SELECT sample_id FROM matrix_store_samples").fetchall() == [("SRR_PASS",)]
@@ -1355,20 +1343,7 @@ def test_matrix_build_ignores_stats_only_sample_without_matching_profile_rows(tm
     with registry.connect(db_file) as conn:
         conn.execute("UPDATE profile_positions SET genome = 'other_genome' WHERE sample_id = 'SRR_STATS_ONLY'")
     bed_file, stb_file = _matrix_contract_files(tmp_path)
-    staged: dict[str, pl.DataFrame] = {}
-
-    def build_matrix_hdf5(**kwargs):
-        profile_dir = Path(kwargs["profile_dir"])
-        staged.update({path.name: pl.read_parquet(path) for path in profile_dir.glob("*.parquet")})
-        Path(kwargs["output_file"]).write_text("matrix")
-
-    zipstrain_module = types.ModuleType("zipstrain")
-    matrix_pairs_module = types.ModuleType("zipstrain.matrix_pairs")
-    matrix_pairs_module.build_matrix_hdf5 = build_matrix_hdf5
-    monkeypatch.setitem(sys.modules, "zipstrain", zipstrain_module)
-    monkeypatch.setitem(sys.modules, "zipstrain.matrix_pairs", matrix_pairs_module)
-    monkeypatch.setattr(zipstrain_module, "matrix_pairs", matrix_pairs_module, raising=False)
-    monkeypatch.setattr(workflows, "_write_matrix_hdf5_metatrawl_metadata", lambda *args, **kwargs: None)
+    matrix_file = tmp_path / "matrix.h5"
 
     result = runner.invoke(
         cli.cli,
@@ -1384,7 +1359,7 @@ def test_matrix_build_ignores_stats_only_sample_without_matching_profile_rows(tm
             "--stb-file",
             str(stb_file),
             "--output-file",
-            str(tmp_path / "matrix.h5"),
+            str(matrix_file),
             "--min-coverage",
             "1",
         ],
@@ -1392,8 +1367,12 @@ def test_matrix_build_ignores_stats_only_sample_without_matching_profile_rows(tm
 
     assert result.exit_code == 0, result.output
     assert "profiles=1" in result.output
-    assert sorted(staged) == ["SRR_GOOD.parquet"]
-    assert staged["SRR_GOOD.parquet"]["genome"].unique().to_list() == ["genome_a"]
+    h5py = pytest.importorskip("h5py")
+    with h5py.File(matrix_file, "r") as handle:
+        assert handle["samples"]["sample_name"].asstr()[...].tolist() == ["SRR_GOOD"]
+        dense = handle["matrices"]["0"][0, :, :].tolist()
+        assert dense[0] == [1, 0, 0, 0]
+        assert dense[1] == [0, 0, 0, 0]  # C count is below ZipStrain's 5x matrix threshold.
 
 
 def test_matrix_build_fails_when_no_complete_profiles_exist(tmp_path: Path) -> None:
@@ -1615,15 +1594,10 @@ def test_matrix_append_accepts_registered_matrix_file(tmp_path: Path, monkeypatc
 
     calls: list[dict[str, object]] = []
 
-    def append_matrix_hdf5(**kwargs):
+    def append_matrix_hdf5_from_duckdb(conn, **kwargs):
         calls.append(kwargs)
 
-    zipstrain_module = types.ModuleType("zipstrain")
-    matrix_pairs_module = types.ModuleType("zipstrain.matrix_pairs")
-    matrix_pairs_module.append_matrix_hdf5 = append_matrix_hdf5
-    monkeypatch.setitem(sys.modules, "zipstrain", zipstrain_module)
-    monkeypatch.setitem(sys.modules, "zipstrain.matrix_pairs", matrix_pairs_module)
-    monkeypatch.setattr(zipstrain_module, "matrix_pairs", matrix_pairs_module, raising=False)
+    monkeypatch.setattr(workflows.matrix_hdf5, "append_matrix_hdf5_from_duckdb", append_matrix_hdf5_from_duckdb)
     monkeypatch.setattr(
         workflows,
         "read_matrix_file_context",
@@ -1651,6 +1625,7 @@ def test_matrix_append_accepts_registered_matrix_file(tmp_path: Path, monkeypatc
     assert result.exit_code == 0, result.output
     assert f"matrix_file={matrix_file}" in result.output
     assert calls[0]["matrix_hdf5_file"] == matrix_file
+    assert calls[0]["sample_ids"] == ["SRR1"]
 
 
 def test_matrix_append_exports_only_eligible_samples_and_matrix_genome(tmp_path: Path, monkeypatch) -> None:
@@ -1693,18 +1668,12 @@ def test_matrix_append_exports_only_eligible_samples_and_matrix_genome(tmp_path:
             filters=registry.MatrixFilters(min_coverage=1),
         )
 
-    staged: dict[str, pl.DataFrame] = {}
+    appended: list[str] = []
 
-    def append_matrix_hdf5(**kwargs):
-        profile_dir = Path(kwargs["profile_dir"])
-        staged.update({path.name: pl.read_parquet(path) for path in profile_dir.glob("*.parquet")})
+    def append_matrix_hdf5_from_duckdb(conn, **kwargs):
+        appended.extend(kwargs["sample_ids"])
 
-    zipstrain_module = types.ModuleType("zipstrain")
-    matrix_pairs_module = types.ModuleType("zipstrain.matrix_pairs")
-    matrix_pairs_module.append_matrix_hdf5 = append_matrix_hdf5
-    monkeypatch.setitem(sys.modules, "zipstrain", zipstrain_module)
-    monkeypatch.setitem(sys.modules, "zipstrain.matrix_pairs", matrix_pairs_module)
-    monkeypatch.setattr(zipstrain_module, "matrix_pairs", matrix_pairs_module, raising=False)
+    monkeypatch.setattr(workflows.matrix_hdf5, "append_matrix_hdf5_from_duckdb", append_matrix_hdf5_from_duckdb)
     monkeypatch.setattr(
         workflows,
         "read_matrix_file_context",
@@ -1730,9 +1699,7 @@ def test_matrix_append_exports_only_eligible_samples_and_matrix_genome(tmp_path:
     )
 
     assert result.exit_code == 0, result.output
-    assert sorted(staged) == ["SRR_PASS.parquet"]
-    assert staged["SRR_PASS.parquet"]["genome"].unique().to_list() == ["genome_a"]
-    assert "ref_base_bitmask" not in staged["SRR_PASS.parquet"].columns
+    assert appended == ["SRR_PASS"]
 
 
 def test_matrix_sync_build_builds_missing_and_appends_existing_matrices(tmp_path: Path, monkeypatch) -> None:
@@ -1882,7 +1849,7 @@ def test_matrix_sync_build_dispatches_one_job_per_genome_with_workflow_config(tm
     _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR1"), add_run=True)
     with registry.connect(db_file) as conn:
         conn.execute("INSERT INTO genome_stats VALUES ('SRR1', 'genome_b', 3.0, 0.8, 0.7, NULL)")
-    workflow_config.write_text('[stages.matrix_build]\nworkers = 2\nthreads = 4\n')
+    workflow_config.write_text('[stages.matrix_build]\nworkers = 2\nthreads = 4\n[matrix_build]\nmemory_limit_gb = 24\nexport_batch_mb = 32\nduckdb_export_threads = 3\n')
     commands: list[tuple[str, list[str], str]] = []
 
     class FakeRuntime:
@@ -1893,6 +1860,7 @@ def test_matrix_sync_build_dispatches_one_job_per_genome_with_workflow_config(tm
             commands.append((stage, command, sample))
 
     monkeypatch.setattr(cli, "WorkflowRuntime", FakeRuntime)
+    monkeypatch.setattr(cli.registry, "connect", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dispatch must not open a write connection")))
 
     result = runner.invoke(
         cli.cli,
@@ -1919,11 +1887,16 @@ def test_matrix_sync_build_dispatches_one_job_per_genome_with_workflow_config(tm
 
     assert result.exit_code == 0, result.output
     assert [stage for stage, _, _ in commands] == ["matrix_build", "matrix_build"]
+    first_command = commands[0][1]
+    assert first_command[first_command.index("--memory-limit-gb") + 1] == "64.0"
+    assert first_command[first_command.index("--export-batch-mb") + 1] == "512.0"
+    assert first_command[first_command.index("--duckdb-export-threads") + 1] == "3"
     command_by_sample = {sample: command for _, command, sample in commands}
     assert sorted(command_by_sample) == ["genome_a", "genome_b"]
     assert "--workflow-config" not in command_by_sample["genome_a"]
     assert command_by_sample["genome_a"][:3] == ["metatrawl", "matrix", "sync-build"]
     assert command_by_sample["genome_a"][command_by_sample["genome_a"].index("--memory-limit-gb") + 1] == "64.0"
+    assert "--no-register" in command_by_sample["genome_a"]
     assert "--sparse" in command_by_sample["genome_b"]
     assert "built=2" in result.output
 
@@ -2030,6 +2003,8 @@ def test_matrix_sync_compare_dispatches_one_job_per_matrix_with_workflow_config(
             commands.append((stage, command, sample))
 
     monkeypatch.setattr(cli, "WorkflowRuntime", FakeRuntime)
+    monkeypatch.setattr(cli.registry, "connect", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dispatch must not open a write connection")))
+    monkeypatch.setattr(cli.registry, "connect_read_only", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("compare dispatch should not open the project database")))
 
     result = runner.invoke(
         cli.cli,
@@ -2056,6 +2031,7 @@ def test_matrix_sync_compare_dispatches_one_job_per_matrix_with_workflow_config(
     assert genome_a[genome_a.index("--calculate") + 1] == "ani+ibs"
     assert genome_a[genome_a.index("--memory-limit-gb") + 1] == "32.0"
     assert genome_a[genome_a.index("--workflow-config") + 1] == str(workflow_config)
+    assert "--no-register" in genome_a
     assert "compared=2" in result.output
 
 

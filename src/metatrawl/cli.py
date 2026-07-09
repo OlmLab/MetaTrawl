@@ -420,6 +420,7 @@ def matrix_group() -> None:
 @click.option("--min-sylph-abundance", type=float, default=None)
 @click.option("--memory-limit-gb", type=float, default=16.0, show_default=True)
 @click.option("--export-batch-mb", type=float, default=128.0, show_default=True)
+@click.option("--duckdb-export-threads", type=int, default=1, show_default=True, help="DuckDB threads used while reading profile rows for matrix writing.")
 def matrix_build(
     db_file: Path,
     genome: str,
@@ -436,6 +437,7 @@ def matrix_build(
     min_sylph_abundance: float | None,
     memory_limit_gb: float,
     export_batch_mb: float,
+    duckdb_export_threads: int,
 ) -> None:
     """Build a matrix store from filtered DuckDB profile rows."""
     filters = registry.MatrixFilters(
@@ -459,6 +461,7 @@ def matrix_build(
                 sparse=sparse,
                 memory_limit_gb=memory_limit_gb,
                 export_batch_mb=export_batch_mb,
+                duckdb_export_threads=duckdb_export_threads,
                 logger=WorkflowLogger(),
             )
     except (FileExistsError, FileNotFoundError, ValueError) as exc:
@@ -481,9 +484,11 @@ def matrix_build(
 @click.option("--min-breadth", type=float, default=None)
 @click.option("--min-ber", type=float, default=None)
 @click.option("--min-sylph-abundance", type=float, default=None)
-@click.option("--memory-limit-gb", type=float, default=16.0, show_default=True)
-@click.option("--export-batch-mb", type=float, default=128.0, show_default=True)
+@click.option("--memory-limit-gb", type=float, default=None, help="Matrix build memory limit in GB. Defaults to [matrix_build].memory_limit_gb or 16.")
+@click.option("--export-batch-mb", type=float, default=None, help="Temporary profile export row-group target in MB. Defaults to [matrix_build].export_batch_mb or 128.")
+@click.option("--duckdb-export-threads", type=int, default=None, help="DuckDB threads used while reading profile rows for matrix writing. Defaults to [matrix_build].duckdb_export_threads or 1.")
 @click.option("--workflow-config", type=click.Path(path_type=Path), help="TOML/JSON stage concurrency and Slurm policy for per-genome build jobs.")
+@click.option("--no-register", is_flag=True, hidden=True, help="Do not write matrix metadata back to the MetaTrawl registry.")
 def matrix_sync_build(
     db_file: Path,
     matrix_dir: Path,
@@ -499,9 +504,11 @@ def matrix_sync_build(
     min_breadth: float | None,
     min_ber: float | None,
     min_sylph_abundance: float | None,
-    memory_limit_gb: float,
-    export_batch_mb: float,
+    memory_limit_gb: float | None,
+    export_batch_mb: float | None,
+    duckdb_export_threads: int | None,
     workflow_config: Path | None,
+    no_register: bool,
 ) -> None:
     """Build missing per-genome matrices and append newly imported samples."""
     filters = registry.MatrixFilters(
@@ -511,28 +518,37 @@ def matrix_sync_build(
         min_sylph_abundance=min_sylph_abundance,
     )
     try:
-        with registry.connect(db_file) as conn:
+        with registry.connect_read_only(db_file) as conn:
             selected_genomes = list(genomes) if genomes else registry.genomes_with_complete_samples(conn)
-            execution_config = load_workflow_config(workflow_config, threads=1, sample_count=max(1, len(selected_genomes)))
-            if workflow_config is not None and _should_dispatch_stage(execution_config, "matrix_build"):
-                summary = _dispatch_matrix_sync_build_jobs(
-                    db_file=db_file,
-                    matrix_dir=matrix_dir,
-                    genomes=selected_genomes,
-                    bed_file=bed_file,
-                    stb_file=stb_file,
-                    bed_dir=bed_dir,
-                    stb_dir=stb_dir,
-                    gene_range_table=gene_range_table,
-                    gene_range_dir=gene_range_dir,
-                    filters=filters,
-                    sparse=sparse,
-                    memory_limit_gb=memory_limit_gb,
-                    export_batch_mb=export_batch_mb,
-                    execution_config=execution_config,
-                    logger=WorkflowLogger(),
-                )
-            else:
+        execution_config = load_workflow_config(workflow_config, threads=1, sample_count=max(1, len(selected_genomes)))
+        resolved_memory_limit_gb, resolved_export_batch_mb, resolved_duckdb_export_threads = _resolve_matrix_build_options(
+            execution_config,
+            memory_limit_gb=memory_limit_gb,
+            export_batch_mb=export_batch_mb,
+            duckdb_export_threads=duckdb_export_threads,
+        )
+        if workflow_config is not None and _should_dispatch_stage(execution_config, "matrix_build") and not no_register:
+            summary = _dispatch_matrix_sync_build_jobs(
+                db_file=db_file,
+                matrix_dir=matrix_dir,
+                genomes=selected_genomes,
+                bed_file=bed_file,
+                stb_file=stb_file,
+                bed_dir=bed_dir,
+                stb_dir=stb_dir,
+                gene_range_table=gene_range_table,
+                gene_range_dir=gene_range_dir,
+                filters=filters,
+                sparse=sparse,
+                memory_limit_gb=resolved_memory_limit_gb,
+                export_batch_mb=resolved_export_batch_mb,
+                duckdb_export_threads=resolved_duckdb_export_threads,
+                execution_config=execution_config,
+                logger=WorkflowLogger(),
+            )
+        else:
+            connect = registry.connect_read_only if no_register else registry.connect
+            with connect(db_file) as conn:
                 summary = workflows.sync_build_matrices(
                     conn,
                     matrix_dir=matrix_dir,
@@ -545,8 +561,10 @@ def matrix_sync_build(
                     gene_range_dir=gene_range_dir,
                     filters=filters,
                     sparse=sparse,
-                    memory_limit_gb=memory_limit_gb,
-                    export_batch_mb=export_batch_mb,
+                    memory_limit_gb=resolved_memory_limit_gb,
+                    export_batch_mb=resolved_export_batch_mb,
+                    duckdb_export_threads=resolved_duckdb_export_threads,
+                    register=not no_register,
                     logger=WorkflowLogger(),
                 )
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
@@ -566,7 +584,8 @@ def matrix_sync_build(
 @click.option("--matrix-file", type=click.Path(path_type=Path), help="Registered matrix HDF5 file.")
 @click.option("--memory-limit-gb", type=float, default=16.0, show_default=True)
 @click.option("--export-batch-mb", type=float, default=128.0, show_default=True)
-def matrix_append(db_file: Path, matrix_id: str | None, matrix_file: Path | None, memory_limit_gb: float, export_batch_mb: float) -> None:
+@click.option("--duckdb-export-threads", type=int, default=1, show_default=True, help="DuckDB threads used while reading profile rows for matrix writing.")
+def matrix_append(db_file: Path, matrix_id: str | None, matrix_file: Path | None, memory_limit_gb: float, export_batch_mb: float, duckdb_export_threads: int) -> None:
     """Append newly imported complete samples to a registered matrix store."""
     try:
         with registry.connect(db_file) as conn:
@@ -581,11 +600,37 @@ def matrix_append(db_file: Path, matrix_id: str | None, matrix_file: Path | None
                 matrix_id=resolved_matrix_id,
                 memory_limit_gb=memory_limit_gb,
                 export_batch_mb=export_batch_mb,
+                duckdb_export_threads=duckdb_export_threads,
                 logger=WorkflowLogger(),
             )
     except (FileNotFoundError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"matrix_file={resolved_matrix_file} appended={appended}")
+
+
+def _resolve_matrix_build_options(
+    execution_config,
+    *,
+    memory_limit_gb: float | None,
+    export_batch_mb: float | None,
+    duckdb_export_threads: int | None,
+) -> tuple[float, float, int]:
+    """Resolve matrix build options with CLI values overriding TOML values."""
+    matrix_config = execution_config.matrix_build
+    resolved_memory_limit_gb = memory_limit_gb if memory_limit_gb is not None else matrix_config.memory_limit_gb or 16.0
+    resolved_export_batch_mb = export_batch_mb if export_batch_mb is not None else matrix_config.export_batch_mb or 128.0
+    resolved_duckdb_export_threads = (
+        duckdb_export_threads
+        if duckdb_export_threads is not None
+        else matrix_config.duckdb_export_threads or 1
+    )
+    if resolved_memory_limit_gb <= 0:
+        raise click.ClickException("--memory-limit-gb must be positive")
+    if resolved_export_batch_mb <= 0:
+        raise click.ClickException("--export-batch-mb must be positive")
+    if resolved_duckdb_export_threads < 1:
+        raise click.ClickException("--duckdb-export-threads must be positive")
+    return resolved_memory_limit_gb, resolved_export_batch_mb, resolved_duckdb_export_threads
 
 
 def _resolve_matrix_compare_options(
@@ -621,10 +666,12 @@ def _resolve_matrix_compare_options(
 @click.option("--backend", default=None, help="ZipStrain matrix backend; overrides workflow configuration.")
 @click.option("--memory-limit-gb", type=float, default=None, help="Comparison memory limit; overrides workflow configuration.")
 @click.option("--workflow-config", type=click.Path(path_type=Path), help="TOML/JSON ZipStrain queue/executor controls.")
-def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | None, output_file: Path, calculate: str | None, genome: str | None, backend: str | None, memory_limit_gb: float | None, workflow_config: Path | None) -> None:
+@click.option("--no-register", is_flag=True, hidden=True, help="Do not write compare metadata back to the MetaTrawl registry.")
+def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | None, output_file: Path, calculate: str | None, genome: str | None, backend: str | None, memory_limit_gb: float | None, workflow_config: Path | None, no_register: bool) -> None:
     """Compare a registered matrix store."""
     try:
-        with registry.connect(db_file) as conn:
+        connect = registry.connect_read_only if no_register else registry.connect
+        with connect(db_file) as conn:
             resolved_matrix_file, resolved_matrix_id = workflows.resolve_matrix_file(
                 conn,
                 matrix_id=matrix_id,
@@ -650,6 +697,7 @@ def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | Non
                 backend=resolved_backend,
                 memory_limit_gb=resolved_memory_limit_gb,
                 compare_config=execution_config.matrix_compare,
+                register=not no_register,
                 logger=WorkflowLogger(),
             )
     except (FileNotFoundError, ValueError) as exc:
@@ -678,31 +726,31 @@ def matrix_sync_compare(
 ) -> None:
     """Run resumable compare for every matrix file in a directory."""
     try:
-        with registry.connect(db_file) as conn:
-            execution_config = load_workflow_config(workflow_config, threads=1, sample_count=1)
-            resolved_calculate, resolved_genome, resolved_backend, resolved_memory_limit_gb = (
-                _resolve_matrix_compare_options(
-                    execution_config,
-                    calculate=calculate,
-                    genome=genome,
-                    backend=backend,
-                    memory_limit_gb=memory_limit_gb,
-                )
+        execution_config = load_workflow_config(workflow_config, threads=1, sample_count=1)
+        resolved_calculate, resolved_genome, resolved_backend, resolved_memory_limit_gb = (
+            _resolve_matrix_compare_options(
+                execution_config,
+                calculate=calculate,
+                genome=genome,
+                backend=backend,
+                memory_limit_gb=memory_limit_gb,
             )
-            if workflow_config is not None and _should_dispatch_stage(execution_config, "matrix_compare"):
-                summary = _dispatch_matrix_sync_compare_jobs(
-                    db_file=db_file,
-                    matrix_dir=matrix_dir,
-                    compare_dir=compare_dir,
-                    calculate=resolved_calculate,
-                    genome=resolved_genome,
-                    backend=resolved_backend,
-                    memory_limit_gb=resolved_memory_limit_gb,
-                    workflow_config=workflow_config,
-                    execution_config=execution_config,
-                    logger=WorkflowLogger(),
-                )
-            else:
+        )
+        if workflow_config is not None and _should_dispatch_stage(execution_config, "matrix_compare"):
+            summary = _dispatch_matrix_sync_compare_jobs(
+                db_file=db_file,
+                matrix_dir=matrix_dir,
+                compare_dir=compare_dir,
+                calculate=resolved_calculate,
+                genome=resolved_genome,
+                backend=resolved_backend,
+                memory_limit_gb=resolved_memory_limit_gb,
+                workflow_config=workflow_config,
+                execution_config=execution_config,
+                logger=WorkflowLogger(),
+            )
+        else:
+            with registry.connect(db_file) as conn:
                 summary = workflows.sync_compare_matrices(
                     conn,
                     matrix_dir=matrix_dir,
@@ -744,6 +792,7 @@ def _dispatch_matrix_sync_build_jobs(
     sparse: bool,
     memory_limit_gb: float,
     export_batch_mb: float,
+    duckdb_export_threads: int,
     execution_config: WorkflowConfig,
     logger: WorkflowLogger,
 ) -> workflows.MatrixSyncBuildSummary:
@@ -774,6 +823,7 @@ def _dispatch_matrix_sync_build_jobs(
                 sparse=sparse,
                 memory_limit_gb=memory_limit_gb,
                 export_batch_mb=export_batch_mb,
+                duckdb_export_threads=duckdb_export_threads,
             )
             futures[executor.submit(runtime.run, "matrix_build", command, sample=genome)] = genome
         for future in as_completed(futures):
@@ -812,6 +862,7 @@ def _matrix_sync_build_child_command(
     sparse: bool,
     memory_limit_gb: float,
     export_batch_mb: float,
+    duckdb_export_threads: int,
 ) -> list[str]:
     command = [
         "metatrawl",
@@ -827,6 +878,9 @@ def _matrix_sync_build_child_command(
         str(memory_limit_gb),
         "--export-batch-mb",
         str(export_batch_mb),
+        "--duckdb-export-threads",
+        str(duckdb_export_threads),
+        "--no-register",
     ]
     if sparse:
         command.append("--sparse")
@@ -892,6 +946,7 @@ def _dispatch_matrix_sync_compare_jobs(
                 str(memory_limit_gb),
                 "--workflow-config",
                 str(workflow_config),
+                "--no-register",
             ]
             futures[executor.submit(runtime.run, "matrix_compare", command, sample=matrix_file.stem)] = matrix_file
         for future in as_completed(futures):

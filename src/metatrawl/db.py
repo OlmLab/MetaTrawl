@@ -163,6 +163,11 @@ def connect(db_path: str | Path) -> duckdb.DuckDBPyConnection:
     return conn
 
 
+def connect_read_only(db_path: str | Path) -> duckdb.DuckDBPyConnection:
+    """Open a read-only DuckDB connection for concurrent matrix jobs."""
+    return duckdb.connect(str(Path(db_path)), read_only=True)
+
+
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create and lightly migrate registry tables."""
     had_legacy_matrix_profiles = _table_exists(conn, "matrix_store_profiles")
@@ -477,39 +482,77 @@ def matrix_store_filters(conn: duckdb.DuckDBPyConnection, matrix_id: str) -> Mat
     )
 
 
+def sample_ids_with_profile_rows(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    sample_ids: list[str],
+    genome: str | None = None,
+) -> list[str]:
+    """Return input sample IDs that have at least one profile row for the matrix scope."""
+    if not sample_ids:
+        return []
+    conditions = ["sample_id IN (SELECT unnest(?))"]
+    params: list[object] = [sample_ids]
+    if genome is not None and genome != "all":
+        conditions.append("genome = ?")
+        params.append(genome)
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT sample_id
+        FROM profile_positions
+        WHERE {' AND '.join(conditions)}
+        """,
+        params,
+    ).fetchall()
+    present = {str(row[0]) for row in rows}
+    return [sample_id for sample_id in sample_ids if sample_id in present]
+
+
+
 def export_profile_parquets(
     conn: duckdb.DuckDBPyConnection,
     *,
     sample_ids: list[str],
     output_dir: Path,
     genome: str | None = None,
+    memory_limit_gb: float | None = None,
+    export_batch_mb: float = 128.0,
+    duckdb_threads: int = 1,
     progress_callback: ExportProgressCallback | None = None,
 ) -> list[Path]:
     """Export selected samples from DuckDB into temporary ZipStrain profile parquets."""
     output_dir.mkdir(parents=True, exist_ok=True)
+    _configure_duckdb_export(conn, output_dir=output_dir, memory_limit_gb=memory_limit_gb, threads=duckdb_threads)
+    row_group_size = _export_row_group_size(export_batch_mb)
     paths: list[Path] = []
     total = len(sample_ids)
     if progress_callback is not None:
         progress_callback({"phase": "start", "completed": 0, "total": total, "genome": genome or "all"})
     for index, sample_id in enumerate(sample_ids, start=1):
         output_file = output_dir / f"{sample_id}.parquet"
-        conditions = ["sample_id = ?"]
-        params: list[object] = [sample_id]
+        conditions = [f"sample_id = {_sql_literal(sample_id)}"]
+        count_params: list[object] = [sample_id]
+        count_conditions = ["sample_id = ?"]
         if genome is not None and genome != "all":
-            conditions.append("genome = ?")
-            params.append(genome)
-        where_sql = " AND ".join(conditions)
-        arrow_table = conn.execute(
-            f"""
-            SELECT chrom, genome, pos, COALESCE(gene, 'NA') AS gene, A, T, C, G
-            FROM profile_positions
-            WHERE {where_sql}
-            ORDER BY chrom, pos
-            """,
-            params,
-        ).fetch_arrow_table()
-        if arrow_table.num_rows:
-            pl.from_arrow(arrow_table).write_parquet(output_file)
+            conditions.append(f"genome = {_sql_literal(genome)}")
+            count_conditions.append("genome = ?")
+            count_params.append(genome)
+        count_where_sql = " AND ".join(count_conditions)
+        row_count = conn.execute(
+            f"SELECT count(*) FROM profile_positions WHERE {count_where_sql}",
+            count_params,
+        ).fetchone()[0]
+        if row_count:
+            where_sql = " AND ".join(conditions)
+            conn.execute(
+                f"""
+                COPY (
+                    SELECT chrom, genome, pos, COALESCE(gene, 'NA') AS gene, A, T, C, G
+                    FROM profile_positions
+                    WHERE {where_sql}
+                ) TO {_sql_literal(output_file)} (FORMAT PARQUET, ROW_GROUP_SIZE {row_group_size})
+                """
+            )
             paths.append(output_file)
         if progress_callback is not None:
             progress_callback(
@@ -524,6 +567,32 @@ def export_profile_parquets(
     if progress_callback is not None:
         progress_callback({"phase": "done", "completed": total, "total": total, "genome": genome or "all"})
     return paths
+
+
+def _configure_duckdb_export(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    output_dir: Path,
+    memory_limit_gb: float | None,
+    threads: int,
+) -> None:
+    # Matrix export can otherwise use large parallel parquet buffers per sample.
+    conn.execute(f"SET threads = {max(1, int(threads))}")
+    temp_dir = output_dir / ".duckdb_tmp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    conn.execute(f"SET temp_directory = {_sql_literal(temp_dir)}")
+    if memory_limit_gb is not None:
+        conn.execute(f"SET memory_limit = {_sql_literal(f'{memory_limit_gb}GB')}")
+
+
+def _export_row_group_size(export_batch_mb: float) -> int:
+    estimated_row_width = 128
+    target_rows = int(max(1.0, export_batch_mb) * 1024 * 1024 / estimated_row_width)
+    return max(10_000, min(250_000, target_rows))
+
+
+def _sql_literal(value: object) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 def register_cache_genome(conn: duckdb.DuckDBPyConnection, *, accession: str, genome_fasta: Path, gene_fasta: Path) -> None:

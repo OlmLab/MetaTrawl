@@ -23,6 +23,10 @@ environment = { OMP_NUM_THREADS = "12" }
 time = "03:00:00"
 memory_gb = 48
 partition = "compute"
+[matrix_build]
+memory_limit_gb = 20
+export_batch_mb = 32
+duckdb_export_threads = 4
 [matrix_compare]
 calculate = "ani+ibs"
 genome = "GCF_1"
@@ -44,6 +48,9 @@ read_inclusion = "proper-pairs"
     assert config.stage("bowtie_build").retries == 2
     assert config.stage("bowtie_build").retry_delay_seconds == 0.5
     assert config.stage("bowtie_build").slurm.memory_gb == 48
+    assert config.matrix_build.memory_limit_gb == 20.0
+    assert config.matrix_build.export_batch_mb == 32.0
+    assert config.matrix_build.duckdb_export_threads == 4
     assert config.matrix_compare.calculate == "ani+ibs"
     assert config.matrix_compare.genome == "GCF_1"
     assert config.matrix_compare.backend == "mps"
@@ -75,6 +82,13 @@ def test_config_rejects_nonpositive_matrix_memory_limit(tmp_path: Path) -> None:
     path = tmp_path / "workflow.toml"
     path.write_text("[matrix_compare]\nmemory_limit_gb = 0\n")
     with pytest.raises(ValueError, match="matrix_compare.memory_limit_gb must be a positive number"):
+        load_workflow_config(path, threads=2, sample_count=2)
+
+
+def test_config_rejects_nonpositive_matrix_build_threads(tmp_path: Path) -> None:
+    path = tmp_path / "workflow.toml"
+    path.write_text("[matrix_build]\nduckdb_export_threads = 0\n")
+    with pytest.raises(ValueError, match="matrix_build.duckdb_export_threads must be a positive integer"):
         load_workflow_config(path, threads=2, sample_count=2)
 
 
