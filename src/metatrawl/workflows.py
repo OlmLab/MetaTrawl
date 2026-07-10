@@ -92,17 +92,9 @@ def build_matrix_from_database(
 ) -> db.MatrixStore:
     """Build a ZipStrain matrix store from DuckDB profile rows."""
     logger = logger or WorkflowLogger()
-    candidate_sample_ids = db.eligible_sample_ids(conn, genome=genome, filters=filters)
-    sample_ids = db.sample_ids_with_profile_rows(
-        conn,
-        sample_ids=candidate_sample_ids,
-        genome=None if genome == "all" else genome,
-    )
+    sample_ids = db.eligible_sample_ids(conn, genome=genome, filters=filters)
     if not sample_ids:
         raise ValueError("No complete samples passed the matrix build filters.")
-    skipped_empty = len(candidate_sample_ids) - len(sample_ids)
-    if skipped_empty:
-        logger.emit(step="matrix-build", status="skipped-empty-profiles", samples=skipped_empty, genome=genome)
 
     output_file = Path(output_file)
     if output_file.exists() and not overwrite:
@@ -183,11 +175,6 @@ def append_matrix_from_database(
             genome=context.genome,
             filters=context.filters,
         )
-    )
-    sample_ids = db.sample_ids_with_profile_rows(
-        conn,
-        sample_ids=sample_ids,
-        genome=None if context.genome == "all" else context.genome,
     )
     if not sample_ids:
         raise ValueError(f"No new complete samples are available to append to matrix: {context.matrix_file}")

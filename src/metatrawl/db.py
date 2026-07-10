@@ -482,32 +482,6 @@ def matrix_store_filters(conn: duckdb.DuckDBPyConnection, matrix_id: str) -> Mat
     )
 
 
-def sample_ids_with_profile_rows(
-    conn: duckdb.DuckDBPyConnection,
-    *,
-    sample_ids: list[str],
-    genome: str | None = None,
-) -> list[str]:
-    """Return input sample IDs that have at least one profile row for the matrix scope."""
-    if not sample_ids:
-        return []
-    conditions = ["sample_id IN (SELECT unnest(?))"]
-    params: list[object] = [sample_ids]
-    if genome is not None and genome != "all":
-        conditions.append("genome = ?")
-        params.append(genome)
-    rows = conn.execute(
-        f"""
-        SELECT DISTINCT sample_id
-        FROM profile_positions
-        WHERE {' AND '.join(conditions)}
-        """,
-        params,
-    ).fetchall()
-    present = {str(row[0]) for row in rows}
-    return [sample_id for sample_id in sample_ids if sample_id in present]
-
-
 
 def export_profile_parquets(
     conn: duckdb.DuckDBPyConnection,

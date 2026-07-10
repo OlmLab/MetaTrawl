@@ -1,6 +1,6 @@
 [project]
 name = "metatrawl"
-version = "0.1.16"
+version = "0.1.17"
 description = "Mutable registry and workflow bookkeeping for large ZipStrain/SRA profiling projects."
 readme = "README.md"
 license = "MIT"

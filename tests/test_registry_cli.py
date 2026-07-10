@@ -1323,19 +1323,19 @@ def test_matrix_build_filters_samples_exports_selected_and_passes_sparse(tmp_pat
     )
 
     assert result.exit_code == 0, result.output
-    assert "profiles=1" in result.output
+    assert "profiles=2" in result.output
     h5py = pytest.importorskip("h5py")
     with h5py.File(matrix_file, "r") as handle:
         assert handle["metadata"].attrs["layout"] == "per_genome_sample_major_sparse_indices_matrix_hdf5"
-        assert handle["samples"]["sample_name"].asstr()[...].tolist() == ["SRR_PASS"]
-        assert handle["matrices"]["0"]["indptr"][...].tolist() == [0, 1]
+        assert handle["samples"]["sample_name"].asstr()[...].tolist() == ["SRR_PASS", "SRR_STATS_ONLY"]
+        assert handle["matrices"]["0"]["indptr"][...].tolist() == [0, 1, 1]
         assert handle["matrices"]["0"]["indices"][...].tolist() == [0]
     with duckdb.connect(str(db_file)) as conn:
-        assert conn.execute("SELECT storage_layout, profile_count FROM matrix_stores").fetchall() == [("sparse", 1)]
-        assert conn.execute("SELECT sample_id FROM matrix_store_samples").fetchall() == [("SRR_PASS",)]
+        assert conn.execute("SELECT storage_layout, profile_count FROM matrix_stores").fetchall() == [("sparse", 2)]
+        assert conn.execute("SELECT sample_id FROM matrix_store_samples ORDER BY sample_id").fetchall() == [("SRR_PASS",), ("SRR_STATS_ONLY",)]
 
 
-def test_matrix_build_ignores_stats_only_sample_without_matching_profile_rows(tmp_path: Path, monkeypatch) -> None:
+def test_matrix_build_keeps_stats_only_sample_as_zero_matrix_row(tmp_path: Path, monkeypatch) -> None:
     runner = CliRunner()
     db_file = tmp_path / "metatrawl.duckdb"
     _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR_GOOD", coverage=5, breadth=0.95, ber=0.9), add_run=True)
@@ -1366,13 +1366,15 @@ def test_matrix_build_ignores_stats_only_sample_without_matching_profile_rows(tm
     )
 
     assert result.exit_code == 0, result.output
-    assert "profiles=1" in result.output
+    assert "profiles=2" in result.output
     h5py = pytest.importorskip("h5py")
     with h5py.File(matrix_file, "r") as handle:
-        assert handle["samples"]["sample_name"].asstr()[...].tolist() == ["SRR_GOOD"]
-        dense = handle["matrices"]["0"][0, :, :].tolist()
-        assert dense[0] == [1, 0, 0, 0]
-        assert dense[1] == [0, 0, 0, 0]  # C count is below ZipStrain's 5x matrix threshold.
+        assert handle["samples"]["sample_name"].asstr()[...].tolist() == ["SRR_GOOD", "SRR_STATS_ONLY"]
+        good_dense = handle["matrices"]["0"][0, :, :].tolist()
+        stats_only_dense = handle["matrices"]["0"][1, :, :].tolist()
+        assert good_dense[0] == [1, 0, 0, 0]
+        assert good_dense[1] == [0, 0, 0, 0]  # C count is below ZipStrain's 5x matrix threshold.
+        assert all(row == [0, 0, 0, 0] for row in stats_only_dense)
 
 
 def test_matrix_build_fails_when_no_complete_profiles_exist(tmp_path: Path) -> None:
@@ -1699,7 +1701,7 @@ def test_matrix_append_exports_only_eligible_samples_and_matrix_genome(tmp_path:
     )
 
     assert result.exit_code == 0, result.output
-    assert appended == ["SRR_PASS"]
+    assert appended == ["SRR_PASS", "SRR_STATS_ONLY"]
 
 
 def test_matrix_sync_build_builds_missing_and_appends_existing_matrices(tmp_path: Path, monkeypatch) -> None:
