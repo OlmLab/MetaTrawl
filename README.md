@@ -336,6 +336,42 @@ MetaTrawl derives completion, samples, and genomes from distinct result rows;
 it still skips a view when an available sample catalog shows that result rows
 are incomplete. No legacy comparison database is modified.
 
+### Explore Genome Views
+
+Start the interactive genome atlas after `sync-genome-views` completes:
+
+```bash
+metatrawl view genomes \
+  --view-dir genome_views
+```
+
+MetaTrawl serves the generated bundles at `http://127.0.0.1:8766` and opens the
+default browser. The viewer provides a searchable genome catalog, summary
+distributions, cluster composition, an interactive ANI heatmap, a scalable
+dendrogram, a filterable sample-neighbor network, and searchable sample
+statistics. It reads only static bundle files and never opens the project or
+comparison DuckDB databases.
+
+On a remote cluster, bind to the compute node without attempting to open its
+browser:
+
+```bash
+metatrawl view genomes \
+  --view-dir genome_views \
+  --host 0.0.0.0 \
+  --port 8766 \
+  --no-open
+```
+
+Use SSH port forwarding from your workstation:
+
+```bash
+ssh -L 8766:127.0.0.1:8766 user@cluster
+```
+
+For public deployment, the same viewer and bundles can be hosted as static
+files; the local server is not a required production component.
+
 ### 8. Inspect Progress
 
 At any point:

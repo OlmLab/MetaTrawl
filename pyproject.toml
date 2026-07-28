@@ -29,6 +29,7 @@ metatrawl = "metatrawl.cli:cli"
 
 [tool.poetry]
 packages = [{include = "metatrawl", from = "src"}]
+include = [{path = "src/metatrawl/web", format = ["sdist", "wheel"]}]
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]

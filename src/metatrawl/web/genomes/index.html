@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#111111">
+  <title>MetaTrawl Genome Atlas</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="loading" class="loading"><span></span><strong>Reading the genome atlas</strong></div>
+  <div id="app" class="app" hidden>
+    <aside class="rail">
+      <header class="brand">
+        <div class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></div>
+        <div><b>MetaTrawl</b><span>Genome atlas</span></div>
+      </header>
+      <label class="search">
+        <span>Find a genome</span>
+        <input id="genome-search" type="search" placeholder="Accession or name" autocomplete="off">
+      </label>
+      <div class="rail-meta"><span id="genome-count"></span><button id="sort-genomes">Samples ↓</button></div>
+      <nav id="genome-list" class="genome-list" aria-label="Genomes"></nav>
+      <footer>Static analysis bundle<br><span id="catalog-date"></span></footer>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <button id="rail-toggle" class="rail-toggle" aria-label="Toggle genome list">☰</button>
+        <div class="identity">
+          <span>Selected genome</span>
+          <h1 id="genome-title">—</h1>
+        </div>
+        <div class="top-actions">
+          <button id="copy-link">Copy link</button>
+          <a id="download-stats" download>Stats ↓</a>
+        </div>
+      </header>
+
+      <section id="metrics" class="metrics" aria-label="Genome summary"></section>
+
+      <nav class="tabs" aria-label="Analysis views">
+        <button class="active" data-tab="overview">Overview</button>
+        <button data-tab="heatmap">ANI map</button>
+        <button data-tab="dendrogram">Dendrogram</button>
+        <button data-tab="network">Neighbors</button>
+        <button data-tab="samples">Samples</button>
+      </nav>
+
+      <div id="workspace" class="workspace">
+        <section id="tab-overview" class="tab-panel active">
+          <div class="overview-grid">
+            <article class="distribution-panel">
+              <div class="section-head">
+                <div><span>Population shape</span><h2>Distributions</h2></div>
+                <select id="distribution-select" aria-label="Distribution metric"></select>
+              </div>
+              <div id="distribution-chart" class="chart"></div>
+            </article>
+            <article class="cluster-panel">
+              <div class="section-head"><div><span>Structure</span><h2>Cluster balance</h2></div></div>
+              <div id="cluster-summary"></div>
+            </article>
+          </div>
+          <article class="preview-panel">
+            <div class="section-head">
+              <div><span>Computed snapshot</span><h2>Clustermap preview</h2></div>
+              <button data-go="heatmap">Open interactive map →</button>
+            </div>
+            <img id="clustermap-preview" alt="Genome ANI clustermap">
+          </article>
+        </section>
+
+        <section id="tab-heatmap" class="tab-panel">
+          <div class="section-head">
+            <div><span>Pairwise identity</span><h2>Interactive ANI map</h2></div>
+            <div class="legend"><i></i><span>Lower ANI</span><b></b><span>100%</span></div>
+          </div>
+          <div id="heatmap-wrap" class="canvas-wrap">
+            <canvas id="heatmap-canvas"></canvas>
+            <div id="heatmap-tip" class="tooltip"></div>
+          </div>
+          <p class="hint">Hover to inspect pairs. Samples follow dendrogram leaf order.</p>
+        </section>
+
+        <section id="tab-dendrogram" class="tab-panel">
+          <div class="section-head">
+            <div><span>Hierarchical structure</span><h2>Dendrogram</h2></div>
+            <div class="zoom-actions"><button data-zoom="out">−</button><button data-zoom="reset">Reset</button><button data-zoom="in">+</button></div>
+          </div>
+          <div id="dendrogram-wrap" class="svg-wrap"></div>
+          <p class="hint">Scroll vertically for large cohorts. Branch distance is 1 − ANI/100.</p>
+        </section>
+
+        <section id="tab-network" class="tab-panel">
+          <div class="section-head">
+            <div><span>Top comparable neighbors</span><h2>Sample network</h2></div>
+            <div class="network-controls">
+              <label>ANI ≥ <output id="ani-output">99.8</output><input id="ani-filter" type="range" min="95" max="100" step="0.01" value="99.8"></label>
+              <button id="network-reset">Reset view</button>
+            </div>
+          </div>
+          <div class="network-layout">
+            <div id="network-wrap" class="canvas-wrap">
+              <canvas id="network-canvas"></canvas>
+              <div id="network-tip" class="tooltip"></div>
+            </div>
+            <aside id="sample-inspector" class="inspector"><span>Select a node</span><h3>Sample details</h3><p>Click any sample to inspect its cluster and profile statistics.</p></aside>
+          </div>
+        </section>
+
+        <section id="tab-samples" class="tab-panel">
+          <div class="section-head">
+            <div><span>Genome-positive cohort</span><h2>Samples</h2></div>
+            <input id="sample-search" class="table-search" type="search" placeholder="Filter samples">
+          </div>
+          <div class="table-wrap"><table id="sample-table"></table></div>
+        </section>
+      </div>
+    </main>
+  </div>
+  <div id="error" class="error" hidden><span>Viewer unavailable</span><h1>Could not load this atlas.</h1><pre></pre></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
