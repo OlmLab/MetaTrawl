@@ -17,7 +17,9 @@ def _database(tmp_path: Path) -> Path:
             [("sample_a", "run_a"), ("sample_b", "run_b")],
         )
         conn.executemany(
-            "INSERT INTO genome_stats VALUES (?, ?, ?, ?, ?, ?)",
+            """INSERT INTO genome_stats
+               (sample_id, genome, coverage, breadth, ber, ref_ani)
+               VALUES (?, ?, ?, ?, ?, ?)""",
             [
                 ("sample_a", "genome_1", 5.0, 0.9, 0.8, 0.999),
                 ("sample_a", "genome_2", 2.0, 0.5, 0.4, None),
@@ -25,7 +27,9 @@ def _database(tmp_path: Path) -> Path:
             ],
         )
         conn.executemany(
-            "INSERT INTO gene_stats VALUES (?, ?, ?, ?, ?, ?, ?)",
+            """INSERT INTO gene_stats
+               (sample_id, genome, gene, coverage, breadth, ber, ref_ani)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
             [
                 ("sample_a", "genome_1", "gene_1", 5.0, 0.9, 0.8, 1.0),
                 ("sample_a", "genome_1", "gene_2", 4.0, 0.8, 0.7, 0.99),
@@ -58,6 +62,8 @@ def test_genome_view_queries_stats_across_samples(tmp_path: Path) -> None:
 
     assert genome_stats["sample_id"].to_list() == ["sample_a", "sample_b"]
     assert genome_stats["ref_ani"].to_list() == [0.999, 0.998]
+    assert {"coverage_median", "fug", "conANI_reference", "SNV_count", "presence"} <= set(genome_stats.columns)
+    assert "length" in gene_stats.columns
     assert gene_stats.select("sample_id", "gene").rows() == [
         ("sample_a", "gene_1"),
         ("sample_b", "gene_1"),

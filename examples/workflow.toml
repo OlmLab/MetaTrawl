@@ -48,8 +48,28 @@ workers = 2
 threads = 8
 execution = "local"
 
+[stages.genome_view]
+workers = 2
+threads = 8
+execution = "local"
+
+[profile]
+min_mapq = 0
+min_baseq = 13
+min_freq = 0.0
+min_read_ani = 0.95
+read_inclusion = "paired"
+
+[matrix_build]
+storage_mode = "bitmask"
+min_cov = 5
+memory_limit_gb = 16
+export_batch_mb = 128
+duckdb_export_threads = 1
+
 [matrix_compare]
 calculate = "all"
+ani_method = "popani"
 memory_limit_gb = 32
 anchor_queue_size = 1
 target_queue_size = 2

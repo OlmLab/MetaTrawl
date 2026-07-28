@@ -62,7 +62,21 @@ CREATE TABLE IF NOT EXISTS genome_stats (
     coverage DOUBLE,
     breadth DOUBLE,
     ber DOUBLE,
-    ref_ani DOUBLE
+    ref_ani DOUBLE,
+    coverage_median DOUBLE,
+    coverage_std DOUBLE,
+    genome_length BIGINT,
+    gap_mean DOUBLE,
+    gap_std DOUBLE,
+    "5x_cov_sites" BIGINT,
+    heterogeneity DOUBLE,
+    fug DOUBLE,
+    reads_mapped BIGINT,
+    conANI_reference DOUBLE,
+    SNS_count BIGINT,
+    SNV_count BIGINT,
+    presence VARCHAR,
+    genome_taxonomy VARCHAR
 );
 
 CREATE TABLE IF NOT EXISTS gene_stats (
@@ -72,7 +86,8 @@ CREATE TABLE IF NOT EXISTS gene_stats (
     coverage DOUBLE,
     breadth DOUBLE,
     ber DOUBLE,
-    ref_ani DOUBLE
+    ref_ani DOUBLE,
+    length BIGINT
 );
 
 CREATE TABLE IF NOT EXISTS sylph_abundance (
@@ -176,7 +191,22 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS gene_stats_file VARCHAR")
     conn.execute("ALTER TABLE profile_positions ADD COLUMN IF NOT EXISTS ref_base_bitmask UTINYINT")
     conn.execute("ALTER TABLE genome_stats ADD COLUMN IF NOT EXISTS ref_ani DOUBLE")
+    conn.execute("ALTER TABLE genome_stats ADD COLUMN IF NOT EXISTS coverage_median DOUBLE")
+    conn.execute("ALTER TABLE genome_stats ADD COLUMN IF NOT EXISTS coverage_std DOUBLE")
+    conn.execute("ALTER TABLE genome_stats ADD COLUMN IF NOT EXISTS genome_length BIGINT")
+    conn.execute("ALTER TABLE genome_stats ADD COLUMN IF NOT EXISTS gap_mean DOUBLE")
+    conn.execute("ALTER TABLE genome_stats ADD COLUMN IF NOT EXISTS gap_std DOUBLE")
+    conn.execute('ALTER TABLE genome_stats ADD COLUMN IF NOT EXISTS "5x_cov_sites" BIGINT')
+    conn.execute("ALTER TABLE genome_stats ADD COLUMN IF NOT EXISTS heterogeneity DOUBLE")
+    conn.execute("ALTER TABLE genome_stats ADD COLUMN IF NOT EXISTS fug DOUBLE")
+    conn.execute("ALTER TABLE genome_stats ADD COLUMN IF NOT EXISTS reads_mapped BIGINT")
+    conn.execute("ALTER TABLE genome_stats ADD COLUMN IF NOT EXISTS conANI_reference DOUBLE")
+    conn.execute("ALTER TABLE genome_stats ADD COLUMN IF NOT EXISTS SNS_count BIGINT")
+    conn.execute("ALTER TABLE genome_stats ADD COLUMN IF NOT EXISTS SNV_count BIGINT")
+    conn.execute("ALTER TABLE genome_stats ADD COLUMN IF NOT EXISTS presence VARCHAR")
+    conn.execute("ALTER TABLE genome_stats ADD COLUMN IF NOT EXISTS genome_taxonomy VARCHAR")
     conn.execute("ALTER TABLE gene_stats ADD COLUMN IF NOT EXISTS ref_ani DOUBLE")
+    conn.execute("ALTER TABLE gene_stats ADD COLUMN IF NOT EXISTS length BIGINT")
     conn.execute("ALTER TABLE matrix_stores ADD COLUMN IF NOT EXISTS storage_layout VARCHAR DEFAULT 'dense'")
     conn.execute("ALTER TABLE matrix_stores ADD COLUMN IF NOT EXISTS min_coverage DOUBLE")
     conn.execute("ALTER TABLE matrix_stores ADD COLUMN IF NOT EXISTS min_breadth DOUBLE")
@@ -827,12 +857,36 @@ def _insert_genome_stats(conn: duckdb.DuckDBPyConnection, *, sample_id: str, sta
         _optional_float_expr(df, ["breadth", "breadth_coverage", "breadth_cov"]).alias("breadth"),
         _optional_float_expr(df, ["ber", "BER"]).alias("ber"),
         _optional_float_expr(df, ["ref_ani", "reference_ani"]).alias("ref_ani"),
+        _optional_float_expr(df, ["coverage_median"]).alias("coverage_median"),
+        _optional_float_expr(df, ["coverage_std"]).alias("coverage_std"),
+        _optional_int_expr(df, ["genome_length", "length"]).alias("genome_length"),
+        _optional_float_expr(df, ["gap_mean"]).alias("gap_mean"),
+        _optional_float_expr(df, ["gap_std"]).alias("gap_std"),
+        _optional_int_expr(df, ["5x_cov_sites"]).alias("5x_cov_sites"),
+        _optional_float_expr(df, ["heterogeneity"]).alias("heterogeneity"),
+        _optional_float_expr(df, ["fug", "FUG"]).alias("fug"),
+        _optional_int_expr(df, ["reads_mapped"]).alias("reads_mapped"),
+        _optional_float_expr(df, ["conANI_reference", "conani_reference"]).alias("conANI_reference"),
+        _optional_int_expr(df, ["SNS_count", "sns_count"]).alias("SNS_count"),
+        _optional_int_expr(df, ["SNV_count", "snv_count"]).alias("SNV_count"),
+        _optional_string_expr(df, ["presence"]).alias("presence"),
+        _optional_string_expr(df, ["genome_taxonomy", "taxonomy"]).alias("genome_taxonomy"),
     )
     conn.register("_metatrawl_genome_stats", df)
     try:
         conn.execute(
-            """INSERT INTO genome_stats (sample_id, genome, coverage, breadth, ber, ref_ani)
-               SELECT sample_id, genome, coverage, breadth, ber, ref_ani FROM _metatrawl_genome_stats"""
+            """INSERT INTO genome_stats (
+                 sample_id, genome, coverage, breadth, ber, ref_ani,
+                 coverage_median, coverage_std, genome_length, gap_mean, gap_std,
+                 "5x_cov_sites", heterogeneity, fug, reads_mapped, conANI_reference,
+                 SNS_count, SNV_count, presence, genome_taxonomy
+               )
+               SELECT
+                 sample_id, genome, coverage, breadth, ber, ref_ani,
+                 coverage_median, coverage_std, genome_length, gap_mean, gap_std,
+                 "5x_cov_sites", heterogeneity, fug, reads_mapped, conANI_reference,
+                 SNS_count, SNV_count, presence, genome_taxonomy
+               FROM _metatrawl_genome_stats"""
         )
     finally:
         conn.unregister("_metatrawl_genome_stats")
@@ -852,12 +906,14 @@ def _insert_gene_stats(conn: duckdb.DuckDBPyConnection, *, sample_id: str, stats
         _optional_float_expr(df, ["breadth", "breadth_coverage", "breadth_cov"]).alias("breadth"),
         _optional_float_expr(df, ["ber", "BER"]).alias("ber"),
         _optional_float_expr(df, ["ref_ani", "reference_ani"]).alias("ref_ani"),
+        _optional_int_expr(df, ["length", "gene_length"]).alias("length"),
     )
     conn.register("_metatrawl_gene_stats", df)
     try:
         conn.execute(
-            """INSERT INTO gene_stats (sample_id, genome, gene, coverage, breadth, ber, ref_ani)
-               SELECT sample_id, genome, gene, coverage, breadth, ber, ref_ani FROM _metatrawl_gene_stats"""
+            """INSERT INTO gene_stats (sample_id, genome, gene, coverage, breadth, ber, ref_ani, length)
+               SELECT sample_id, genome, gene, coverage, breadth, ber, ref_ani, length
+               FROM _metatrawl_gene_stats"""
         )
     finally:
         conn.unregister("_metatrawl_gene_stats")
@@ -924,6 +980,20 @@ def _optional_float_expr(df: pl.DataFrame, names: list[str]) -> pl.Expr:
     if column is None:
         return pl.lit(None, dtype=pl.Float64)
     return pl.col(column).cast(pl.Float64)
+
+
+def _optional_int_expr(df: pl.DataFrame, names: list[str]) -> pl.Expr:
+    column = _first_existing(df, names)
+    if column is None:
+        return pl.lit(None, dtype=pl.Int64)
+    return pl.col(column).cast(pl.Int64)
+
+
+def _optional_string_expr(df: pl.DataFrame, names: list[str]) -> pl.Expr:
+    column = _first_existing(df, names)
+    if column is None:
+        return pl.lit(None, dtype=pl.Utf8)
+    return pl.col(column).cast(pl.Utf8)
 
 
 def _first_existing(df: pl.DataFrame, names: list[str]) -> str | None:

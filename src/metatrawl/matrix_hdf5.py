@@ -24,10 +24,22 @@ COUNT_DTYPES = {
     "uint16": np.uint16,
     "uint32": np.uint32,
 }
+MATRIX_DTYPES = {"uint8": np.uint8, **COUNT_DTYPES}
+MATRIX_COUNT_DTYPE_CHOICES = ("auto", "uint16", "uint32")
 MATRIX_BUILD_MIN_COV = 5
 FILTERED_PRESENCE_MATRIX_VALUE_SEMANTICS = "allele_presence_after_cov_filter"
+BITMASK_MATRIX_VALUE_SEMANTICS = "packed_allele_presence_after_cov_filter"
+COUNT_MATRIX_VALUE_SEMANTICS = "allele_counts_after_cov_filter"
+MATRIX_STORAGE_BITMASK = "bitmask"
+MATRIX_STORAGE_COUNTS = "counts"
+MATRIX_STORAGE_LEGACY_PRESENCE = "legacy-presence"
+MATRIX_STORAGE_MODES = (MATRIX_STORAGE_BITMASK, MATRIX_STORAGE_COUNTS)
+BITMASK_DTYPE_NAME = "uint8"
+BITMASK_BASE_BITS = np.asarray([1, 2, 4, 8], dtype=np.uint8)
 CURRENT_MATRIX_HDF5_LAYOUT = "per_genome_sample_major_dense_matrix_hdf5"
 CURRENT_MATRIX_HDF5_SPARSE_LAYOUT = "per_genome_sample_major_sparse_indices_matrix_hdf5"
+CURRENT_MATRIX_HDF5_BITMASK_LAYOUT = "per_genome_sample_major_bitmask_hdf5"
+CURRENT_MATRIX_HDF5_SPARSE_BITMASK_LAYOUT = "per_genome_sample_major_sparse_bitmask_hdf5"
 MATRIX_HDF5_FILE_VERSION = "1"
 MATRIX_HDF5_CONTRACT_GENOMES_GROUP = "contract_genomes"
 MATRIX_HDF5_CONTRACT_SCAFFOLDS_GROUP = "contract_genome_scaffolds"
@@ -104,7 +116,9 @@ def build_matrix_hdf5_from_duckdb(
     bed_file: Path,
     stb_file: Path,
     gene_range_table: Path | None = None,
-    count_dtype: str = "uint16",
+    storage_mode: str | None = None,
+    count_dtype: str | None = None,
+    min_cov: int = MATRIX_BUILD_MIN_COV,
     memory_limit_gb: float = 16.0,
     export_batch_mb: float = 128.0,
     duckdb_threads: int = 1,
@@ -112,8 +126,16 @@ def build_matrix_hdf5_from_duckdb(
     progress_callback: BuildProgressCallback | None = None,
 ) -> DirectMatrixBuildSummary:
     """Build a ZipStrain-compatible HDF5 matrix directly from MetaTrawl DuckDB rows."""
-    if count_dtype not in COUNT_DTYPES:
-        raise ValueError(f"Unsupported count dtype '{count_dtype}'. Choose one of {', '.join(COUNT_DTYPES)}.")
+    storage_mode = _resolve_storage_mode(storage_mode=storage_mode, count_dtype=count_dtype)
+    count_dtype = _resolve_count_dtype(
+        conn,
+        storage_mode=storage_mode,
+        count_dtype=count_dtype,
+        sample_ids=sample_ids,
+        genome=None if genome == "all" else genome,
+    )
+    if min_cov < 1:
+        raise ValueError("min_cov must be >= 1")
     if export_batch_mb <= 0:
         raise ValueError("export_batch_mb must be > 0")
     _configure_duckdb_for_matrix(conn, memory_limit_gb=memory_limit_gb, threads=duckdb_threads)
@@ -167,6 +189,8 @@ def build_matrix_hdf5_from_duckdb(
         metadata_rows = _metadata_rows(
             genome=genome_scope or "all",
             count_dtype=count_dtype,
+            storage_mode=storage_mode,
+            min_cov=min_cov,
             memory_limit_gb=memory_limit_gb,
             export_batch_mb=export_batch_mb,
             sparse=sparse,
@@ -188,13 +212,19 @@ def build_matrix_hdf5_from_duckdb(
                 contract_genome_scaffolds=contract_genome_scaffolds,
                 gene_ranges=gene_ranges,
                 count_dtype=count_dtype,
+                storage_mode=storage_mode,
                 export_batch_mb=export_batch_mb,
                 sparse=sparse,
             )
             sparse_states = _initial_sparse_states(handle, genomes) if sparse else {}
             for sample_row, sample_id in sample_rows:
                 for spec in genomes:
-                    _check_matrix_memory(spec, count_dtype=count_dtype, memory_limit_bytes=memory_limit_bytes)
+                    _check_matrix_memory(
+                        spec,
+                        storage_mode=storage_mode,
+                        count_dtype=count_dtype,
+                        memory_limit_bytes=memory_limit_bytes,
+                    )
                     _emit_progress(progress_callback, "processing", completed_work, total_work, sample_id, spec.genome, stored_rows)
                     matrix = _load_duckdb_sample_genome_matrix(
                         conn,
@@ -202,19 +232,24 @@ def build_matrix_hdf5_from_duckdb(
                         genome_spec=spec,
                         genome_offsets=scaffolds_by_genome_idx[spec.genome_idx],
                         count_dtype=count_dtype,
+                        storage_mode=storage_mode,
+                        min_cov=min_cov,
                     )
                     if sparse:
-                        indptr_ds, indices_ds, current_nnz = sparse_states[spec.genome_idx]
+                        indptr_ds, indices_ds, values_ds, current_nnz = sparse_states[spec.genome_idx]
+                        flat_indices, values = _dense_matrix_to_sparse(matrix)
                         current_nnz = _append_sparse_hdf5_matrix_row(
                             indptr_dataset=indptr_ds,
                             indices_dataset=indices_ds,
+                            values_dataset=values_ds,
                             sample_row=sample_row,
-                            flat_indices=_dense_matrix_to_sparse_flat_indices(matrix),
+                            flat_indices=flat_indices,
+                            values=values,
                             current_nnz=current_nnz,
                         )
-                        sparse_states[spec.genome_idx] = (indptr_ds, indices_ds, current_nnz)
+                        sparse_states[spec.genome_idx] = (indptr_ds, indices_ds, values_ds, current_nnz)
                     else:
-                        handle[_hdf5_matrix_dataset_path(spec.genome_idx)][sample_row, :, :] = matrix
+                        handle[_hdf5_matrix_dataset_path(spec.genome_idx)][sample_row, ...] = matrix
                     stored_rows += 1
                     completed_work += 1
                     _emit_progress(progress_callback, "advance", completed_work, total_work, sample_id, spec.genome, stored_rows)
@@ -231,7 +266,7 @@ def build_matrix_hdf5_from_duckdb(
         output_file=output_file,
         sample_count=len(sample_ids),
         stored_rows=stored_rows,
-        storage_layout=CURRENT_MATRIX_HDF5_SPARSE_LAYOUT if sparse else CURRENT_MATRIX_HDF5_LAYOUT,
+        storage_layout=_matrix_layout(storage_mode=storage_mode, sparse=sparse),
         genome_scope=genome_scope or "all",
     )
 
@@ -259,10 +294,12 @@ def append_matrix_hdf5_from_duckdb(
     completed_work = 0
     with h5py.File(str(matrix_hdf5_file), "r+") as handle:
         metadata = {str(k): str(v) for k, v in handle["metadata"].attrs.items()}
+        storage_mode = _storage_mode_from_metadata(metadata)
         count_dtype = str(metadata.get("count_dtype", "uint16"))
+        min_cov = int(metadata.get("coverage_filter_min_cov", MATRIX_BUILD_MIN_COV))
         layout = str(metadata.get("layout", CURRENT_MATRIX_HDF5_LAYOUT))
         genome_scope = str(metadata.get("genome_scope", "all"))
-        sparse = layout == CURRENT_MATRIX_HDF5_SPARSE_LAYOUT
+        sparse = layout in {CURRENT_MATRIX_HDF5_SPARSE_LAYOUT, CURRENT_MATRIX_HDF5_SPARSE_BITMASK_LAYOUT}
         genomes = _read_genomes(handle["genomes"])
         genome_scaffolds = _read_genome_scaffolds(handle["genome_scaffolds"])
         existing_samples = _read_samples(handle["samples"])
@@ -287,17 +324,23 @@ def append_matrix_hdf5_from_duckdb(
         total_work = len(sample_rows) * len(genomes)
         _emit_progress(progress_callback, "start", completed_work, total_work, "", genome_scope, stored_rows)
         scaffolds_by_genome_idx = _group_scaffolds_by_genome(genome_scaffolds)
-        sparse_states: dict[int, tuple[object, object, int]] = {}
+        sparse_states: dict[int, tuple[object, object, object | None, int]] = {}
         for spec in genomes:
-            _check_matrix_memory(spec, count_dtype=count_dtype, memory_limit_bytes=memory_limit_bytes)
+            _check_matrix_memory(
+                spec,
+                storage_mode=storage_mode,
+                count_dtype=count_dtype,
+                memory_limit_bytes=memory_limit_bytes,
+            )
             node = handle[_hdf5_matrix_dataset_path(spec.genome_idx)]
             if sparse:
                 indptr = node["indptr"]
                 indices = node["indices"]
                 indptr.resize((total_sample_count + 1,))
-                sparse_states[spec.genome_idx] = (indptr, indices, int(indptr[existing_sample_count]))
+                values = node.get("values")
+                sparse_states[spec.genome_idx] = (indptr, indices, values, int(indptr[existing_sample_count]))
             else:
-                node.resize((total_sample_count, spec.matrix_length, 4))
+                node.resize((total_sample_count, *node.shape[1:]))
 
         for sample_row, sample_id in sample_rows:
             for spec in genomes:
@@ -308,19 +351,24 @@ def append_matrix_hdf5_from_duckdb(
                     genome_spec=spec,
                     genome_offsets=scaffolds_by_genome_idx[spec.genome_idx],
                     count_dtype=count_dtype,
+                    storage_mode=storage_mode,
+                    min_cov=min_cov,
                 )
                 if sparse:
-                    indptr_ds, indices_ds, current_nnz = sparse_states[spec.genome_idx]
+                    indptr_ds, indices_ds, values_ds, current_nnz = sparse_states[spec.genome_idx]
+                    flat_indices, values = _dense_matrix_to_sparse(matrix)
                     current_nnz = _append_sparse_hdf5_matrix_row(
                         indptr_dataset=indptr_ds,
                         indices_dataset=indices_ds,
+                        values_dataset=values_ds,
                         sample_row=sample_row,
-                        flat_indices=_dense_matrix_to_sparse_flat_indices(matrix),
+                        flat_indices=flat_indices,
+                        values=values,
                         current_nnz=current_nnz,
                     )
-                    sparse_states[spec.genome_idx] = (indptr_ds, indices_ds, current_nnz)
+                    sparse_states[spec.genome_idx] = (indptr_ds, indices_ds, values_ds, current_nnz)
                 else:
-                    handle[_hdf5_matrix_dataset_path(spec.genome_idx)][sample_row, :, :] = matrix
+                    handle[_hdf5_matrix_dataset_path(spec.genome_idx)][sample_row, ...] = matrix
                 stored_rows += 1
                 completed_work += 1
                 _emit_progress(progress_callback, "advance", completed_work, total_work, sample_id, spec.genome, stored_rows)
@@ -340,9 +388,13 @@ def _load_duckdb_sample_genome_matrix(
     genome_spec: GenomeSpec,
     genome_offsets: list[GenomeScaffoldOffset],
     count_dtype: str,
+    storage_mode: str,
+    min_cov: int,
 ) -> np.ndarray:
-    np_dtype = COUNT_DTYPES[count_dtype]
-    matrix = np.zeros((genome_spec.matrix_length, 4), dtype=np_dtype)
+    if storage_mode == MATRIX_STORAGE_BITMASK:
+        matrix = np.zeros((genome_spec.matrix_length,), dtype=np.uint8)
+    else:
+        matrix = np.zeros((genome_spec.matrix_length, 4), dtype=COUNT_DTYPES[count_dtype])
     rows = conn.execute(
         """
         SELECT chrom, pos, A, T, C, G
@@ -350,7 +402,7 @@ def _load_duckdb_sample_genome_matrix(
         WHERE sample_id = ? AND genome = ?
           AND CAST(A AS BIGINT) + CAST(T AS BIGINT) + CAST(C AS BIGINT) + CAST(G AS BIGINT) >= ?
         """,
-        [sample_id, genome_spec.genome, MATRIX_BUILD_MIN_COV],
+        [sample_id, genome_spec.genome, min_cov],
     ).fetchall()
     if not rows:
         return matrix
@@ -366,10 +418,19 @@ def _load_duckdb_sample_genome_matrix(
                 f"matrix range is {offset.min_pos}-{offset.max_pos}."
             )
         axis_pos = pos_int - offset.index_base + offset.axis_start
-        matrix[axis_pos, 0] = 1 if int(a) > 0 else 0
-        matrix[axis_pos, 1] = 1 if int(t) > 0 else 0
-        matrix[axis_pos, 2] = 1 if int(c) > 0 else 0
-        matrix[axis_pos, 3] = 1 if int(g) > 0 else 0
+        counts = np.asarray([a, t, c, g], dtype=np.int64)
+        if storage_mode == MATRIX_STORAGE_BITMASK:
+            matrix[axis_pos] = np.bitwise_or.reduce(BITMASK_BASE_BITS[counts > 0], initial=np.uint8(0))
+        elif storage_mode == MATRIX_STORAGE_LEGACY_PRESENCE:
+            matrix[axis_pos, :] = counts > 0
+        else:
+            max_value = np.iinfo(COUNT_DTYPES[count_dtype]).max
+            if np.any(counts < 0) or np.any(counts > max_value):
+                raise OverflowError(
+                    f"Profile count for {sample_id} at {genome_spec.genome}:{chrom}:{pos_int} "
+                    f"does not fit {count_dtype}."
+                )
+            matrix[axis_pos, :] = counts
     return matrix
 
 
@@ -385,6 +446,7 @@ def _initialize_hdf5_store(
     contract_genome_scaffolds: list[GenomeScaffoldOffset],
     gene_ranges: list[GeneRangeSpec],
     count_dtype: str,
+    storage_mode: str,
     export_batch_mb: float,
     sparse: bool,
 ) -> None:
@@ -428,20 +490,32 @@ def _initialize_hdf5_store(
                 genome_idx=spec.genome_idx,
                 sample_count=sample_count,
                 matrix_length=spec.matrix_length,
+                dtype_name=BITMASK_DTYPE_NAME if storage_mode == MATRIX_STORAGE_BITMASK else count_dtype,
             )
         else:
+            matrix_shape = (
+                (sample_count, spec.matrix_length)
+                if storage_mode == MATRIX_STORAGE_BITMASK
+                else (sample_count, spec.matrix_length, 4)
+            )
+            matrix_maxshape = (
+                (None, spec.matrix_length)
+                if storage_mode == MATRIX_STORAGE_BITMASK
+                else (None, spec.matrix_length, 4)
+            )
             chunk_samples = _matrix_hdf5_chunk_sample_count(
                 sample_count=sample_count,
                 matrix_length=spec.matrix_length,
-                dtype_name=count_dtype,
+                dtype_name=BITMASK_DTYPE_NAME if storage_mode == MATRIX_STORAGE_BITMASK else count_dtype,
+                channels=1 if storage_mode == MATRIX_STORAGE_BITMASK else 4,
                 target_batch_mb=export_batch_mb,
             )
             matrices_group.create_dataset(
                 str(spec.genome_idx),
-                shape=(sample_count, spec.matrix_length, 4),
-                dtype=COUNT_DTYPES[count_dtype],
-                chunks=(chunk_samples, spec.matrix_length, 4),
-                maxshape=(None, spec.matrix_length, 4),
+                shape=matrix_shape,
+                dtype=MATRIX_DTYPES[BITMASK_DTYPE_NAME if storage_mode == MATRIX_STORAGE_BITMASK else count_dtype],
+                chunks=(chunk_samples, *matrix_shape[1:]),
+                maxshape=matrix_maxshape,
                 fillvalue=0,
             )
 
@@ -450,6 +524,8 @@ def _metadata_rows(
     *,
     genome: str,
     count_dtype: str,
+    storage_mode: str,
+    min_cov: int,
     memory_limit_gb: float,
     export_batch_mb: float,
     sparse: bool,
@@ -462,10 +538,16 @@ def _metadata_rows(
         "profiles_dir": "metatrawl_duckdb",
         "profile_format": "metatrawl_duckdb_profile_positions",
         "genome_scope": genome,
+        "storage_mode": storage_mode,
+        "matrix_dtype": BITMASK_DTYPE_NAME if storage_mode == MATRIX_STORAGE_BITMASK else count_dtype,
         "count_dtype": count_dtype,
-        "layout": CURRENT_MATRIX_HDF5_SPARSE_LAYOUT if sparse else CURRENT_MATRIX_HDF5_LAYOUT,
-        "matrix_value_semantics": FILTERED_PRESENCE_MATRIX_VALUE_SEMANTICS,
-        "coverage_filter_min_cov": str(MATRIX_BUILD_MIN_COV),
+        "layout": _matrix_layout(storage_mode=storage_mode, sparse=sparse),
+        "matrix_value_semantics": (
+            BITMASK_MATRIX_VALUE_SEMANTICS
+            if storage_mode == MATRIX_STORAGE_BITMASK
+            else COUNT_MATRIX_VALUE_SEMANTICS
+        ),
+        "coverage_filter_min_cov": str(min_cov),
         "memory_limit_gb": str(memory_limit_gb),
         "export_batch_mb": str(export_batch_mb),
         "separator_rows_between_scaffolds": "1",
@@ -725,9 +807,16 @@ def _matrix_hdf5_sample_axis_chunk_length(sample_count: int) -> int:
     return max(1, min(int(sample_count), 1024))
 
 
-def _matrix_hdf5_chunk_sample_count(*, sample_count: int, matrix_length: int, dtype_name: str, target_batch_mb: float) -> int:
-    dtype = COUNT_DTYPES[dtype_name]
-    per_sample_bytes = max(1, matrix_length * 4 * np.dtype(dtype).itemsize)
+def _matrix_hdf5_chunk_sample_count(
+    *,
+    sample_count: int,
+    matrix_length: int,
+    dtype_name: str,
+    channels: int,
+    target_batch_mb: float,
+) -> int:
+    dtype = MATRIX_DTYPES[dtype_name]
+    per_sample_bytes = max(1, matrix_length * channels * np.dtype(dtype).itemsize)
     target_batch_bytes = int(target_batch_mb * (1024 ** 2))
     return max(1, min(sample_count, int(target_batch_bytes // per_sample_bytes) or 1))
 
@@ -736,31 +825,60 @@ def _matrix_hdf5_sparse_indices_chunk_length(matrix_length: int) -> int:
     return max(1024, min(max(matrix_length * 4, 1), 1_048_576))
 
 
-def _create_sparse_hdf5_genome_store(matrices_group, *, genome_idx: int, sample_count: int, matrix_length: int):
+def _create_sparse_hdf5_genome_store(
+    matrices_group,
+    *,
+    genome_idx: int,
+    sample_count: int,
+    matrix_length: int,
+    dtype_name: str,
+):
     group = matrices_group.create_group(str(genome_idx))
     group.create_dataset("indptr", shape=(sample_count + 1,), dtype=np.int64, chunks=(_matrix_hdf5_sample_axis_chunk_length(sample_count + 1),), maxshape=(None,), fillvalue=0)
     group.create_dataset("indices", shape=(0,), dtype=np.int64, chunks=(_matrix_hdf5_sparse_indices_chunk_length(matrix_length),), maxshape=(None,), fillvalue=0)
+    group.create_dataset(
+        "values",
+        shape=(0,),
+        dtype=MATRIX_DTYPES[dtype_name],
+        chunks=(_matrix_hdf5_sparse_indices_chunk_length(matrix_length),),
+        maxshape=(None,),
+        fillvalue=0,
+    )
     return group
 
 
-def _initial_sparse_states(handle, genomes: list[GenomeSpec]) -> dict[int, tuple[object, object, int]]:
+def _initial_sparse_states(handle, genomes: list[GenomeSpec]) -> dict[int, tuple[object, object, object, int]]:
     states = {}
     for spec in genomes:
         group = handle[_hdf5_matrix_dataset_path(spec.genome_idx)]
-        states[spec.genome_idx] = (group["indptr"], group["indices"], 0)
+        states[spec.genome_idx] = (group["indptr"], group["indices"], group["values"], 0)
     return states
 
 
-def _dense_matrix_to_sparse_flat_indices(matrix: np.ndarray) -> np.ndarray:
-    return np.flatnonzero(matrix.reshape(-1)).astype(np.int64, copy=False)
+def _dense_matrix_to_sparse(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    flattened = matrix.reshape(-1)
+    indices = np.flatnonzero(flattened).astype(np.int64, copy=False)
+    return indices, flattened[indices]
 
 
-def _append_sparse_hdf5_matrix_row(*, indptr_dataset, indices_dataset, sample_row: int, flat_indices: np.ndarray, current_nnz: int) -> int:
+def _append_sparse_hdf5_matrix_row(
+    *,
+    indptr_dataset,
+    indices_dataset,
+    values_dataset,
+    sample_row: int,
+    flat_indices: np.ndarray,
+    values: np.ndarray,
+    current_nnz: int,
+) -> int:
     flat_indices = np.asarray(flat_indices, dtype=np.int64)
     next_nnz = current_nnz + int(flat_indices.size)
     if flat_indices.size > 0:
         indices_dataset.resize((next_nnz,))
         indices_dataset[current_nnz:next_nnz] = flat_indices
+        if values_dataset is not None:
+            values_dataset.resize((next_nnz,))
+            values_dataset[current_nnz:next_nnz] = values
     indptr_dataset[int(sample_row) + 1] = next_nnz
     return next_nnz
 
@@ -772,12 +890,85 @@ def _group_scaffolds_by_genome(genome_scaffolds: list[GenomeScaffoldOffset]) -> 
     return grouped
 
 
+def _resolve_storage_mode(*, storage_mode: str | None, count_dtype: str | None) -> str:
+    resolved = storage_mode or (MATRIX_STORAGE_COUNTS if count_dtype is not None else MATRIX_STORAGE_BITMASK)
+    if resolved not in MATRIX_STORAGE_MODES:
+        raise ValueError(f"Unsupported storage mode '{resolved}'. Choose one of {', '.join(MATRIX_STORAGE_MODES)}.")
+    if resolved == MATRIX_STORAGE_BITMASK and count_dtype is not None:
+        raise ValueError("count_dtype can only be used with count storage.")
+    return resolved
+
+
+def _resolve_count_dtype(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    storage_mode: str,
+    count_dtype: str | None,
+    sample_ids: list[str],
+    genome: str | None,
+) -> str:
+    if storage_mode == MATRIX_STORAGE_BITMASK:
+        return BITMASK_DTYPE_NAME
+    resolved = count_dtype or "auto"
+    if resolved not in MATRIX_COUNT_DTYPE_CHOICES:
+        raise ValueError(
+            f"Unsupported count dtype '{resolved}'. Choose one of {', '.join(MATRIX_COUNT_DTYPE_CHOICES)}."
+        )
+    if resolved != "auto":
+        return resolved
+
+    max_count = 0
+    for sample_id in sample_ids:
+        query = """
+            SELECT greatest(
+                coalesce(max(A), 0), coalesce(max(T), 0),
+                coalesce(max(C), 0), coalesce(max(G), 0)
+            )
+            FROM profile_positions
+            WHERE sample_id = ?
+        """
+        parameters: list[object] = [sample_id]
+        if genome is not None:
+            query += " AND genome = ?"
+            parameters.append(genome)
+        max_count = max(max_count, int(conn.execute(query, parameters).fetchone()[0]))
+        if max_count > np.iinfo(np.uint16).max:
+            return "uint32"
+    return "uint16"
+
+
+def _storage_mode_from_metadata(metadata: dict[str, str]) -> str:
+    explicit = metadata.get("storage_mode")
+    if explicit in {MATRIX_STORAGE_BITMASK, MATRIX_STORAGE_COUNTS, MATRIX_STORAGE_LEGACY_PRESENCE}:
+        return explicit
+    semantics = metadata.get("matrix_value_semantics")
+    if semantics == BITMASK_MATRIX_VALUE_SEMANTICS:
+        return MATRIX_STORAGE_BITMASK
+    if semantics == COUNT_MATRIX_VALUE_SEMANTICS:
+        return MATRIX_STORAGE_COUNTS
+    return MATRIX_STORAGE_LEGACY_PRESENCE
+
+
+def _matrix_layout(*, storage_mode: str, sparse: bool) -> str:
+    if storage_mode == MATRIX_STORAGE_BITMASK:
+        return CURRENT_MATRIX_HDF5_SPARSE_BITMASK_LAYOUT if sparse else CURRENT_MATRIX_HDF5_BITMASK_LAYOUT
+    return CURRENT_MATRIX_HDF5_SPARSE_LAYOUT if sparse else CURRENT_MATRIX_HDF5_LAYOUT
+
+
 def _memory_limit_bytes(memory_limit_gb: float) -> int:
     return int(float(memory_limit_gb) * (1024 ** 3))
 
 
-def _check_matrix_memory(spec: GenomeSpec, *, count_dtype: str, memory_limit_bytes: int) -> None:
-    estimated = spec.matrix_length * 4 * np.dtype(COUNT_DTYPES[count_dtype]).itemsize
+def _check_matrix_memory(
+    spec: GenomeSpec,
+    *,
+    storage_mode: str,
+    count_dtype: str,
+    memory_limit_bytes: int,
+) -> None:
+    channels = 1 if storage_mode == MATRIX_STORAGE_BITMASK else 4
+    dtype = np.uint8 if storage_mode == MATRIX_STORAGE_BITMASK else COUNT_DTYPES[count_dtype]
+    estimated = spec.matrix_length * channels * np.dtype(dtype).itemsize
     if estimated > memory_limit_bytes:
         raise MemoryError(f"Genome {spec.genome} matrix requires about {estimated} bytes, exceeding configured memory limit {memory_limit_bytes} bytes.")
 

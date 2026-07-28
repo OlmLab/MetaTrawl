@@ -53,15 +53,30 @@ def _write_bundle_files(tmp_path: Path, run_id: str, *, coverage: float = 2.0, b
         {
             "genome": ["genome_a"],
             "coverage": [coverage],
+            "coverage_median": [coverage - 0.1],
+            "coverage_std": [0.25],
             "breadth": [breadth],
+            "genome_length": [10],
+            "gap_mean": [2.0],
+            "gap_std": [0.5],
+            "5x_cov_sites": [8],
+            "heterogeneity": [0.01],
             "ber": [ber],
+            "fug": [0.63],
+            "reads_mapped": [20],
             "ref_ani": [0.999],
+            "conANI_reference": [99.8],
+            "SNS_count": [1],
+            "SNV_count": [2],
+            "presence": ["present"],
+            "genome_taxonomy": ["d__Bacteria;p__Test"],
         }
     ).write_parquet(genome_stats_file)
     pl.DataFrame(
         {
             "genome": ["genome_a"],
             "gene": ["gene1"],
+            "length": [2],
             "coverage": [coverage],
             "breadth": [breadth],
             "ber": [ber],
@@ -163,6 +178,31 @@ def test_adding_run_ids_is_idempotent(tmp_path: Path) -> None:
     assert "added=0" in second.output
 
 
+def test_schema_migrates_pre_v1_stat_tables_without_rebuild(tmp_path: Path) -> None:
+    db_file = tmp_path / "metatrawl.duckdb"
+    with duckdb.connect(str(db_file)) as conn:
+        conn.execute(
+            """CREATE TABLE genome_stats (
+                 sample_id VARCHAR, genome VARCHAR, coverage DOUBLE, breadth DOUBLE,
+                 ber DOUBLE, ref_ani DOUBLE
+               )"""
+        )
+        conn.execute(
+            """CREATE TABLE gene_stats (
+                 sample_id VARCHAR, genome VARCHAR, gene VARCHAR, coverage DOUBLE,
+                 breadth DOUBLE, ber DOUBLE, ref_ani DOUBLE
+               )"""
+        )
+        conn.execute("INSERT INTO genome_stats VALUES ('S1', 'G1', 2.0, 0.8, 0.7, 99.9)")
+        conn.execute("INSERT INTO gene_stats VALUES ('S1', 'G1', 'gene1', 2.0, 0.8, NULL, 99.8)")
+
+    with registry.connect(db_file) as conn:
+        assert conn.execute(
+            "SELECT coverage, coverage_median, fug, SNV_count FROM genome_stats"
+        ).fetchone() == (2.0, None, None, None)
+        assert conn.execute("SELECT gene, length FROM gene_stats").fetchone() == ("gene1", None)
+
+
 def test_deleted_run_is_excluded_from_remaining_profiles(tmp_path: Path) -> None:
     runner = CliRunner()
     db_file = tmp_path / "metatrawl.duckdb"
@@ -189,6 +229,28 @@ def test_profiles_import_stores_profile_stats_gene_and_abundance_tables(tmp_path
         assert conn.execute("SELECT gene FROM gene_stats WHERE sample_id = 'SRR1'").fetchone() == ("gene1",)
         assert conn.execute("SELECT ref_ani FROM genome_stats WHERE sample_id = 'SRR1'").fetchone() == (0.999,)
         assert conn.execute("SELECT ref_ani FROM gene_stats WHERE sample_id = 'SRR1'").fetchone() == (0.998,)
+        assert conn.execute(
+            """SELECT coverage_median, coverage_std, genome_length, gap_mean, gap_std,
+                      "5x_cov_sites", heterogeneity, fug, reads_mapped,
+                      conANI_reference, SNS_count, SNV_count, presence, genome_taxonomy
+               FROM genome_stats WHERE sample_id = 'SRR1'"""
+        ).fetchone() == (
+            1.9,
+            0.25,
+            10,
+            2.0,
+            0.5,
+            8,
+            0.01,
+            0.63,
+            20,
+            99.8,
+            1,
+            2,
+            "present",
+            "d__Bacteria;p__Test",
+        )
+        assert conn.execute("SELECT length FROM gene_stats WHERE sample_id = 'SRR1'").fetchone() == (2,)
         assert conn.execute("SELECT ref_base_bitmask FROM profile_positions WHERE sample_id = 'SRR1' ORDER BY pos").fetchall() == [(1,), (2,)]
         assert conn.execute("SELECT accession, abundance FROM sylph_abundance WHERE sample_id = 'SRR1'").fetchone() == ("GCF_1", 0.1)
         assert conn.execute("SELECT status FROM samples WHERE sample_id = 'SRR1'").fetchone() == ("complete",)
@@ -920,6 +982,7 @@ def test_alignment_and_profile_stage_publishes_outputs(tmp_path: Path, monkeypat
         profile_config=ProfileConfig(
             min_mapq=20,
             min_baseq=25,
+            min_freq=0.02,
             min_read_ani=0.97,
             read_inclusion="proper-pairs",
         ),
@@ -937,6 +1000,7 @@ def test_alignment_and_profile_stage_publishes_outputs(tmp_path: Path, monkeypat
     assert "--reference-fasta" in profile_call
     assert profile_call[profile_call.index("--min-mapq") + 1] == "20"
     assert profile_call[profile_call.index("--min-baseq") + 1] == "25"
+    assert profile_call[profile_call.index("--min-freq") + 1] == "0.02"
     assert profile_call[profile_call.index("--min-read-ani") + 1] == "0.97"
     assert profile_call[profile_call.index("--read-inclusion") + 1] == "proper-pairs"
     assert shell_calls
@@ -1326,10 +1390,13 @@ def test_matrix_build_filters_samples_exports_selected_and_passes_sparse(tmp_pat
     assert "profiles=2" in result.output
     h5py = pytest.importorskip("h5py")
     with h5py.File(matrix_file, "r") as handle:
-        assert handle["metadata"].attrs["layout"] == "per_genome_sample_major_sparse_indices_matrix_hdf5"
+        assert handle["metadata"].attrs["storage_mode"] == "bitmask"
+        assert handle["metadata"].attrs["layout"] == "per_genome_sample_major_sparse_bitmask_hdf5"
+        assert handle["metadata"].attrs["matrix_dtype"] == "uint8"
         assert handle["samples"]["sample_name"].asstr()[...].tolist() == ["SRR_PASS", "SRR_STATS_ONLY"]
         assert handle["matrices"]["0"]["indptr"][...].tolist() == [0, 1, 1]
         assert handle["matrices"]["0"]["indices"][...].tolist() == [0]
+        assert handle["matrices"]["0"]["values"][...].tolist() == [1]
     with duckdb.connect(str(db_file)) as conn:
         assert conn.execute("SELECT storage_layout, profile_count FROM matrix_stores").fetchall() == [("sparse", 2)]
         assert conn.execute("SELECT sample_id FROM matrix_store_samples ORDER BY sample_id").fetchall() == [("SRR_PASS",), ("SRR_STATS_ONLY",)]
@@ -1370,11 +1437,168 @@ def test_matrix_build_keeps_stats_only_sample_as_zero_matrix_row(tmp_path: Path,
     h5py = pytest.importorskip("h5py")
     with h5py.File(matrix_file, "r") as handle:
         assert handle["samples"]["sample_name"].asstr()[...].tolist() == ["SRR_GOOD", "SRR_STATS_ONLY"]
-        good_dense = handle["matrices"]["0"][0, :, :].tolist()
-        stats_only_dense = handle["matrices"]["0"][1, :, :].tolist()
-        assert good_dense[0] == [1, 0, 0, 0]
-        assert good_dense[1] == [0, 0, 0, 0]  # C count is below ZipStrain's 5x matrix threshold.
-        assert all(row == [0, 0, 0, 0] for row in stats_only_dense)
+        good_dense = handle["matrices"]["0"][0, :].tolist()
+        stats_only_dense = handle["matrices"]["0"][1, :].tolist()
+        assert good_dense[0] == 1
+        assert good_dense[1] == 0  # C count is below ZipStrain's 5x matrix threshold.
+        assert all(value == 0 for value in stats_only_dense)
+
+
+def test_matrix_build_count_storage_preserves_counts_and_threshold(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR_COUNTS"), add_run=True)
+    bed_file, stb_file = _matrix_contract_files(tmp_path)
+    matrix_file = tmp_path / "counts.h5"
+
+    result = runner.invoke(
+        cli.cli,
+        [
+            "matrix", "build",
+            "--db", str(db_file),
+            "--genome", "genome_a",
+            "--bed-file", str(bed_file),
+            "--stb-file", str(stb_file),
+            "--output-file", str(matrix_file),
+            "--storage-mode", "counts",
+            "--count-dtype", "auto",
+            "--matrix-min-cov", "3",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    h5py = pytest.importorskip("h5py")
+    with h5py.File(matrix_file, "r") as handle:
+        metadata = handle["metadata"].attrs
+        assert metadata["storage_mode"] == "counts"
+        assert metadata["matrix_value_semantics"] == "allele_counts_after_cov_filter"
+        assert metadata["coverage_filter_min_cov"] == "3"
+        assert metadata["count_dtype"] == "uint16"
+        matrix = handle["matrices"]["0"][0, :, :]
+        assert matrix.dtype.name == "uint16"
+        assert matrix[0].tolist() == [5, 0, 0, 0]
+        assert matrix[1].tolist() == [0, 0, 3, 0]
+
+
+def test_direct_matrix_store_is_consumed_by_zipstrain_v1_compare(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR1"), add_run=True)
+    _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR2"), add_run=True)
+    bed_file, stb_file = _matrix_contract_files(tmp_path)
+    matrix_file = tmp_path / "matrix.h5"
+
+    result = runner.invoke(
+        cli.cli,
+        [
+            "matrix",
+            "build",
+            "--db",
+            str(db_file),
+            "--genome",
+            "genome_a",
+            "--bed-file",
+            str(bed_file),
+            "--stb-file",
+            str(stb_file),
+            "--output-file",
+            str(matrix_file),
+            "--sparse",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    from zipstrain import matrix_pairs
+
+    compare_file = tmp_path / "compare.duckdb"
+    matrix_pairs.matrix_compare(
+        matrix_db_file=matrix_file,
+        output_file=compare_file,
+        calculate="ani",
+        backend="numpy",
+        min_cov=5,
+    )
+
+    with duckdb.connect(str(compare_file), read_only=True) as conn:
+        assert conn.execute(
+            "SELECT sample_1, sample_2, genome, total_positions, share_allele_pos, genome_ani "
+            "FROM matrix_compare_results"
+        ).fetchone() == ("SRR1", "SRR2", "genome_a", 1, 1, 100.0)
+        metadata = dict(conn.execute("SELECT key, value FROM matrix_compare_metadata").fetchall())
+        assert metadata["ani_method"] == "popani"
+        assert metadata["min_cov"] == "5"
+
+
+def test_direct_count_matrix_supports_conani_compare(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR1"), add_run=True)
+    _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR2"), add_run=True)
+    bed_file, stb_file = _matrix_contract_files(tmp_path)
+    matrix_file = tmp_path / "counts.h5"
+    result = runner.invoke(
+        cli.cli,
+        [
+            "matrix", "build",
+            "--db", str(db_file),
+            "--genome", "genome_a",
+            "--bed-file", str(bed_file),
+            "--stb-file", str(stb_file),
+            "--output-file", str(matrix_file),
+            "--storage-mode", "counts",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    from zipstrain import matrix_pairs
+
+    compare_file = tmp_path / "conani.duckdb"
+    matrix_pairs.matrix_compare(
+        matrix_db_file=matrix_file,
+        output_file=compare_file,
+        calculate="ani",
+        ani_method="conani",
+        backend="numpy",
+    )
+    with duckdb.connect(str(compare_file), read_only=True) as conn:
+        row = conn.execute(
+            "SELECT total_positions, share_allele_pos, genome_ani FROM matrix_compare_results"
+        ).fetchone()
+        assert row == (1, 1, 100.0)
+
+
+def test_matrix_append_preserves_new_bitmask_layout(tmp_path: Path) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR1"), add_run=True)
+    bed_file, stb_file = _matrix_contract_files(tmp_path)
+    matrix_file = tmp_path / "matrix.h5"
+    built = runner.invoke(
+        cli.cli,
+        [
+            "matrix", "build",
+            "--db", str(db_file),
+            "--genome", "genome_a",
+            "--bed-file", str(bed_file),
+            "--stb-file", str(stb_file),
+            "--output-file", str(matrix_file),
+        ],
+    )
+    assert built.exit_code == 0, built.output
+
+    _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR2"), add_run=True)
+    appended = runner.invoke(
+        cli.cli,
+        ["matrix", "append", "--db", str(db_file), "--matrix-file", str(matrix_file)],
+    )
+    assert appended.exit_code == 0, appended.output
+
+    h5py = pytest.importorskip("h5py")
+    with h5py.File(matrix_file, "r") as handle:
+        assert handle["metadata"].attrs["layout"] == "per_genome_sample_major_bitmask_hdf5"
+        assert handle["samples"]["sample_name"].asstr()[...].tolist() == ["SRR1", "SRR2"]
+        assert handle["matrices"]["0"].shape == (2, 10)
+        assert handle["matrices"]["0"][:, 0].tolist() == [1, 1]
 
 
 def test_matrix_build_fails_when_no_complete_profiles_exist(tmp_path: Path) -> None:
@@ -1460,7 +1684,10 @@ def test_matrix_compare_uses_registered_matrix_store(tmp_path: Path, monkeypatch
     matrix_file = tmp_path / "matrix.h5"
     matrix_file.write_text("matrix")
     workflow_config = tmp_path / "workflow.toml"
-    workflow_config.write_text('[matrix_compare]\ncalculate = "ani+gene"\ngenome = "genome_scope"\nbackend = "mps"\nmemory_limit_gb = 24\n')
+    workflow_config.write_text(
+        '[matrix_compare]\ncalculate = "ani+gene"\ngenome = "genome_scope"\n'
+        'backend = "mps"\nmin_cov = 7\nmemory_limit_gb = 24\n'
+    )
     calls: list[dict[str, object]] = []
 
     with registry.connect(db_file) as conn:
@@ -1516,6 +1743,7 @@ def test_matrix_compare_uses_registered_matrix_store(tmp_path: Path, monkeypatch
     assert calls[0]["calculate"] == "ani+gene"
     assert calls[0]["genome"] == "genome_scope"
     assert calls[0]["backend"] == "mps"
+    assert calls[0]["min_cov"] == 7
     assert calls[0]["memory_limit_gb"] == 24.0
     with duckdb.connect(str(db_file)) as conn:
         assert conn.execute("SELECT compare_id, matrix_id, calculate FROM matrix_compares").fetchall() == [("compare", "genome_a", "ani+gene")]
@@ -1709,7 +1937,10 @@ def test_matrix_sync_build_builds_missing_and_appends_existing_matrices(tmp_path
     db_file = tmp_path / "metatrawl.duckdb"
     _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR1"), add_run=True)
     with registry.connect(db_file) as conn:
-        conn.execute("INSERT INTO genome_stats VALUES ('SRR1', 'genome_b', 3.0, 0.8, 0.7, NULL)")
+        conn.execute(
+            "INSERT INTO genome_stats (sample_id, genome, coverage, breadth, ber, ref_ani) "
+            "VALUES ('SRR1', 'genome_b', 3.0, 0.8, 0.7, NULL)"
+        )
     matrix_dir = tmp_path / "matrices"
     matrix_dir.mkdir()
     existing_matrix = matrix_dir / "genome_a.h5"
@@ -1784,7 +2015,10 @@ def test_matrix_sync_build_can_target_one_genome(tmp_path: Path, monkeypatch) ->
     db_file = tmp_path / "metatrawl.duckdb"
     _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR1"), add_run=True)
     with registry.connect(db_file) as conn:
-        conn.execute("INSERT INTO genome_stats VALUES ('SRR1', 'genome_b', 3.0, 0.8, 0.7, NULL)")
+        conn.execute(
+            "INSERT INTO genome_stats (sample_id, genome, coverage, breadth, ber, ref_ani) "
+            "VALUES ('SRR1', 'genome_b', 3.0, 0.8, 0.7, NULL)"
+        )
     matrix_dir = tmp_path / "matrices"
     matrix_dir.mkdir()
     (matrix_dir / "genome_a.h5").write_text("matrix")
@@ -1850,7 +2084,10 @@ def test_matrix_sync_build_dispatches_one_job_per_genome_with_workflow_config(tm
     stb_dir.mkdir()
     _import_bundle(runner, db_file, _write_bundle_files(tmp_path, "SRR1"), add_run=True)
     with registry.connect(db_file) as conn:
-        conn.execute("INSERT INTO genome_stats VALUES ('SRR1', 'genome_b', 3.0, 0.8, 0.7, NULL)")
+        conn.execute(
+            "INSERT INTO genome_stats (sample_id, genome, coverage, breadth, ber, ref_ani) "
+            "VALUES ('SRR1', 'genome_b', 3.0, 0.8, 0.7, NULL)"
+        )
     workflow_config.write_text('[stages.matrix_build]\nworkers = 2\nthreads = 4\n[matrix_build]\nmemory_limit_gb = 24\nexport_batch_mb = 32\nduckdb_export_threads = 3\n')
     commands: list[tuple[str, list[str], str]] = []
 
@@ -1993,6 +2230,7 @@ def test_matrix_sync_compare_dispatches_one_job_per_matrix_with_workflow_config(
         '[matrix_compare]\n'
         'calculate = "ani+ibs"\n'
         'backend = "numpy"\n'
+        'min_cov = 6\n'
         'memory_limit_gb = 32\n'
     )
     commands: list[tuple[str, list[str], str]] = []
@@ -2031,6 +2269,7 @@ def test_matrix_sync_compare_dispatches_one_job_per_matrix_with_workflow_config(
     genome_a = command_by_sample["genome_a"]
     assert genome_a[:3] == ["metatrawl", "matrix", "compare"]
     assert genome_a[genome_a.index("--calculate") + 1] == "ani+ibs"
+    assert genome_a[genome_a.index("--min-cov") + 1] == "6"
     assert genome_a[genome_a.index("--memory-limit-gb") + 1] == "32.0"
     assert genome_a[genome_a.index("--workflow-config") + 1] == str(workflow_config)
     assert "--no-register" in genome_a
@@ -2050,6 +2289,7 @@ def test_matrix_sync_compare_uses_workflow_config_when_cli_args_are_omitted(tmp_
         'calculate = "ani+gene"\n'
         'genome = "genome_scope"\n'
         'backend = "mps"\n'
+        'min_cov = 7\n'
         'memory_limit_gb = 24\n'
     )
     calls: list[dict[str, object]] = []
@@ -2081,6 +2321,7 @@ def test_matrix_sync_compare_uses_workflow_config_when_cli_args_are_omitted(tmp_
     assert calls[0]["calculate"] == "ani+gene"
     assert calls[0]["genome"] == "genome_scope"
     assert calls[0]["backend"] == "mps"
+    assert calls[0]["min_cov"] == 7
     assert calls[0]["memory_limit_gb"] == 24.0
 
 
@@ -2097,6 +2338,7 @@ def test_matrix_sync_compare_cli_args_override_workflow_config(tmp_path: Path, m
         'calculate = "ani+gene"\n'
         'genome = "genome_scope"\n'
         'backend = "mps"\n'
+        'min_cov = 7\n'
         'memory_limit_gb = 24\n'
     )
     calls: list[dict[str, object]] = []
@@ -2127,6 +2369,8 @@ def test_matrix_sync_compare_cli_args_override_workflow_config(tmp_path: Path, m
             "all",
             "--backend",
             "numpy",
+            "--min-cov",
+            "5",
             "--memory-limit-gb",
             "16",
         ],
@@ -2136,6 +2380,7 @@ def test_matrix_sync_compare_cli_args_override_workflow_config(tmp_path: Path, m
     assert calls[0]["calculate"] == "all"
     assert calls[0]["genome"] == "all"
     assert calls[0]["backend"] == "numpy"
+    assert calls[0]["min_cov"] == 5
     assert calls[0]["memory_limit_gb"] == 16.0
 
 

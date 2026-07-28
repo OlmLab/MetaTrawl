@@ -27,16 +27,22 @@ partition = "compute"
 memory_limit_gb = 20
 export_batch_mb = 32
 duckdb_export_threads = 4
+storage_mode = "counts"
+count_dtype = "auto"
+min_cov = 6
 [matrix_compare]
 calculate = "ani+ibs"
 genome = "GCF_1"
 backend = "mps"
+min_cov = 7
+ani_method = "conani"
 memory_limit_gb = 48.5
 target_queue_size = 3
 loader_executor_kind = "process"
 [profile]
 min_mapq = 20
 min_baseq = 25
+min_freq = 0.02
 min_read_ani = 0.97
 read_inclusion = "proper-pairs"
 ''')
@@ -51,13 +57,19 @@ read_inclusion = "proper-pairs"
     assert config.matrix_build.memory_limit_gb == 20.0
     assert config.matrix_build.export_batch_mb == 32.0
     assert config.matrix_build.duckdb_export_threads == 4
+    assert config.matrix_build.storage_mode == "counts"
+    assert config.matrix_build.count_dtype == "auto"
+    assert config.matrix_build.min_cov == 6
     assert config.matrix_compare.calculate == "ani+ibs"
     assert config.matrix_compare.genome == "GCF_1"
     assert config.matrix_compare.backend == "mps"
+    assert config.matrix_compare.min_cov == 7
+    assert config.matrix_compare.ani_method == "conani"
     assert config.matrix_compare.memory_limit_gb == 48.5
     assert config.matrix_compare.kwargs() == {"target_queue_size": 3, "loader_executor_kind": "process"}
     assert config.profile.min_mapq == 20
     assert config.profile.min_baseq == 25
+    assert config.profile.min_freq == 0.02
     assert config.profile.min_read_ani == 0.97
     assert config.profile.read_inclusion == "proper-pairs"
 
@@ -69,6 +81,10 @@ def test_json_config_is_supported(tmp_path: Path) -> None:
     assert config.sample_workers == 2
     assert config.stage("alignment").workers == 1
     assert config.stage("alignment").threads == 8
+    assert config.profile.min_freq == 0.0
+    assert config.profile.min_read_ani == 0.95
+    assert config.profile.read_inclusion == "paired"
+    assert config.matrix_compare.min_cov is None
 
 
 def test_config_rejects_unknown_stage(tmp_path: Path) -> None:
@@ -103,6 +119,13 @@ def test_config_rejects_invalid_profile_read_ani(tmp_path: Path) -> None:
     path = tmp_path / "workflow.toml"
     path.write_text("[profile]\nmin_read_ani = 1.5\n")
     with pytest.raises(ValueError, match="profile.min_read_ani must be between 0 and 1"):
+        load_workflow_config(path, threads=2, sample_count=2)
+
+
+def test_config_rejects_invalid_profile_min_freq(tmp_path: Path) -> None:
+    path = tmp_path / "workflow.toml"
+    path.write_text("[profile]\nmin_freq = -0.1\n")
+    with pytest.raises(ValueError, match="profile.min_freq must be between 0 and 1"):
         load_workflow_config(path, threads=2, sample_count=2)
 
 

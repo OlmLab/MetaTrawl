@@ -6,7 +6,19 @@ from pathlib import Path
 import tomllib
 from typing import Any
 
-STAGE_NAMES = ("sra_download", "sylph", "genome_download", "prodigal", "prepare_profile", "bowtie_build", "alignment", "profile", "matrix_build", "matrix_compare")
+STAGE_NAMES = (
+    "sra_download",
+    "sylph",
+    "genome_download",
+    "prodigal",
+    "prepare_profile",
+    "bowtie_build",
+    "alignment",
+    "profile",
+    "matrix_build",
+    "matrix_compare",
+    "genome_view",
+)
 READ_INCLUSION_CHOICES = ("proper-pairs", "paired", "all-mapped")
 
 @dataclass(frozen=True)
@@ -32,6 +44,9 @@ class MatrixBuildConfig:
     memory_limit_gb: float | None = None
     export_batch_mb: float | None = None
     duckdb_export_threads: int | None = None
+    storage_mode: str | None = None
+    count_dtype: str | None = None
+    min_cov: int | None = None
 
 
 @dataclass(frozen=True)
@@ -39,6 +54,8 @@ class MatrixCompareConfig:
     calculate: str | None = None
     genome: str | None = None
     backend: str | None = None
+    min_cov: int | None = None
+    ani_method: str | None = None
     memory_limit_gb: float | None = None
     anchor_queue_size: int | None = None
     target_queue_size: int | None = None
@@ -60,8 +77,9 @@ class MatrixCompareConfig:
 class ProfileConfig:
     min_mapq: int = 0
     min_baseq: int = 13
-    min_read_ani: float | None = None
-    read_inclusion: str = "all-mapped"
+    min_freq: float = 0.0
+    min_read_ani: float | None = 0.95
+    read_inclusion: str = "paired"
 
 @dataclass(frozen=True)
 class WorkflowConfig:
@@ -86,6 +104,7 @@ class WorkflowConfig:
         stages["prodigal"] = StageConfig(workers=1, threads=1)
         stages["matrix_build"] = StageConfig(workers=1, threads=max(1, threads))
         stages["matrix_compare"] = StageConfig(workers=1, threads=max(1, threads))
+        stages["genome_view"] = StageConfig(workers=1, threads=max(1, threads))
         return cls(sample_workers=sample_workers, stages=stages)
 
 def load_workflow_config(path: Path | None, *, threads: int, sample_count: int) -> WorkflowConfig:
@@ -159,16 +178,25 @@ def _parse(raw: dict[str, Any], *, threads: int, sample_count: int) -> WorkflowC
     return WorkflowConfig(sample_workers=sample_workers, stages=stages, profile=ProfileConfig(
         min_mapq=_nonnegative_int(profile.get("min_mapq", ProfileConfig.min_mapq), "profile.min_mapq"),
         min_baseq=_nonnegative_int(profile.get("min_baseq", ProfileConfig.min_baseq), "profile.min_baseq"),
-        min_read_ani=_optional_probability(profile.get("min_read_ani"), "profile.min_read_ani"),
+        min_freq=_probability(profile.get("min_freq", ProfileConfig.min_freq), "profile.min_freq"),
+        min_read_ani=_optional_probability(
+            profile.get("min_read_ani", ProfileConfig.min_read_ani),
+            "profile.min_read_ani",
+        ),
         read_inclusion=read_inclusion,
     ), matrix_build=MatrixBuildConfig(
         memory_limit_gb=_optional_positive_float(build.get("memory_limit_gb"), "matrix_build.memory_limit_gb"),
         export_batch_mb=_optional_positive_float(build.get("export_batch_mb"), "matrix_build.export_batch_mb"),
         duckdb_export_threads=_optional_positive(build.get("duckdb_export_threads"), "matrix_build.duckdb_export_threads"),
+        storage_mode=_choice(build.get("storage_mode"), "matrix_build.storage_mode", ("bitmask", "counts")),
+        count_dtype=_choice(build.get("count_dtype"), "matrix_build.count_dtype", ("auto", "uint16", "uint32")),
+        min_cov=_optional_positive(build.get("min_cov"), "matrix_build.min_cov"),
     ), matrix_compare=MatrixCompareConfig(
         calculate=_optional_string(compare.get("calculate")),
         genome=_optional_string(compare.get("genome")),
         backend=_optional_string(compare.get("backend")),
+        min_cov=_optional_positive(compare.get("min_cov"), "matrix_compare.min_cov"),
+        ani_method=_optional_string(compare.get("ani_method")),
         memory_limit_gb=_optional_positive_float(compare.get("memory_limit_gb"), "matrix_compare.memory_limit_gb"),
         anchor_queue_size=_optional_positive(compare.get("anchor_queue_size"), "matrix_compare.anchor_queue_size"),
         target_queue_size=_optional_positive(compare.get("target_queue_size"), "matrix_compare.target_queue_size"),
@@ -198,6 +226,15 @@ def _nonnegative_int(value: Any, key: str) -> int:
 def _optional_positive(value: Any, key: str) -> int | None:
     return None if value is None else _positive(value, key)
 
+
+def _choice(value: Any, key: str, choices: tuple[str, ...]) -> str | None:
+    if value is None:
+        return None
+    result = str(value).strip().lower()
+    if result not in choices:
+        raise ValueError(f"{key} must be one of: {', '.join(choices)}")
+    return result
+
 def _nonnegative_float(value: Any, key: str) -> float:
     try:
         result = float(value)
@@ -226,6 +263,12 @@ def _optional_probability(value: Any, key: str) -> float | None:
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{key} must be between 0 and 1.") from exc
     if not 0.0 <= result <= 1.0:
+        raise ValueError(f"{key} must be between 0 and 1.")
+    return result
+
+def _probability(value: Any, key: str) -> float:
+    result = _optional_probability(value, key)
+    if result is None:
         raise ValueError(f"{key} must be between 0 and 1.")
     return result
 

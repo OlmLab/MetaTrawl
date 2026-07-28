@@ -1,5 +1,5 @@
 {% set name = "metatrawl" %}
-{% set version = "0.1.7" %}
+{% set version = "0.2.0" %}
 
 package:
   name: {{ name }}
@@ -29,7 +29,7 @@ requirements:
     - duckdb >=1.1
     - polars >=1.0
     - rich >=13.0
-    - zipstrain >=0.10.0
+    - zipstrain >=1.0.1,<2
     - sylph
     - samtools
     - bowtie2

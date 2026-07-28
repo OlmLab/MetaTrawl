@@ -15,6 +15,7 @@ from rich.table import Table
 from metatrawl import __version__
 from metatrawl import cache
 from metatrawl import db as registry
+from metatrawl import genome_views
 from metatrawl import healthcheck
 from metatrawl import workflows
 from metatrawl.config import WorkflowConfig, load_workflow_config
@@ -414,6 +415,9 @@ def matrix_group() -> None:
 @click.option("--matrix-id", default=None, help="Registry ID for this matrix. Defaults to output-file stem.")
 @click.option("--overwrite", is_flag=True, help="Replace an existing matrix file/registry row.")
 @click.option("--sparse", is_flag=True, help="Store matrices using ZipStrain's sparse HDF5 matrix layout.")
+@click.option("--storage-mode", type=click.Choice(["bitmask", "counts"]), default=None, help="Matrix values to store. Defaults to compact bitmasks.")
+@click.option("--count-dtype", type=click.Choice(["auto", "uint16", "uint32"]), default=None, help="Count dtype when --storage-mode counts is used.")
+@click.option("--matrix-min-cov", type=click.IntRange(min=1), default=5, show_default=True, help="Per-position coverage filter embedded in the matrix.")
 @click.option("--min-coverage", type=float, default=None)
 @click.option("--min-breadth", type=float, default=None)
 @click.option("--min-ber", type=float, default=None)
@@ -431,6 +435,9 @@ def matrix_build(
     matrix_id: str | None,
     overwrite: bool,
     sparse: bool,
+    storage_mode: str | None,
+    count_dtype: str | None,
+    matrix_min_cov: int,
     min_coverage: float | None,
     min_breadth: float | None,
     min_ber: float | None,
@@ -459,6 +466,9 @@ def matrix_build(
                 overwrite=overwrite,
                 matrix_id=matrix_id,
                 sparse=sparse,
+                storage_mode=storage_mode,
+                count_dtype=count_dtype,
+                min_cov=matrix_min_cov,
                 memory_limit_gb=memory_limit_gb,
                 export_batch_mb=export_batch_mb,
                 duckdb_export_threads=duckdb_export_threads,
@@ -480,6 +490,9 @@ def matrix_build(
 @click.option("--gene-range-table", type=click.Path(path_type=Path), help="Optional cache-wide gene range table for gene ANI.")
 @click.option("--gene-range-dir", type=click.Path(path_type=Path), help="Optional directory with per-genome ACCESSION.gene_ranges.tsv files.")
 @click.option("--sparse", is_flag=True, help="Build missing matrices using ZipStrain's sparse HDF5 layout.")
+@click.option("--storage-mode", type=click.Choice(["bitmask", "counts"]), default=None, help="Matrix values for newly built matrices. Defaults to compact bitmasks.")
+@click.option("--count-dtype", type=click.Choice(["auto", "uint16", "uint32"]), default=None, help="Count dtype when count storage is selected.")
+@click.option("--matrix-min-cov", type=click.IntRange(min=1), default=None, help="Build-time per-position coverage filter.")
 @click.option("--min-coverage", type=float, default=None)
 @click.option("--min-breadth", type=float, default=None)
 @click.option("--min-ber", type=float, default=None)
@@ -500,6 +513,9 @@ def matrix_sync_build(
     gene_range_table: Path | None,
     gene_range_dir: Path | None,
     sparse: bool,
+    storage_mode: str | None,
+    count_dtype: str | None,
+    matrix_min_cov: int | None,
     min_coverage: float | None,
     min_breadth: float | None,
     min_ber: float | None,
@@ -521,11 +537,21 @@ def matrix_sync_build(
         with registry.connect_read_only(db_file) as conn:
             selected_genomes = list(genomes) if genomes else registry.genomes_with_complete_samples(conn)
         execution_config = load_workflow_config(workflow_config, threads=1, sample_count=max(1, len(selected_genomes)))
-        resolved_memory_limit_gb, resolved_export_batch_mb, resolved_duckdb_export_threads = _resolve_matrix_build_options(
+        (
+            resolved_memory_limit_gb,
+            resolved_export_batch_mb,
+            resolved_duckdb_export_threads,
+            resolved_storage_mode,
+            resolved_count_dtype,
+            resolved_matrix_min_cov,
+        ) = _resolve_matrix_build_options(
             execution_config,
             memory_limit_gb=memory_limit_gb,
             export_batch_mb=export_batch_mb,
             duckdb_export_threads=duckdb_export_threads,
+            storage_mode=storage_mode,
+            count_dtype=count_dtype,
+            min_cov=matrix_min_cov,
         )
         if workflow_config is not None and _should_dispatch_stage(execution_config, "matrix_build") and not no_register:
             summary = _dispatch_matrix_sync_build_jobs(
@@ -540,6 +566,9 @@ def matrix_sync_build(
                 gene_range_dir=gene_range_dir,
                 filters=filters,
                 sparse=sparse,
+                storage_mode=resolved_storage_mode,
+                count_dtype=resolved_count_dtype,
+                min_cov=resolved_matrix_min_cov,
                 memory_limit_gb=resolved_memory_limit_gb,
                 export_batch_mb=resolved_export_batch_mb,
                 duckdb_export_threads=resolved_duckdb_export_threads,
@@ -561,6 +590,9 @@ def matrix_sync_build(
                     gene_range_dir=gene_range_dir,
                     filters=filters,
                     sparse=sparse,
+                    storage_mode=resolved_storage_mode,
+                    count_dtype=resolved_count_dtype,
+                    min_cov=resolved_matrix_min_cov,
                     memory_limit_gb=resolved_memory_limit_gb,
                     export_batch_mb=resolved_export_batch_mb,
                     duckdb_export_threads=resolved_duckdb_export_threads,
@@ -614,7 +646,10 @@ def _resolve_matrix_build_options(
     memory_limit_gb: float | None,
     export_batch_mb: float | None,
     duckdb_export_threads: int | None,
-) -> tuple[float, float, int]:
+    storage_mode: str | None,
+    count_dtype: str | None,
+    min_cov: int | None,
+) -> tuple[float, float, int, str | None, str | None, int]:
     """Resolve matrix build options with CLI values overriding TOML values."""
     matrix_config = execution_config.matrix_build
     resolved_memory_limit_gb = memory_limit_gb if memory_limit_gb is not None else matrix_config.memory_limit_gb or 16.0
@@ -630,7 +665,19 @@ def _resolve_matrix_build_options(
         raise click.ClickException("--export-batch-mb must be positive")
     if resolved_duckdb_export_threads < 1:
         raise click.ClickException("--duckdb-export-threads must be positive")
-    return resolved_memory_limit_gb, resolved_export_batch_mb, resolved_duckdb_export_threads
+    resolved_storage_mode = storage_mode if storage_mode is not None else matrix_config.storage_mode
+    resolved_count_dtype = count_dtype if count_dtype is not None else matrix_config.count_dtype
+    resolved_min_cov = min_cov if min_cov is not None else matrix_config.min_cov or 5
+    if resolved_storage_mode == "bitmask" and resolved_count_dtype is not None:
+        raise click.ClickException("--count-dtype requires --storage-mode counts")
+    return (
+        resolved_memory_limit_gb,
+        resolved_export_batch_mb,
+        resolved_duckdb_export_threads,
+        resolved_storage_mode,
+        resolved_count_dtype,
+        resolved_min_cov,
+    )
 
 
 def _resolve_matrix_compare_options(
@@ -639,8 +686,10 @@ def _resolve_matrix_compare_options(
     calculate: str | None,
     genome: str | None,
     backend: str | None,
+    min_cov: int | None,
+    ani_method: str | None,
     memory_limit_gb: float | None,
-) -> tuple[str, str, str, float]:
+) -> tuple[str, str, str, int | None, str, float]:
     """Resolve matrix compare options with CLI values overriding TOML values."""
     matrix_config = execution_config.matrix_compare
     resolved_memory_limit_gb = (
@@ -652,6 +701,8 @@ def _resolve_matrix_compare_options(
         calculate or matrix_config.calculate or "all",
         genome or matrix_config.genome or "all",
         backend or matrix_config.backend or "numpy",
+        min_cov if min_cov is not None else matrix_config.min_cov,
+        ani_method or matrix_config.ani_method or "popani",
         resolved_memory_limit_gb,
     )
 
@@ -664,10 +715,12 @@ def _resolve_matrix_compare_options(
 @click.option("--calculate", default=None, help="Metrics to calculate; overrides workflow configuration.")
 @click.option("--genome", default=None, help="Optional compare genome scope; overrides workflow configuration.")
 @click.option("--backend", default=None, help="ZipStrain matrix backend; overrides workflow configuration.")
+@click.option("--min-cov", type=click.IntRange(min=1), default=None, help="Minimum comparison coverage; overrides workflow configuration.")
+@click.option("--ani-method", default=None, help="ANI method: popani, conani, or cosani_<threshold>.")
 @click.option("--memory-limit-gb", type=float, default=None, help="Comparison memory limit; overrides workflow configuration.")
 @click.option("--workflow-config", type=click.Path(path_type=Path), help="TOML/JSON ZipStrain queue/executor controls.")
 @click.option("--no-register", is_flag=True, hidden=True, help="Do not write compare metadata back to the MetaTrawl registry.")
-def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | None, output_file: Path, calculate: str | None, genome: str | None, backend: str | None, memory_limit_gb: float | None, workflow_config: Path | None, no_register: bool) -> None:
+def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | None, output_file: Path, calculate: str | None, genome: str | None, backend: str | None, min_cov: int | None, ani_method: str | None, memory_limit_gb: float | None, workflow_config: Path | None, no_register: bool) -> None:
     """Compare a registered matrix store."""
     try:
         connect = registry.connect_read_only if no_register else registry.connect
@@ -678,12 +731,14 @@ def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | Non
                 matrix_file=matrix_file,
             )
             execution_config = load_workflow_config(workflow_config, threads=1, sample_count=1)
-            resolved_calculate, resolved_genome, resolved_backend, resolved_memory_limit_gb = (
+            resolved_calculate, resolved_genome, resolved_backend, resolved_min_cov, resolved_ani_method, resolved_memory_limit_gb = (
                 _resolve_matrix_compare_options(
                     execution_config,
                     calculate=calculate,
                     genome=genome,
                     backend=backend,
+                    min_cov=min_cov,
+                    ani_method=ani_method,
                     memory_limit_gb=memory_limit_gb,
                 )
             )
@@ -695,6 +750,8 @@ def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | Non
                 calculate=resolved_calculate,
                 genome=resolved_genome,
                 backend=resolved_backend,
+                min_cov=resolved_min_cov,
+                ani_method=resolved_ani_method,
                 memory_limit_gb=resolved_memory_limit_gb,
                 compare_config=execution_config.matrix_compare,
                 register=not no_register,
@@ -712,6 +769,8 @@ def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | Non
 @click.option("--calculate", default=None, help="Metrics to calculate; overrides workflow configuration.")
 @click.option("--genome", default=None, help="Optional compare genome scope; overrides workflow configuration.")
 @click.option("--backend", default=None, help="ZipStrain matrix backend; overrides workflow configuration.")
+@click.option("--min-cov", type=click.IntRange(min=1), default=None, help="Minimum comparison coverage; overrides workflow configuration.")
+@click.option("--ani-method", default=None, help="ANI method: popani, conani, or cosani_<threshold>.")
 @click.option("--memory-limit-gb", type=float, default=None, help="Comparison memory limit; overrides workflow configuration.")
 @click.option("--workflow-config", type=click.Path(path_type=Path), help="TOML/JSON ZipStrain queue/executor controls.")
 def matrix_sync_compare(
@@ -721,18 +780,22 @@ def matrix_sync_compare(
     calculate: str | None,
     genome: str | None,
     backend: str | None,
+    min_cov: int | None,
+    ani_method: str | None,
     memory_limit_gb: float | None,
     workflow_config: Path | None,
 ) -> None:
     """Run resumable compare for every matrix file in a directory."""
     try:
         execution_config = load_workflow_config(workflow_config, threads=1, sample_count=1)
-        resolved_calculate, resolved_genome, resolved_backend, resolved_memory_limit_gb = (
+        resolved_calculate, resolved_genome, resolved_backend, resolved_min_cov, resolved_ani_method, resolved_memory_limit_gb = (
             _resolve_matrix_compare_options(
                 execution_config,
                 calculate=calculate,
                 genome=genome,
                 backend=backend,
+                min_cov=min_cov,
+                ani_method=ani_method,
                 memory_limit_gb=memory_limit_gb,
             )
         )
@@ -744,6 +807,8 @@ def matrix_sync_compare(
                 calculate=resolved_calculate,
                 genome=resolved_genome,
                 backend=resolved_backend,
+                min_cov=resolved_min_cov,
+                ani_method=resolved_ani_method,
                 memory_limit_gb=resolved_memory_limit_gb,
                 workflow_config=workflow_config,
                 execution_config=execution_config,
@@ -758,6 +823,8 @@ def matrix_sync_compare(
                     calculate=resolved_calculate,
                     genome=resolved_genome,
                     backend=resolved_backend,
+                    min_cov=resolved_min_cov,
+                    ani_method=resolved_ani_method,
                     memory_limit_gb=resolved_memory_limit_gb,
                     compare_config=execution_config.matrix_compare,
                     logger=WorkflowLogger(),
@@ -790,6 +857,9 @@ def _dispatch_matrix_sync_build_jobs(
     gene_range_dir: Path | None,
     filters: registry.MatrixFilters,
     sparse: bool,
+    storage_mode: str | None,
+    count_dtype: str | None,
+    min_cov: int,
     memory_limit_gb: float,
     export_batch_mb: float,
     duckdb_export_threads: int,
@@ -821,6 +891,9 @@ def _dispatch_matrix_sync_build_jobs(
                 gene_range_dir=gene_range_dir,
                 filters=filters,
                 sparse=sparse,
+                storage_mode=storage_mode,
+                count_dtype=count_dtype,
+                min_cov=min_cov,
                 memory_limit_gb=memory_limit_gb,
                 export_batch_mb=export_batch_mb,
                 duckdb_export_threads=duckdb_export_threads,
@@ -860,6 +933,9 @@ def _matrix_sync_build_child_command(
     gene_range_dir: Path | None,
     filters: registry.MatrixFilters,
     sparse: bool,
+    storage_mode: str | None,
+    count_dtype: str | None,
+    min_cov: int,
     memory_limit_gb: float,
     export_batch_mb: float,
     duckdb_export_threads: int,
@@ -884,6 +960,11 @@ def _matrix_sync_build_child_command(
     ]
     if sparse:
         command.append("--sparse")
+    if storage_mode is not None:
+        command.extend(["--storage-mode", storage_mode])
+    if count_dtype is not None:
+        command.extend(["--count-dtype", count_dtype])
+    command.extend(["--matrix-min-cov", str(min_cov)])
     _append_path_option(command, "--bed-file", bed_file)
     _append_path_option(command, "--stb-file", stb_file)
     _append_path_option(command, "--bed-dir", bed_dir)
@@ -905,6 +986,8 @@ def _dispatch_matrix_sync_compare_jobs(
     calculate: str,
     genome: str,
     backend: str,
+    min_cov: int | None,
+    ani_method: str,
     memory_limit_gb: float,
     workflow_config: Path,
     execution_config: WorkflowConfig,
@@ -942,12 +1025,16 @@ def _dispatch_matrix_sync_compare_jobs(
                 genome,
                 "--backend",
                 backend,
+                "--ani-method",
+                ani_method,
                 "--memory-limit-gb",
                 str(memory_limit_gb),
                 "--workflow-config",
                 str(workflow_config),
                 "--no-register",
             ]
+            if min_cov is not None:
+                command.extend(["--min-cov", str(min_cov)])
             futures[executor.submit(runtime.run, "matrix_compare", command, sample=matrix_file.stem)] = matrix_file
         for future in as_completed(futures):
             matrix_file = futures[future]
@@ -971,6 +1058,190 @@ def _append_path_option(command: list[str], option: str, value: Path | None) -> 
 def _append_float_option(command: list[str], option: str, value: float | None) -> None:
     if value is not None:
         command.extend([option, str(value)])
+
+
+@cli.command("sync-genome-views")
+@click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
+@click.option("--compare-dir", required=True, type=click.Path(path_type=Path), help="Directory containing per-genome compare DuckDB files.")
+@click.option("--view-dir", required=True, type=click.Path(path_type=Path), help="Directory for self-contained per-genome view bundles.")
+@click.option("--genome", "genomes", multiple=True, help="Optional genome to sync. Repeat for multiple genomes.")
+@click.option("--min-comp-len", type=click.IntRange(min=0), default=10_000, show_default=True, help="Minimum shared positions used for clustering.")
+@click.option("--impute-ani", type=click.FloatRange(min=0, max=100), default=97.0, show_default=True, help="ANI assigned to missing comparisons.")
+@click.option("--max-null-samples", type=click.IntRange(min=0), default=500, show_default=True, help="Maximum missing comparisons allowed per sample.")
+@click.option("--linkage-method", type=click.Choice(genome_views.SUPPORTED_LINKAGE_METHODS), default="average", show_default=True)
+@click.option("--neighbor-k", type=click.IntRange(min=1), default=20, show_default=True, help="Nearest neighbors retained for each sample.")
+@click.option("--clonal-cluster-threshold", type=click.FloatRange(min=0, max=100), default=99.93, show_default=True)
+@click.option("--strain-cluster-threshold", type=click.FloatRange(min=0, max=100), default=99.8, show_default=True)
+@click.option("--workflow-config", type=click.Path(path_type=Path), help="TOML/JSON execution policy for per-genome view jobs.")
+@click.option("--force", is_flag=True, help="Rebuild view bundles even when their inputs and parameters are unchanged.")
+@click.option("--local-child", is_flag=True, hidden=True, help="Run selected genomes directly without redispatching.")
+def sync_genome_views(
+    db_file: Path,
+    compare_dir: Path,
+    view_dir: Path,
+    genomes: tuple[str, ...],
+    min_comp_len: int,
+    impute_ani: float,
+    max_null_samples: int,
+    linkage_method: str,
+    neighbor_k: int,
+    clonal_cluster_threshold: float,
+    strain_cluster_threshold: float,
+    workflow_config: Path | None,
+    force: bool,
+    local_child: bool,
+) -> None:
+    """Create full clustermap, dendrogram, network, and stats files per genome."""
+    options = genome_views.GenomeViewOptions(
+        min_comp_len=min_comp_len,
+        impute_ani=impute_ani,
+        max_null_samples=max_null_samples,
+        linkage_method=linkage_method,
+        neighbor_k=neighbor_k,
+        clonal_cluster_threshold=clonal_cluster_threshold,
+        strain_cluster_threshold=strain_cluster_threshold,
+    )
+    try:
+        compare_files = genome_views.discover_compare_databases(compare_dir, list(genomes) or None)
+        execution_config = load_workflow_config(
+            workflow_config,
+            threads=1,
+            sample_count=max(1, len(compare_files)),
+        )
+        if workflow_config is not None and _should_dispatch_stage(execution_config, "genome_view") and not local_child:
+            summary = _dispatch_genome_view_jobs(
+                db_file=db_file,
+                compare_dir=compare_dir,
+                view_dir=view_dir,
+                compare_files=compare_files,
+                options=options,
+                force=force,
+                execution_config=execution_config,
+                logger=WorkflowLogger(),
+            )
+        else:
+            summary = genome_views.sync_genome_views(
+                db_file=db_file,
+                compare_dir=compare_dir,
+                view_dir=view_dir,
+                genomes=list(genomes) or None,
+                options=options,
+                force=force,
+                logger=WorkflowLogger(),
+            )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        f"genome-views-sync genomes={summary.genomes} ready={summary.ready} "
+        f"generated={summary.generated} up_to_date={summary.up_to_date} "
+        f"skipped={summary.skipped} failed={summary.failed}"
+    )
+    if summary.failed:
+        raise click.ClickException("Genome view sync completed with failures. Check the genome-level logs above.")
+
+
+def _dispatch_genome_view_jobs(
+    *,
+    db_file: Path,
+    compare_dir: Path,
+    view_dir: Path,
+    compare_files: list[Path],
+    options: genome_views.GenomeViewOptions,
+    force: bool,
+    execution_config: WorkflowConfig,
+    logger: WorkflowLogger,
+) -> genome_views.GenomeViewSyncSummary:
+    view_dir.mkdir(parents=True, exist_ok=True)
+    runtime = WorkflowRuntime(execution_config, state_dir=view_dir, logger=logger)
+    stage = execution_config.stage("genome_view")
+    logger.emit(
+        step="sync-genome-views",
+        status="dispatch-start",
+        genomes=len(compare_files),
+        execution=stage.execution,
+        workers=stage.workers,
+    )
+    completed = failed = 0
+    with ThreadPoolExecutor(max_workers=max(1, min(len(compare_files) or 1, stage.workers))) as executor:
+        futures = {}
+        for compare_file in compare_files:
+            genome = compare_file.stem
+            command = _genome_view_child_command(
+                db_file=db_file,
+                compare_dir=compare_dir,
+                view_dir=view_dir,
+                genome=genome,
+                options=options,
+                force=force,
+            )
+            futures[executor.submit(runtime.run, "genome_view", command, sample=genome)] = genome
+        for future in as_completed(futures):
+            genome = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                failed += 1
+                logger.emit(step="sync-genome-views", status="failed", genome=genome, error=exc)
+            else:
+                completed += 1
+                logger.emit(step="sync-genome-views", status="ready", genome=genome)
+    logger.emit(
+        step="sync-genome-views",
+        status="dispatch-done",
+        genomes=len(compare_files),
+        ready=completed,
+        failed=failed,
+    )
+    genome_views.write_view_catalog(view_dir)
+    return genome_views.GenomeViewSyncSummary(
+        genomes=len(compare_files),
+        ready=completed,
+        generated=0,
+        up_to_date=0,
+        skipped=0,
+        failed=failed,
+    )
+
+
+def _genome_view_child_command(
+    *,
+    db_file: Path,
+    compare_dir: Path,
+    view_dir: Path,
+    genome: str,
+    options: genome_views.GenomeViewOptions,
+    force: bool,
+) -> list[str]:
+    command = [
+        "metatrawl",
+        "sync-genome-views",
+        "--db",
+        str(db_file),
+        "--compare-dir",
+        str(compare_dir),
+        "--view-dir",
+        str(view_dir),
+        "--genome",
+        genome,
+        "--min-comp-len",
+        str(options.min_comp_len),
+        "--impute-ani",
+        str(options.impute_ani),
+        "--max-null-samples",
+        str(options.max_null_samples),
+        "--linkage-method",
+        options.linkage_method,
+        "--neighbor-k",
+        str(options.neighbor_k),
+        "--clonal-cluster-threshold",
+        str(options.clonal_cluster_threshold),
+        "--strain-cluster-threshold",
+        str(options.strain_cluster_threshold),
+        "--local-child",
+    ]
+    if force:
+        command.append("--force")
+    return command
 
 
 @cli.command("status")

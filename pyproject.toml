@@ -1,6 +1,6 @@
 [project]
 name = "metatrawl"
-version = "0.1.17"
+version = "0.2.0"
 description = "Mutable registry and workflow bookkeeping for large ZipStrain/SRA profiling projects."
 readme = "README.md"
 license = "MIT"
@@ -10,9 +10,13 @@ dependencies = [
     "click>=8.1",
     "duckdb>=1.1",
     "h5py>=3.10",
+    "matplotlib>=3.10",
     "numpy>=1.26",
     "polars>=1.0",
     "rich>=13.0",
+    "scipy>=1.16",
+    "seaborn>=0.13",
+    "zipstrain>=1.0.1,<2",
 ]
 
 [project.optional-dependencies]

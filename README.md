@@ -283,7 +283,60 @@ compares/GCF_xxx.duckdb
 Rerunning `sync-compare` is safe. ZipStrain resumes incomplete comparison
 databases and skips completed pairs.
 
-### 7. Inspect Progress
+### 7. Sync Genome Views
+
+Prepare self-contained browser-ready artifacts for every completed genome
+comparison:
+
+```bash
+metatrawl sync-genome-views \
+  --db metatrawl.duckdb \
+  --compare-dir compares \
+  --view-dir genome_views
+```
+
+Each `genome_views/<genome>/` bundle is a versioned, self-contained web and
+analysis snapshot. A web client starts at `genome_views/catalog.json`, follows
+the genome's `manifest.json`, and then loads only the artifacts needed for the
+current panel:
+
+- `samples.json`: matrix indices, dendrogram leaf order, missing-data fraction,
+  and cluster labels.
+- `sample_stats.json`: typed, column-oriented statistics ready for a browser
+  table; `sample_stats.parquet` preserves the same data for analytical tools.
+- `clusters.json`: reusable clonal and strain assignments, memberships,
+  thresholds, and linkage method.
+- `dendrogram.json`: the SciPy linkage matrix plus explicit tree merges for an
+  interactive dendrogram.
+- `neighbor_network.json`: browser-ready nodes and top-neighbor edges, including
+  ANI and compared-position counts.
+- `similarity_ani.condensed.f32.gz`: the little-endian float32 ANI matrix in
+  SciPy-compatible condensed upper-triangle order.
+- `total_positions.condensed.u64.gz`: the matching condensed uint64 overlap
+  matrix; zero identifies an imputed comparison.
+- `distributions.json`: precomputed ANI, overlap, coverage, breadth, BER, and
+  abundance histograms.
+- `view_data.h5`: the matrices, linkage, ordering, and assignments in a reusable
+  scientific container.
+- `clustermap.png` and `dendrogram.svg`: static previews, not the primary data
+  source for the web interface.
+
+`manifest.json` documents every file's format, media type, size, matrix shape,
+dtype, byte order, and axis ordering. The bundle therefore requires no query
+against the main MetaTrawl or comparison databases at presentation time.
+Rerunning the command skips unchanged bundles, but refreshes them when either
+the comparison or relevant project statistics change. Schema-1 bundles are
+automatically regenerated as schema 2. Use `--genome GCF_xxx` to refresh one
+genome explicitly.
+
+Completed comparison databases from pre-1.0 ZipStrain releases are accepted
+read-only. MetaTrawl detects the legacy `genome_pop_ani` result column
+automatically. If an older database lacks checkpoint or catalog tables,
+MetaTrawl derives completion, samples, and genomes from distinct result rows;
+it still skips a view when an available sample catalog shows that result rows
+are incomplete. No legacy comparison database is modified.
+
+### 8. Inspect Progress
 
 At any point:
 
@@ -400,9 +453,9 @@ metatrawl sync-profile \
 
 Each stage supports `workers`, `threads`, `execution = "local" | "slurm"`, `retries`, `retry_delay_seconds`, and an optional `environment` table. Slurm stages also accept `time`, `memory_gb`, `partition`, `account`, and arbitrary `extra` `sbatch` options. MetaTrawl submits Slurm jobs with `sbatch --wait`; checkpointing, output publication, and scratch cleanup therefore happen only after the job completes. If a stage fails, MetaTrawl retries that stage command or Slurm job according to the stage retry settings before marking the sample failed.
 
-The configurable stages are `sra_download`, `sylph`, `genome_download`, `prodigal`, `prepare_profile`, `bowtie_build`, `alignment`, `profile`, `matrix_build`, and `matrix_compare`. Without `--workflow-config`, `--threads` retains the previous profiling behavior.
+The configurable stages are `sra_download`, `sylph`, `genome_download`, `prodigal`, `prepare_profile`, `bowtie_build`, `alignment`, `profile`, `matrix_build`, `matrix_compare`, and `genome_view`. Without `--workflow-config`, `--threads` retains the previous profiling behavior.
 
-The same file can configure ZipStrain `profile-single` read filters under `[profile]`: `min_mapq`, `min_baseq`, optional `min_read_ani`, and `read_inclusion`. It can also configure `calculate`, `genome`, `backend`, `memory_limit_gb`, and ZipStrain queue/executor controls under `[matrix_compare]`; pass it to `matrix compare` or `matrix sync-compare`. `matrix sync-build` can use `[stages.matrix_build]` to submit one build/append job per genome, and `matrix sync-compare` can use `[stages.matrix_compare]` to submit one compare job per matrix. Explicit CLI values override the matching TOML values.
+The same file can configure ZipStrain `profile-single` read filters under `[profile]`: `min_mapq`, `min_baseq`, `min_freq`, `min_read_ani`, and `read_inclusion`. Matrix construction settings belong under `[matrix_build]`: `storage_mode`, `count_dtype`, `min_cov`, `memory_limit_gb`, `export_batch_mb`, and `duckdb_export_threads`. New matrices use compact bitmask storage by default; choose count storage when `conani` or `cosani_<threshold>` is required. Comparison settings under `[matrix_compare]` include `calculate`, `ani_method`, `genome`, `backend`, optional `min_cov`, `memory_limit_gb`, and queue/executor controls. When comparison `min_cov` is omitted, ZipStrain uses the build threshold stored in the HDF5 file. `matrix sync-build` can use `[stages.matrix_build]` to submit one build/append job per genome, `matrix sync-compare` can use `[stages.matrix_compare]` to submit one compare job per matrix, and `sync-genome-views` can use `[stages.genome_view]` to submit one artifact job per genome. Explicit CLI values override the matching TOML values.
 
 ### Complete TOML template
 
@@ -490,16 +543,34 @@ execution = "local"
 retries = 1
 retry_delay_seconds = 60
 
+[stages.genome_view]
+workers = 4
+threads = 8
+execution = "local"
+retries = 1
+retry_delay_seconds = 60
+
 [profile]
 min_mapq = 0
 min_baseq = 13
-# min_read_ani = 0.97
-read_inclusion = "all-mapped"
+min_freq = 0.0
+min_read_ani = 0.95
+read_inclusion = "paired"
+
+[matrix_build]
+storage_mode = "bitmask" # use "counts" for conANI/cosANI
+# count_dtype = "auto"   # valid with storage_mode = "counts"
+min_cov = 5
+memory_limit_gb = 16
+export_batch_mb = 128
+duckdb_export_threads = 1
 
 [matrix_compare]
 calculate = "all"
+ani_method = "popani" # conani and cosani_<threshold> require count matrices
 genome = "all"
 backend = "numpy"
+# min_cov = 5 # normally omit: use the threshold embedded in the matrix
 memory_limit_gb = 32
 anchor_queue_size = 1
 target_queue_size = 2
@@ -514,4 +585,6 @@ MetaTrawl also accepts optional per-stage `environment` and `slurm.extra` tables
 when a real tool or cluster requires them; they are intentionally omitted here
 because the standard pipeline does not require any.
 
-Current ZipStrain profiling receives both `reference.fasta` and `profiling_contract.json`. This preserves the reference-aware profile fields and enables `ref_ani` in imported genome and gene statistics. The `[profile]` section is passed directly to `zipstrain utilities profile-single`; leave `min_read_ani` commented out to disable read-ANI filtering.
+Current ZipStrain profiling receives both `reference.fasta` and `profiling_contract.json`. This preserves the reference-aware profile fields and enables `ref_ani` in imported genome and gene statistics. MetaTrawl follows the ZipStrain 1.x defaults of `min_freq = 0`, `min_read_ani = 0.95`, and `read_inclusion = "paired"`; set `min_read_ani = 0` to disable read-ANI filtering. Genuinely single-end inputs continue to use all mapped reads.
+
+MetaTrawl preserves the expanded ZipStrain 1.x statistics in DuckDB. Genome queries include coverage median and standard deviation, genome length, gap statistics, 5x covered sites, heterogeneity, FUG, mapped reads, population and consensus reference ANI, SNS/SNV counts, presence, and taxonomy when those columns are present in the imported ZipStrain output. Gene queries also retain gene length. Older MetaTrawl databases are migrated in place the next time a writable command opens them.

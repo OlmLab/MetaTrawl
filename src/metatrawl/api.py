@@ -126,7 +126,7 @@ class GenomeView:
         return Query(
             self.db_path,
             """
-            SELECT sample_id, genome, coverage, breadth, ber, ref_ani
+            SELECT *
             FROM genome_stats
             WHERE genome = ?
             ORDER BY sample_id
@@ -144,7 +144,7 @@ class GenomeView:
         return Query(
             self.db_path,
             f"""
-            SELECT sample_id, genome, gene, coverage, breadth, ber, ref_ani
+            SELECT *
             FROM gene_stats
             WHERE {' AND '.join(conditions)}
             ORDER BY sample_id, gene
@@ -194,7 +194,7 @@ class SampleView:
         """Return genome statistics stored for this sample."""
         return self._filtered_query(
             table="genome_stats",
-            columns="sample_id, genome, coverage, breadth, ber, ref_ani",
+            columns="*",
             genome=genome,
             order_by="genome",
         )
@@ -203,7 +203,7 @@ class SampleView:
         """Return gene statistics stored for this sample."""
         return self._filtered_query(
             table="gene_stats",
-            columns="sample_id, genome, gene, coverage, breadth, ber, ref_ani",
+            columns="*",
             genome=genome,
             gene=gene,
             order_by="genome, gene",
