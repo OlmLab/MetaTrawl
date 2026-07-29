@@ -171,6 +171,27 @@ This creates the DuckDB project store. The database tracks SRA runs, imported
 profile rows, genome stats, gene stats, Sylph abundance, and matrix/compare
 bookkeeping.
 
+For projects that only need allele-presence comparisons, initialize an
+`allele-mask` database:
+
+```bash
+metatrawl init \
+  --db metatrawl.duckdb \
+  --profile-storage allele-mask \
+  --profile-min-cov 5
+```
+
+ZipStrain profiling is unchanged and still produces its normal full profile.
+During import, MetaTrawl stores only the covered-position and allele-set masks
+needed by bitmask matrices, plus one shared copy of each cached reference
+scaffold. The temporary full profile is deleted only after this transaction
+commits.
+
+The threshold is part of the database contract and cannot be changed later.
+`allele-mask` supports dense or sparse bitmask matrices, popANI, IBS, and
+gene-level popANI. Count matrices, conANI, cosANI, raw A/C/G/T profile queries,
+and count reconstruction require normal `full` storage.
+
 ### 2. Add SRA Runs
 
 ```bash
@@ -570,7 +591,8 @@ metatrawl profiles import \
   --profile-file outputs/SRR000001.profile.parquet \
   --genome-stats-file outputs/SRR000001.genome_stats.parquet \
   --gene-stats-file outputs/SRR000001.gene_stats.parquet \
-  --sylph-abundance-file outputs/SRR000001.sylph.csv
+  --sylph-abundance-file outputs/SRR000001.sylph.csv \
+  --cache-dir cache
 ```
 
 Or import many samples from a manifest:
@@ -578,7 +600,8 @@ Or import many samples from a manifest:
 ```bash
 metatrawl profiles add \
   --db metatrawl.duckdb \
-  --manifest completed_profiles.csv
+  --manifest completed_profiles.csv \
+  --cache-dir cache
 ```
 
 Manifest columns:
@@ -588,8 +611,27 @@ run_id,profile_file,genome_stats_file,gene_stats_file,sylph_abundance_file
 SRR000001,/path/profile.parquet,/path/genome_stats.parquet,/path/gene_stats.parquet,/path/sylph.csv
 ```
 
-`gene_stats_file` is optional. A run is complete after profile positions, genome
-stats, and Sylph abundance have been imported.
+`gene_stats_file` is optional. `--cache-dir` is required only for an
+`allele-mask` database when a referenced genome has not already been stored.
+A run is complete after its selected profile representation, genome stats, and
+Sylph abundance have been imported.
+
+### Compact An Existing Full Database
+
+DuckDB does not return space to the operating system when a large table is
+dropped, so conversion writes a new database and never modifies the source:
+
+```bash
+metatrawl profiles compact-database \
+  --source-db metatrawl.duckdb \
+  --output-db metatrawl.allele-mask.duckdb \
+  --cache-dir cache \
+  --min-cov 5
+```
+
+The migration commits one sample at a time. Rerun the same command to resume
+after interruption. Do not replace the source until every sample reports
+completion and the new database has been validated.
 
 You can still run the lower-level worker command if you want to manage the
 remaining-runs CSV yourself:
@@ -643,6 +685,11 @@ query.sink_parquet("GCF_000001.profiles.parquet")
 filtered = query.lazy().filter(pl.col("sample_id").is_in(selected_samples))
 ```
 
+Genome stats, gene stats, Sylph abundance, samples, and genomes remain queryable
+in both storage modes. Position-level `profile()` and `profiles()` queries raise
+a clear error for `allele-mask` databases because real A/C/G/T counts were
+deliberately discarded.
+
 ## Controlling concurrency and execution
 
 `sync-profile` and `profile-sra` accept `--workflow-config` with a TOML or JSON file. This separates the number of samples allowed in flight from the concurrency and CPU allocation of each stage. For example, downloads can remain highly parallel while only one Bowtie index build and two alignments run at once:
@@ -661,7 +708,7 @@ Each stage supports `workers`, `threads`, `execution = "local" | "slurm"`, `retr
 
 The configurable stages are `sra_download`, `sylph`, `genome_download`, `prodigal`, `prepare_profile`, `bowtie_build`, `alignment`, `profile`, `matrix_build`, `matrix_compare`, and `genome_view`. Without `--workflow-config`, `--threads` retains the previous profiling behavior.
 
-The same file can configure ZipStrain `profile-single` read filters under `[profile]`: `min_mapq`, `min_baseq`, `min_freq`, `min_read_ani`, and `read_inclusion`. Matrix construction settings belong under `[matrix_build]`: `storage_mode`, `count_dtype`, `min_cov`, `memory_limit_gb`, `export_batch_mb`, and `duckdb_export_threads`. New matrices use compact bitmask storage by default; choose count storage when `conani` or `cosani_<threshold>` is required. Comparison settings under `[matrix_compare]` include `calculate`, `ani_method`, `genome`, `backend`, optional `min_cov`, `memory_limit_gb`, and queue/executor controls. When comparison `min_cov` is omitted, ZipStrain uses the build threshold stored in the HDF5 file. `matrix sync-build` can use `[stages.matrix_build]` to submit one build/append job per genome, `matrix sync-compare` can use `[stages.matrix_compare]` to submit one compare job per matrix, and `sync-genome-views` can use `[stages.genome_view]` to submit one artifact job per genome. Explicit CLI values override the matching TOML values.
+The same file can configure ZipStrain `profile-single` read filters under `[profile]`: `min_mapq`, `min_baseq`, `min_freq`, `min_read_ani`, and `read_inclusion`. Matrix construction settings belong under `[matrix_build]`: `storage_mode`, `count_dtype`, `min_cov`, `memory_limit_gb`, `export_batch_mb`, and `duckdb_export_threads`. New matrices use compact bitmask storage by default; choose count storage when `conani` or `cosani_<threshold>` is required. An `allele-mask` database rejects count storage and any `min_cov` different from its database contract before creating or resizing a matrix. Comparison settings under `[matrix_compare]` include `calculate`, `ani_method`, `genome`, `backend`, optional `min_cov`, `memory_limit_gb`, and queue/executor controls. When comparison `min_cov` is omitted, ZipStrain uses the build threshold stored in the HDF5 file. `matrix sync-build` can use `[stages.matrix_build]` to submit one build/append job per genome, `matrix sync-compare` can use `[stages.matrix_compare]` to submit one compare job per matrix, and `sync-genome-views` can use `[stages.genome_view]` to submit one artifact job per genome. Explicit CLI values override the matching TOML values.
 
 ### Complete TOML template
 

@@ -17,6 +17,7 @@ from metatrawl import cache
 from metatrawl import db as registry
 from metatrawl import genome_views
 from metatrawl import healthcheck
+from metatrawl import migration
 from metatrawl import viewer
 from metatrawl import workflows
 from metatrawl.config import WorkflowConfig, load_workflow_config
@@ -32,11 +33,51 @@ def cli() -> None:
 
 @cli.command("init")
 @click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
-def init(db_file: Path) -> None:
+@click.option(
+    "--profile-storage",
+    type=click.Choice(["full", "allele-mask"]),
+    default=None,
+    help="Durable profile representation. New databases default to full.",
+)
+@click.option(
+    "--profile-min-cov",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Fixed coverage threshold for allele-mask storage. Defaults to 5.",
+)
+def init(
+    db_file: Path,
+    profile_storage: str | None,
+    profile_min_cov: int | None,
+) -> None:
     """Initialize a MetaTrawl project database."""
-    conn = registry.connect(db_file)
-    conn.close()
-    click.echo(f"initialized={db_file}")
+    try:
+        with registry.connect(db_file) as conn:
+            if profile_storage is not None:
+                storage = registry.configure_profile_storage(
+                    conn,
+                    mode=profile_storage,
+                    min_cov=(
+                        profile_min_cov
+                        if profile_storage == "allele-mask" and profile_min_cov is not None
+                        else 5
+                        if profile_storage == "allele-mask"
+                        else profile_min_cov
+                    ),
+                )
+            else:
+                if profile_min_cov is not None:
+                    raise ValueError(
+                        "--profile-min-cov requires --profile-storage allele-mask."
+                    )
+                storage = registry.profile_storage_config(conn)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    threshold = storage.min_cov if storage.min_cov is not None else "NA"
+    click.echo(
+        f"initialized={db_file} profile_storage={storage.mode} "
+        f"profile_min_cov={threshold}"
+    )
 
 
 @cli.group("runs")
@@ -103,6 +144,11 @@ def profiles_remaining(db_file: Path, output_file: Path | None) -> None:
 @click.option("--genome-stats-file", required=True, type=click.Path(path_type=Path), help="ZipStrain genome stats table.")
 @click.option("--gene-stats-file", type=click.Path(path_type=Path), help="Optional ZipStrain gene stats table.")
 @click.option("--sylph-abundance-file", required=True, type=click.Path(path_type=Path), help="Sylph abundance table.")
+@click.option(
+    "--cache-dir",
+    type=click.Path(path_type=Path),
+    help="Genome cache containing genomes/ACCESSION.fna; required by allele-mask imports.",
+)
 @click.option("--add-run", is_flag=True, help="Register run ID before importing if it is missing.")
 def profiles_import(
     db_file: Path,
@@ -111,6 +157,7 @@ def profiles_import(
     genome_stats_file: Path,
     gene_stats_file: Path | None,
     sylph_abundance_file: Path,
+    cache_dir: Path | None,
     add_run: bool,
 ) -> None:
     """Import profile rows, stats, and Sylph abundance into DuckDB."""
@@ -123,7 +170,12 @@ def profiles_import(
     )
     try:
         with registry.connect(db_file) as conn:
-            registry.import_profile_bundle(conn, bundle, add_run_if_missing=add_run)
+            registry.import_profile_bundle(
+                conn,
+                bundle,
+                add_run_if_missing=add_run,
+                cache_dir=cache_dir,
+            )
     except (FileNotFoundError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"imported={run_id}")
@@ -132,13 +184,28 @@ def profiles_import(
 @profiles_group.command("add")
 @click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
 @click.option("--manifest", required=True, type=click.Path(path_type=Path), help="Completed profile manifest CSV.")
+@click.option(
+    "--cache-dir",
+    type=click.Path(path_type=Path),
+    help="Genome cache containing genomes/ACCESSION.fna; required by allele-mask imports.",
+)
 @click.option("--add-runs", is_flag=True, help="Register unknown run IDs before adding profile bundles.")
-def profiles_add(db_file: Path, manifest: Path, add_runs: bool) -> None:
+def profiles_add(
+    db_file: Path,
+    manifest: Path,
+    cache_dir: Path | None,
+    add_runs: bool,
+) -> None:
     """Import completed profile bundles from a manifest CSV."""
     bundles = _read_profile_manifest(manifest)
     try:
         with registry.connect(db_file) as conn:
-            imported = registry.add_profiles(conn, bundles, add_runs_if_missing=add_runs)
+            imported = registry.add_profiles(
+                conn,
+                bundles,
+                add_runs_if_missing=add_runs,
+                cache_dir=cache_dir,
+            )
     except (FileNotFoundError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"imported={imported}")
@@ -152,9 +219,64 @@ def profiles_list(db_file: Path) -> None:
         rows = registry.list_profiles(conn)
     _print_rows(
         rows,
-        columns=["run_id", "profile_file", "genome_stats_file", "gene_stats_file", "sylph_abundance_file"],
+        columns=[
+            "run_id",
+            "profile_storage_mode",
+            "profile_min_cov",
+            "profile_file",
+            "genome_stats_file",
+            "gene_stats_file",
+            "sylph_abundance_file",
+        ],
         title="Profiles",
     )
+
+
+@profiles_group.command("compact-database")
+@click.option("--source-db", required=True, type=click.Path(path_type=Path), help="Existing full-profile MetaTrawl database.")
+@click.option("--output-db", required=True, type=click.Path(path_type=Path), help="New or resumable allele-mask database.")
+@click.option("--cache-dir", required=True, type=click.Path(path_type=Path), help="Genome cache containing genomes/ACCESSION.fna.")
+@click.option("--min-cov", type=click.IntRange(min=1), default=5, show_default=True, help="Immutable allele-mask coverage threshold.")
+def profiles_compact_database(
+    source_db: Path,
+    output_db: Path,
+    cache_dir: Path,
+    min_cov: int,
+) -> None:
+    """Create or resume an allele-mask copy of a full-profile database."""
+    logger = WorkflowLogger()
+
+    def report(event: dict[str, object]) -> None:
+        payload = dict(event)
+        status_value = str(payload.pop("phase", "progress"))
+        sample_id = payload.pop("sample_id", None)
+        logger.emit(
+            sample=str(sample_id) if sample_id is not None else None,
+            step="profile-compaction",
+            status=status_value,
+            **payload,
+        )
+
+    try:
+        summary = migration.migrate_full_database(
+            source_db=source_db,
+            output_db=output_db,
+            cache_dir=cache_dir,
+            min_cov=min_cov,
+            progress_callback=report,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        f"profile-compaction total={summary.total_samples} "
+        f"completed={summary.completed_samples} migrated={summary.migrated_samples} "
+        f"failed={summary.failed_samples} output={output_db}"
+    )
+    if summary.failed_samples:
+        raise click.ClickException(
+            "Profile compaction completed with failed samples; rerun the same "
+            "command after addressing the reported errors."
+        )
 
 
 @cli.group("cache")
@@ -418,7 +540,7 @@ def matrix_group() -> None:
 @click.option("--sparse", is_flag=True, help="Store matrices using ZipStrain's sparse HDF5 matrix layout.")
 @click.option("--storage-mode", type=click.Choice(["bitmask", "counts"]), default=None, help="Matrix values to store. Defaults to compact bitmasks.")
 @click.option("--count-dtype", type=click.Choice(["auto", "uint16", "uint32"]), default=None, help="Count dtype when --storage-mode counts is used.")
-@click.option("--matrix-min-cov", type=click.IntRange(min=1), default=5, show_default=True, help="Per-position coverage filter embedded in the matrix.")
+@click.option("--matrix-min-cov", type=click.IntRange(min=1), default=None, help="Per-position coverage filter embedded in the matrix. Defaults to 5 or the database's allele-mask threshold.")
 @click.option("--min-coverage", type=float, default=None)
 @click.option("--min-breadth", type=float, default=None)
 @click.option("--min-ber", type=float, default=None)
@@ -438,7 +560,7 @@ def matrix_build(
     sparse: bool,
     storage_mode: str | None,
     count_dtype: str | None,
-    matrix_min_cov: int,
+    matrix_min_cov: int | None,
     min_coverage: float | None,
     min_breadth: float | None,
     min_ber: float | None,
@@ -456,6 +578,14 @@ def matrix_build(
     )
     try:
         with registry.connect(db_file) as conn:
+            profile_storage = registry.profile_storage_config(conn)
+            resolved_min_cov = (
+                matrix_min_cov
+                if matrix_min_cov is not None
+                else profile_storage.min_cov
+                if profile_storage.mode == "allele-mask"
+                else 5
+            )
             store = workflows.build_matrix_from_database(
                 conn,
                 output_file=output_file,
@@ -469,7 +599,7 @@ def matrix_build(
                 sparse=sparse,
                 storage_mode=storage_mode,
                 count_dtype=count_dtype,
-                min_cov=matrix_min_cov,
+                min_cov=resolved_min_cov,
                 memory_limit_gb=memory_limit_gb,
                 export_batch_mb=export_batch_mb,
                 duckdb_export_threads=duckdb_export_threads,
@@ -537,6 +667,7 @@ def matrix_sync_build(
     try:
         with registry.connect_read_only(db_file) as conn:
             selected_genomes = list(genomes) if genomes else registry.genomes_with_complete_samples(conn)
+            profile_storage = registry.profile_storage_config(conn)
         execution_config = load_workflow_config(workflow_config, threads=1, sample_count=max(1, len(selected_genomes)))
         (
             resolved_memory_limit_gb,
@@ -554,6 +685,12 @@ def matrix_sync_build(
             count_dtype=count_dtype,
             min_cov=matrix_min_cov,
         )
+        if (
+            matrix_min_cov is None
+            and execution_config.matrix_build.min_cov is None
+            and profile_storage.mode == "allele-mask"
+        ):
+            resolved_matrix_min_cov = int(profile_storage.min_cov)
         if workflow_config is not None and _should_dispatch_stage(execution_config, "matrix_build") and not no_register:
             summary = _dispatch_matrix_sync_build_jobs(
                 db_file=db_file,

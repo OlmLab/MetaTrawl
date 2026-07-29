@@ -9,6 +9,12 @@ from typing import Any
 import duckdb
 import polars as pl
 
+from metatrawl import db as registry
+
+
+class ProfileCountsUnavailableError(RuntimeError):
+    """Raised when a query needs counts discarded by allele-mask storage."""
+
 
 class MetaTrawlDatabase:
     """Read data from a MetaTrawl DuckDB database."""
@@ -154,6 +160,7 @@ class GenomeView:
 
     def profiles(self, gene: str | None = None) -> Query:
         """Return profile positions across samples."""
+        _require_full_profile_storage(self.db_path)
         conditions = ["genome = ?"]
         parameters: list[Any] = [self.genome]
         if gene is not None:
@@ -211,6 +218,7 @@ class SampleView:
 
     def profile(self, genome: str | None = None, gene: str | None = None) -> Query:
         """Return profile positions stored for this sample."""
+        _require_full_profile_storage(self.db_path)
         return self._filtered_query(
             table="profile_positions",
             columns="sample_id, chrom, pos, genome, gene, A, C, G, T, ref_base_bitmask",
@@ -270,6 +278,17 @@ class SampleView:
 def open_database(db_path: str | Path) -> MetaTrawlDatabase:
     """Open a MetaTrawl database for genome- and sample-centric queries."""
     return MetaTrawlDatabase(db_path)
+
+
+def _require_full_profile_storage(db_path: Path) -> None:
+    with duckdb.connect(str(db_path), read_only=True) as conn:
+        storage = registry.profile_storage_config(conn)
+    if storage.mode == "allele-mask":
+        raise ProfileCountsUnavailableError(
+            "This database uses allele-mask profile storage and does not retain "
+            "A/C/G/T counts. Genome and gene statistics remain queryable; build "
+            "a bitmask matrix for popANI comparisons."
+        )
 
 
 def _required_text(value: str, name: str) -> str:

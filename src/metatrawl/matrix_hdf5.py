@@ -16,6 +16,7 @@ import duckdb
 import numpy as np
 import polars as pl
 
+from metatrawl import allele_mask
 from metatrawl import db
 
 BuildProgressCallback = Callable[[dict[str, object]], None]
@@ -127,6 +128,11 @@ def build_matrix_hdf5_from_duckdb(
 ) -> DirectMatrixBuildSummary:
     """Build a ZipStrain-compatible HDF5 matrix directly from MetaTrawl DuckDB rows."""
     storage_mode = _resolve_storage_mode(storage_mode=storage_mode, count_dtype=count_dtype)
+    profile_storage = _validate_profile_storage_for_matrix(
+        conn,
+        storage_mode=storage_mode,
+        min_cov=min_cov,
+    )
     count_dtype = _resolve_count_dtype(
         conn,
         storage_mode=storage_mode,
@@ -198,6 +204,7 @@ def build_matrix_hdf5_from_duckdb(
             stb_file=stb_file,
             gene_range_table=gene_range_table,
             has_gene_ranges=bool(gene_ranges),
+            profile_format=_matrix_profile_format(profile_storage),
         )
         scaffolds_by_genome_idx = _group_scaffolds_by_genome(genome_scaffolds)
         with h5py.File(str(tmp_output), "w") as handle:
@@ -297,6 +304,11 @@ def append_matrix_hdf5_from_duckdb(
         storage_mode = _storage_mode_from_metadata(metadata)
         count_dtype = str(metadata.get("count_dtype", "uint16"))
         min_cov = int(metadata.get("coverage_filter_min_cov", MATRIX_BUILD_MIN_COV))
+        _validate_profile_storage_for_matrix(
+            conn,
+            storage_mode=storage_mode,
+            min_cov=min_cov,
+        )
         layout = str(metadata.get("layout", CURRENT_MATRIX_HDF5_LAYOUT))
         genome_scope = str(metadata.get("genome_scope", "all"))
         sparse = layout in {CURRENT_MATRIX_HDF5_SPARSE_LAYOUT, CURRENT_MATRIX_HDF5_SPARSE_BITMASK_LAYOUT}
@@ -391,6 +403,18 @@ def _load_duckdb_sample_genome_matrix(
     storage_mode: str,
     min_cov: int,
 ) -> np.ndarray:
+    profile_storage = db.profile_storage_config(conn)
+    if profile_storage.mode == allele_mask.PROFILE_STORAGE_ALLELE_MASK:
+        if storage_mode != MATRIX_STORAGE_BITMASK:
+            raise ValueError(
+                "Allele-mask profile storage can only build bitmask matrices."
+            )
+        return _load_allele_mask_sample_genome_matrix(
+            conn,
+            sample_id=sample_id,
+            genome_spec=genome_spec,
+            genome_offsets=genome_offsets,
+        )
     if storage_mode == MATRIX_STORAGE_BITMASK:
         matrix = np.zeros((genome_spec.matrix_length,), dtype=np.uint8)
     else:
@@ -431,6 +455,54 @@ def _load_duckdb_sample_genome_matrix(
                     f"does not fit {count_dtype}."
                 )
             matrix[axis_pos, :] = counts
+    return matrix
+
+
+def _load_allele_mask_sample_genome_matrix(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    sample_id: str,
+    genome_spec: GenomeSpec,
+    genome_offsets: list[GenomeScaffoldOffset],
+) -> np.ndarray:
+    """Decode compact blocks directly into ZipStrain's bitmask matrix axis."""
+    matrix = np.zeros((genome_spec.matrix_length,), dtype=np.uint8)
+    offsets_by_chrom = {offset.chrom: offset for offset in genome_offsets}
+    for block in allele_mask.iter_decoded_profile_blocks(
+        conn,
+        sample_id=sample_id,
+        genome=genome_spec.genome,
+    ):
+        offset = offsets_by_chrom.get(block.chrom)
+        if offset is None:
+            if np.any(block.masks):
+                raise ValueError(
+                    f"Allele-mask sample {sample_id} has scaffold {block.chrom} "
+                    f"outside matrix contract for genome {genome_spec.genome}."
+                )
+            continue
+        block_end = block.start_pos + int(block.masks.size) - 1
+        before = max(0, offset.min_pos - block.start_pos)
+        after = max(0, block_end - offset.max_pos)
+        if before and np.any(block.masks[:before]):
+            raise ValueError(
+                f"Allele-mask sample {sample_id} has positions before the matrix "
+                f"range for {genome_spec.genome}/{block.chrom}."
+            )
+        if after and np.any(block.masks[block.masks.size - after :]):
+            raise ValueError(
+                f"Allele-mask sample {sample_id} has positions after the matrix "
+                f"range for {genome_spec.genome}/{block.chrom}."
+            )
+        overlap_start = max(block.start_pos, offset.min_pos)
+        overlap_end = min(block_end, offset.max_pos)
+        if overlap_end < overlap_start:
+            continue
+        source_start = overlap_start - block.start_pos
+        source_stop = overlap_end - block.start_pos + 1
+        target_start = offset.axis_start + overlap_start - offset.index_base
+        target_stop = target_start + source_stop - source_start
+        matrix[target_start:target_stop] = block.masks[source_start:source_stop]
     return matrix
 
 
@@ -533,10 +605,11 @@ def _metadata_rows(
     stb_file: Path,
     gene_range_table: Path | None,
     has_gene_ranges: bool,
+    profile_format: str,
 ) -> dict[str, str]:
     rows = {
         "profiles_dir": "metatrawl_duckdb",
-        "profile_format": "metatrawl_duckdb_profile_positions",
+        "profile_format": profile_format,
         "genome_scope": genome,
         "storage_mode": storage_mode,
         "matrix_dtype": BITMASK_DTYPE_NAME if storage_mode == MATRIX_STORAGE_BITMASK else count_dtype,
@@ -695,6 +768,19 @@ def _collect_gene_range_specs(*, gene_range_table: Path, genome_scaffolds: list[
 def _observed_genomes_for_samples(conn: duckdb.DuckDBPyConnection, *, sample_ids: list[str], genome: str | None) -> set[str]:
     if not sample_ids:
         return set()
+    storage = db.profile_storage_config(conn)
+    if storage.mode == allele_mask.PROFILE_STORAGE_ALLELE_MASK:
+        if genome is not None:
+            return {genome}
+        rows = conn.execute(
+            """
+            SELECT DISTINCT genome
+            FROM genome_stats
+            WHERE sample_id IN (SELECT unnest(?))
+            """,
+            [sample_ids],
+        ).fetchall()
+        return {str(row[0]) for row in rows}
     conditions = ["sample_id IN (SELECT unnest(?))"]
     params: list[object] = [sample_ids]
     if genome is not None:
@@ -702,6 +788,35 @@ def _observed_genomes_for_samples(conn: duckdb.DuckDBPyConnection, *, sample_ids
         params.append(genome)
     rows = conn.execute(f"SELECT DISTINCT genome FROM profile_positions WHERE {' AND '.join(conditions)}", params).fetchall()
     return {str(row[0]) for row in rows}
+
+
+def _validate_profile_storage_for_matrix(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    storage_mode: str,
+    min_cov: int,
+) -> db.ProfileStorageConfig:
+    storage = db.profile_storage_config(conn)
+    if storage.mode != allele_mask.PROFILE_STORAGE_ALLELE_MASK:
+        return storage
+    if storage_mode != MATRIX_STORAGE_BITMASK:
+        raise ValueError(
+            "Allele-mask profile storage can only build bitmask matrices; "
+            "A/C/G/T counts are not stored."
+        )
+    if min_cov != storage.min_cov:
+        raise ValueError(
+            f"This allele-mask database was stored with min_cov={storage.min_cov}; "
+            f"matrix min_cov={min_cov} cannot be used. Rebuild the profile database "
+            "to change the threshold."
+        )
+    return storage
+
+
+def _matrix_profile_format(storage: db.ProfileStorageConfig) -> str:
+    if storage.mode == allele_mask.PROFILE_STORAGE_ALLELE_MASK:
+        return f"metatrawl_allele_mask_v{storage.format_version}"
+    return "metatrawl_duckdb_profile_positions"
 
 
 def _configure_duckdb_for_matrix(conn: duckdb.DuckDBPyConnection, *, memory_limit_gb: float | None, threads: int) -> None:

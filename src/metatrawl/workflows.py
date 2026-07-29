@@ -752,7 +752,7 @@ def sync_remaining_profiles(
                 logger.emit(sample=run_id, step="import", status="missing-output", error=exc)
                 raise
             logger.emit(sample=run_id, step="import", status="start")
-            db.import_profile_bundle(conn, bundle)
+            db.import_profile_bundle(conn, bundle, cache_dir=cache_dir)
             imported += 1
             logger.emit(sample=run_id, step="import", status="done", imported=imported)
             if cleanup_outputs:

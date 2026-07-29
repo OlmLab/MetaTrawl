@@ -11,6 +11,8 @@ from typing import Callable
 import duckdb
 import polars as pl
 
+from metatrawl import allele_mask
+
 
 ExportProgressCallback = Callable[[dict[str, object]], None]
 ACCESSION_PATTERN = re.compile(r"(GC[AF]_\d+(?:\.\d+)?)", re.IGNORECASE)
@@ -39,6 +41,8 @@ CREATE TABLE IF NOT EXISTS profiles (
     genome_stats_file VARCHAR NOT NULL,
     gene_stats_file VARCHAR,
     sylph_abundance_file VARCHAR NOT NULL,
+    profile_storage_mode VARCHAR NOT NULL DEFAULT 'full',
+    profile_min_cov INTEGER,
     created_at DOUBLE NOT NULL,
     updated_at DOUBLE NOT NULL
 );
@@ -54,6 +58,47 @@ CREATE TABLE IF NOT EXISTS profile_positions (
     G USMALLINT NOT NULL,
     T USMALLINT NOT NULL,
     ref_base_bitmask UTINYINT
+);
+
+CREATE TABLE IF NOT EXISTS profile_storage (
+    id UTINYINT PRIMARY KEY CHECK (id = 1),
+    mode VARCHAR NOT NULL,
+    format_version INTEGER NOT NULL,
+    min_cov INTEGER,
+    codec VARCHAR,
+    allele_bit_order VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS allele_mask_reference_segments (
+    segment_id UBIGINT PRIMARY KEY,
+    genome VARCHAR NOT NULL,
+    chrom VARCHAR NOT NULL,
+    segment_ordinal INTEGER NOT NULL,
+    start_pos BIGINT NOT NULL,
+    span BIGINT NOT NULL,
+    reference_mask BLOB NOT NULL,
+    reference_hash VARCHAR NOT NULL,
+    UNIQUE (genome, chrom)
+);
+
+CREATE TABLE IF NOT EXISTS allele_mask_profile_blocks (
+    sample_id VARCHAR NOT NULL,
+    segment_id UBIGINT NOT NULL,
+    presence BLOB NOT NULL,
+    deviation BLOB NOT NULL,
+    covered_positions BIGINT NOT NULL,
+    payload_hash VARCHAR NOT NULL,
+    PRIMARY KEY (sample_id, segment_id)
+);
+
+CREATE TABLE IF NOT EXISTS allele_mask_migration_state (
+    sample_id VARCHAR PRIMARY KEY,
+    status VARCHAR NOT NULL,
+    source_rows BIGINT,
+    compressed_blocks BIGINT,
+    covered_positions BIGINT,
+    error VARCHAR,
+    updated_at DOUBLE NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS genome_stats (
@@ -169,6 +214,17 @@ class MatrixFilters:
     min_sylph_abundance: float | None = None
 
 
+@dataclass(frozen=True)
+class ProfileStorageConfig:
+    """Immutable profile representation selected for one project database."""
+
+    mode: str = allele_mask.PROFILE_STORAGE_FULL
+    format_version: int = allele_mask.ALLELE_MASK_FORMAT_VERSION
+    min_cov: int | None = None
+    codec: str | None = None
+    allele_bit_order: str | None = None
+
+
 def connect(db_path: str | Path) -> duckdb.DuckDBPyConnection:
     """Open a DuckDB connection and ensure the MetaTrawl schema exists."""
     path = Path(db_path)
@@ -189,6 +245,11 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute(SCHEMA_SQL)
     conn.execute("ALTER TABLE sra_runs ADD COLUMN IF NOT EXISTS status VARCHAR DEFAULT 'added'")
     conn.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS gene_stats_file VARCHAR")
+    conn.execute(
+        "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS "
+        "profile_storage_mode VARCHAR DEFAULT 'full'"
+    )
+    conn.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS profile_min_cov INTEGER")
     conn.execute("ALTER TABLE profile_positions ADD COLUMN IF NOT EXISTS ref_base_bitmask UTINYINT")
     conn.execute("ALTER TABLE genome_stats ADD COLUMN IF NOT EXISTS ref_ani DOUBLE")
     conn.execute("ALTER TABLE genome_stats ADD COLUMN IF NOT EXISTS coverage_median DOUBLE")
@@ -212,6 +273,15 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("ALTER TABLE matrix_stores ADD COLUMN IF NOT EXISTS min_breadth DOUBLE")
     conn.execute("ALTER TABLE matrix_stores ADD COLUMN IF NOT EXISTS min_ber DOUBLE")
     conn.execute("ALTER TABLE matrix_stores ADD COLUMN IF NOT EXISTS min_sylph_abundance DOUBLE")
+    conn.execute(
+        """
+        INSERT INTO profile_storage
+          (id, mode, format_version, min_cov, codec, allele_bit_order)
+        SELECT 1, 'full', ?, NULL, NULL, NULL
+        WHERE NOT EXISTS (SELECT 1 FROM profile_storage WHERE id = 1)
+        """,
+        [allele_mask.ALLELE_MASK_FORMAT_VERSION],
+    )
     _migrate_profile_counts_to_uint16(conn)
     _normalize_existing_sylph_genomes(conn)
     if had_legacy_matrix_profiles:
@@ -222,6 +292,118 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             FROM matrix_store_profiles
             """
         )
+
+
+def profile_storage_config(conn: duckdb.DuckDBPyConnection) -> ProfileStorageConfig:
+    """Return the database profile-storage contract.
+
+    Databases created by older MetaTrawl versions have no contract table and are
+    therefore interpreted as full-profile databases.
+    """
+    if not _table_exists(conn, "profile_storage"):
+        return ProfileStorageConfig()
+    row = conn.execute(
+        """
+        SELECT mode, format_version, min_cov, codec, allele_bit_order
+        FROM profile_storage
+        WHERE id = 1
+        """
+    ).fetchone()
+    if row is None:
+        return ProfileStorageConfig()
+    mode = str(row[0])
+    if mode not in allele_mask.PROFILE_STORAGE_MODES:
+        raise ValueError(f"Unsupported database profile storage mode: {mode}")
+    config = ProfileStorageConfig(
+        mode=mode,
+        format_version=int(row[1]),
+        min_cov=int(row[2]) if row[2] is not None else None,
+        codec=str(row[3]) if row[3] is not None else None,
+        allele_bit_order=str(row[4]) if row[4] is not None else None,
+    )
+    if mode == allele_mask.PROFILE_STORAGE_ALLELE_MASK:
+        if config.format_version != allele_mask.ALLELE_MASK_FORMAT_VERSION:
+            raise ValueError(
+                "Unsupported allele-mask format version: "
+                f"{config.format_version}; expected {allele_mask.ALLELE_MASK_FORMAT_VERSION}."
+            )
+        if config.min_cov is None or config.min_cov < 1:
+            raise ValueError("Allele-mask database has no valid fixed min_cov.")
+        if config.codec != allele_mask.ALLELE_MASK_CODEC:
+            raise ValueError(f"Unsupported allele-mask codec: {config.codec}")
+        if config.allele_bit_order != allele_mask.ALLELE_MASK_BIT_ORDER:
+            raise ValueError(
+                f"Unsupported allele-mask bit order: {config.allele_bit_order}"
+            )
+    return config
+
+
+def configure_profile_storage(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    mode: str,
+    min_cov: int | None = None,
+) -> ProfileStorageConfig:
+    """Set profile storage before any samples have been imported."""
+    if mode not in allele_mask.PROFILE_STORAGE_MODES:
+        raise ValueError(
+            "profile storage must be one of: "
+            + ", ".join(allele_mask.PROFILE_STORAGE_MODES)
+        )
+    if mode == allele_mask.PROFILE_STORAGE_ALLELE_MASK:
+        if min_cov is None or min_cov < 1:
+            raise ValueError("Allele-mask profile storage requires --profile-min-cov >= 1.")
+    elif min_cov is not None:
+        raise ValueError("--profile-min-cov can only be used with allele-mask storage.")
+
+    current = profile_storage_config(conn)
+    requested = ProfileStorageConfig(
+        mode=mode,
+        format_version=allele_mask.ALLELE_MASK_FORMAT_VERSION,
+        min_cov=min_cov,
+        codec=(
+            allele_mask.ALLELE_MASK_CODEC
+            if mode == allele_mask.PROFILE_STORAGE_ALLELE_MASK
+            else None
+        ),
+        allele_bit_order=(
+            allele_mask.ALLELE_MASK_BIT_ORDER
+            if mode == allele_mask.PROFILE_STORAGE_ALLELE_MASK
+            else None
+        ),
+    )
+    if current == requested:
+        return current
+    stored_profiles = int(
+        conn.execute(
+            """
+            SELECT
+              (SELECT count(*) FROM samples)
+              + (SELECT count(*) FROM profile_positions)
+              + (SELECT count(*) FROM allele_mask_profile_blocks)
+            """
+        ).fetchone()[0]
+    )
+    if stored_profiles:
+        raise ValueError(
+            f"Cannot change profile storage from {current.mode} to {mode} after "
+            "samples have been imported. Create a new database instead."
+        )
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO profile_storage
+          (id, mode, format_version, min_cov, codec, allele_bit_order)
+        VALUES (1, ?, ?, ?, ?, ?)
+        """,
+        [
+            requested.mode,
+            requested.format_version,
+            requested.min_cov,
+            requested.codec,
+            requested.allele_bit_order,
+        ],
+    )
+    return requested
 
 
 def add_runs(conn: duckdb.DuckDBPyConnection, run_ids: list[str]) -> tuple[int, int]:
@@ -309,6 +491,7 @@ def import_profile_bundle(
     bundle: ProfileBundle,
     *,
     add_run_if_missing: bool = False,
+    cache_dir: Path | None = None,
 ) -> None:
     """Import profile, stat, and abundance files into project tables."""
     if conn.execute("SELECT 1 FROM sra_runs WHERE run_id = ?", [bundle.run_id]).fetchone() is None:
@@ -323,14 +506,32 @@ def import_profile_bundle(
 
     sample_id = bundle.run_id
     now = time.time()
+    storage = profile_storage_config(conn)
     conn.execute("BEGIN TRANSACTION")
     try:
         conn.execute("DELETE FROM profile_positions WHERE sample_id = ?", [sample_id])
+        conn.execute(
+            "DELETE FROM allele_mask_profile_blocks WHERE sample_id = ?",
+            [sample_id],
+        )
         conn.execute("DELETE FROM genome_stats WHERE sample_id = ?", [sample_id])
         conn.execute("DELETE FROM gene_stats WHERE sample_id = ?", [sample_id])
         conn.execute("DELETE FROM sylph_abundance WHERE sample_id = ?", [sample_id])
 
-        _insert_profile_positions(conn, sample_id=sample_id, profile_file=bundle.profile_file)
+        if storage.mode == allele_mask.PROFILE_STORAGE_ALLELE_MASK:
+            allele_mask.store_profile_parquet(
+                conn,
+                sample_id=sample_id,
+                profile_file=bundle.profile_file,
+                min_cov=int(storage.min_cov),
+                cache_dir=cache_dir,
+            )
+        else:
+            _insert_profile_positions(
+                conn,
+                sample_id=sample_id,
+                profile_file=bundle.profile_file,
+            )
         _insert_genome_stats(conn, sample_id=sample_id, stats_file=bundle.genome_stats_file)
         if bundle.gene_stats_file is not None:
             _insert_gene_stats(conn, sample_id=sample_id, stats_file=bundle.gene_stats_file)
@@ -347,8 +548,10 @@ def import_profile_bundle(
         conn.execute(
             """
             INSERT OR REPLACE INTO profiles
-              (run_id, profile_file, genome_stats_file, gene_stats_file, sylph_abundance_file, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+              (run_id, profile_file, genome_stats_file, gene_stats_file,
+               sylph_abundance_file, profile_storage_mode, profile_min_cov,
+               created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 bundle.run_id,
@@ -356,6 +559,8 @@ def import_profile_bundle(
                 str(bundle.genome_stats_file),
                 str(bundle.gene_stats_file) if bundle.gene_stats_file is not None else None,
                 str(bundle.sylph_abundance_file),
+                storage.mode,
+                storage.min_cov,
                 profile_created_at,
                 now,
             ],
@@ -375,10 +580,16 @@ def add_profiles(
     bundles: list[ProfileBundle],
     *,
     add_runs_if_missing: bool = False,
+    cache_dir: Path | None = None,
 ) -> int:
     """Import completed profile bundles by SRA run ID."""
     for bundle in bundles:
-        import_profile_bundle(conn, bundle, add_run_if_missing=add_runs_if_missing)
+        import_profile_bundle(
+            conn,
+            bundle,
+            add_run_if_missing=add_runs_if_missing,
+            cache_dir=cache_dir,
+        )
     return len(bundles)
 
 
@@ -387,7 +598,9 @@ def list_profiles(conn: duckdb.DuckDBPyConnection) -> list[dict[str, object]]:
     return _rows_as_dicts(
         conn.execute(
             """
-            SELECT run_id, profile_file, genome_stats_file, gene_stats_file, sylph_abundance_file, created_at, updated_at
+            SELECT run_id, profile_file, genome_stats_file, gene_stats_file,
+                   sylph_abundance_file, profile_storage_mode, profile_min_cov,
+                   created_at, updated_at
             FROM profiles
             ORDER BY run_id
             """
@@ -525,6 +738,12 @@ def export_profile_parquets(
     progress_callback: ExportProgressCallback | None = None,
 ) -> list[Path]:
     """Export selected samples from DuckDB into temporary ZipStrain profile parquets."""
+    storage = profile_storage_config(conn)
+    if storage.mode == allele_mask.PROFILE_STORAGE_ALLELE_MASK:
+        raise ValueError(
+            "Allele-mask databases do not contain reconstructable A/C/G/T counts. "
+            "Build a bitmask matrix directly instead."
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     _configure_duckdb_export(conn, output_dir=output_dir, memory_limit_gb=memory_limit_gb, threads=duckdb_threads)
     row_group_size = _export_row_group_size(export_batch_mb)
@@ -751,20 +970,31 @@ def register_matrix_compare(
     )
 
 
-def registry_status(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
+def registry_status(conn: duckdb.DuckDBPyConnection) -> dict[str, object]:
     """Return high-level registry counts."""
     active_runs = conn.execute("SELECT count(*) FROM sra_runs WHERE deleted_at IS NULL").fetchone()[0]
     deleted_runs = conn.execute("SELECT count(*) FROM sra_runs WHERE deleted_at IS NOT NULL").fetchone()[0]
     samples = conn.execute("SELECT count(*) FROM samples WHERE status = 'complete'").fetchone()[0]
     profile_rows = conn.execute("SELECT count(*) FROM profile_positions").fetchone()[0]
+    allele_mask_blocks = conn.execute(
+        "SELECT count(*) FROM allele_mask_profile_blocks"
+    ).fetchone()[0]
+    allele_mask_positions = conn.execute(
+        "SELECT COALESCE(sum(covered_positions), 0) FROM allele_mask_profile_blocks"
+    ).fetchone()[0]
     matrices = conn.execute("SELECT count(*) FROM matrix_stores").fetchone()[0]
     compares = conn.execute("SELECT count(*) FROM matrix_compares").fetchone()[0]
     remaining = len(remaining_runs(conn))
+    storage = profile_storage_config(conn)
     return {
         "active_runs": int(active_runs),
         "deleted_runs": int(deleted_runs),
         "complete_samples": int(samples),
         "profile_rows": int(profile_rows),
+        "profile_storage": storage.mode,
+        "profile_min_cov": storage.min_cov if storage.min_cov is not None else "NA",
+        "allele_mask_blocks": int(allele_mask_blocks),
+        "allele_mask_positions": int(allele_mask_positions),
         "remaining_profiles": remaining,
         "matrix_stores": int(matrices),
         "matrix_compares": int(compares),
