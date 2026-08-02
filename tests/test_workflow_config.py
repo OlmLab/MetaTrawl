@@ -39,6 +39,14 @@ ani_method = "conani"
 memory_limit_gb = 48.5
 target_queue_size = 3
 loader_executor_kind = "process"
+[genome_view]
+min_comp_len = 20000
+impute_ani = 96.5
+max_null_fraction = 0.25
+linkage_method = "complete"
+neighbor_k = 15
+clonal_cluster_threshold = 99.95
+strain_cluster_threshold = 99.75
 [profile]
 min_mapq = 20
 min_baseq = 25
@@ -67,6 +75,14 @@ read_inclusion = "proper-pairs"
     assert config.matrix_compare.ani_method == "conani"
     assert config.matrix_compare.memory_limit_gb == 48.5
     assert config.matrix_compare.kwargs() == {"target_queue_size": 3, "loader_executor_kind": "process"}
+    assert config.genome_view.min_comp_len == 20_000
+    assert config.genome_view.impute_ani == 96.5
+    assert config.genome_view.max_null_fraction == 0.25
+    assert config.genome_view.max_null_samples is None
+    assert config.genome_view.linkage_method == "complete"
+    assert config.genome_view.neighbor_k == 15
+    assert config.genome_view.clonal_cluster_threshold == 99.95
+    assert config.genome_view.strain_cluster_threshold == 99.75
     assert config.profile.min_mapq == 20
     assert config.profile.min_baseq == 25
     assert config.profile.min_freq == 0.02
@@ -133,6 +149,13 @@ def test_config_rejects_invalid_profile_read_inclusion(tmp_path: Path) -> None:
     path = tmp_path / "workflow.toml"
     path.write_text('[profile]\nread_inclusion = "mapped"\n')
     with pytest.raises(ValueError, match="profile.read_inclusion must be one of"):
+        load_workflow_config(path, threads=2, sample_count=2)
+
+
+def test_config_rejects_invalid_genome_view_null_fraction(tmp_path: Path) -> None:
+    path = tmp_path / "workflow.toml"
+    path.write_text("[genome_view]\nmax_null_fraction = 1.1\n")
+    with pytest.raises(ValueError, match="genome_view.max_null_fraction must be between 0 and 1"):
         load_workflow_config(path, threads=2, sample_count=2)
 
 

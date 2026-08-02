@@ -363,6 +363,14 @@ metatrawl sync-genome-views \
   --view-dir genome_views
 ```
 
+By default, a sample is retained when no more than 20% of its comparisons for
+that genome are missing after applying `--min-comp-len`. This genome-relative
+rule scales from small to very large matrices; configure it with
+`--max-null-fraction` or `[genome_view].max_null_fraction`. Use
+`--max-null-samples` only when an explicit absolute limit is desired. DuckDB
+computes connectivity from compact integer sample indices before retained pair
+values are transferred to Python.
+
 Each `genome_views/<genome>/` bundle is a versioned, self-contained web and
 analysis snapshot. A web client starts at `genome_views/catalog.json`, follows
 the genome's `manifest.json`, and then loads only the artifacts needed for the
@@ -830,6 +838,16 @@ target_queue_size = 2
 result_transfer_batch_size = 512
 loader_executor_kind = "thread"
 writer_executor_kind = "thread"
+
+[genome_view]
+min_comp_len = 10000
+impute_ani = 97.0
+max_null_fraction = 0.20
+# max_null_samples = 500 # optional absolute override
+linkage_method = "average"
+neighbor_k = 20
+clonal_cluster_threshold = 99.93
+strain_cluster_threshold = 99.8
 ```
 
 The values above are an example allocation, not universal defaults. Tune

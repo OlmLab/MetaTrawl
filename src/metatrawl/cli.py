@@ -1239,13 +1239,14 @@ def view_genomes(view_dir: Path, host: str, port: int, open_browser: bool) -> No
 @click.option("--compare-dir", required=True, type=click.Path(path_type=Path), help="Directory containing per-genome compare DuckDB files.")
 @click.option("--view-dir", required=True, type=click.Path(path_type=Path), help="Directory for self-contained per-genome view bundles.")
 @click.option("--genome", "genomes", multiple=True, help="Optional genome to sync. Repeat for multiple genomes.")
-@click.option("--min-comp-len", type=click.IntRange(min=0), default=10_000, show_default=True, help="Minimum shared positions used for clustering.")
-@click.option("--impute-ani", type=click.FloatRange(min=0, max=100), default=97.0, show_default=True, help="ANI assigned to missing comparisons.")
-@click.option("--max-null-samples", type=click.IntRange(min=0), default=500, show_default=True, help="Maximum missing comparisons allowed per sample.")
-@click.option("--linkage-method", type=click.Choice(genome_views.SUPPORTED_LINKAGE_METHODS), default="average", show_default=True)
-@click.option("--neighbor-k", type=click.IntRange(min=1), default=20, show_default=True, help="Nearest neighbors retained for each sample.")
-@click.option("--clonal-cluster-threshold", type=click.FloatRange(min=0, max=100), default=99.93, show_default=True)
-@click.option("--strain-cluster-threshold", type=click.FloatRange(min=0, max=100), default=99.8, show_default=True)
+@click.option("--min-comp-len", type=click.IntRange(min=0), default=None, help="Minimum shared positions used for clustering; default 10000 or [genome_view].")
+@click.option("--impute-ani", type=click.FloatRange(min=0, max=100), default=None, help="ANI assigned to missing comparisons; default 97 or [genome_view].")
+@click.option("--max-null-fraction", type=click.FloatRange(min=0, max=1), default=None, help="Maximum missing-comparison fraction per sample; default 0.2 or [genome_view].")
+@click.option("--max-null-samples", type=click.IntRange(min=0), default=None, help="Optional absolute missing-comparison limit, overriding the fraction.")
+@click.option("--linkage-method", type=click.Choice(genome_views.SUPPORTED_LINKAGE_METHODS), default=None, help="Linkage method; default average or [genome_view].")
+@click.option("--neighbor-k", type=click.IntRange(min=1), default=None, help="Nearest neighbors retained per sample; default 20 or [genome_view].")
+@click.option("--clonal-cluster-threshold", type=click.FloatRange(min=0, max=100), default=None, help="Default 99.93 or [genome_view].")
+@click.option("--strain-cluster-threshold", type=click.FloatRange(min=0, max=100), default=None, help="Default 99.8 or [genome_view].")
 @click.option("--workflow-config", type=click.Path(path_type=Path), help="TOML/JSON execution policy for per-genome view jobs.")
 @click.option("--force", is_flag=True, help="Rebuild view bundles even when their inputs and parameters are unchanged.")
 @click.option("--local-child", is_flag=True, hidden=True, help="Run selected genomes directly without redispatching.")
@@ -1254,33 +1255,36 @@ def sync_genome_views(
     compare_dir: Path,
     view_dir: Path,
     genomes: tuple[str, ...],
-    min_comp_len: int,
-    impute_ani: float,
-    max_null_samples: int,
-    linkage_method: str,
-    neighbor_k: int,
-    clonal_cluster_threshold: float,
-    strain_cluster_threshold: float,
+    min_comp_len: int | None,
+    impute_ani: float | None,
+    max_null_fraction: float | None,
+    max_null_samples: int | None,
+    linkage_method: str | None,
+    neighbor_k: int | None,
+    clonal_cluster_threshold: float | None,
+    strain_cluster_threshold: float | None,
     workflow_config: Path | None,
     force: bool,
     local_child: bool,
 ) -> None:
     """Create full clustermap, dendrogram, network, and stats files per genome."""
-    options = genome_views.GenomeViewOptions(
-        min_comp_len=min_comp_len,
-        impute_ani=impute_ani,
-        max_null_samples=max_null_samples,
-        linkage_method=linkage_method,
-        neighbor_k=neighbor_k,
-        clonal_cluster_threshold=clonal_cluster_threshold,
-        strain_cluster_threshold=strain_cluster_threshold,
-    )
     try:
         compare_files = genome_views.discover_compare_databases(compare_dir, list(genomes) or None)
         execution_config = load_workflow_config(
             workflow_config,
             threads=1,
             sample_count=max(1, len(compare_files)),
+        )
+        options = _resolve_genome_view_options(
+            execution_config,
+            min_comp_len=min_comp_len,
+            impute_ani=impute_ani,
+            max_null_fraction=max_null_fraction,
+            max_null_samples=max_null_samples,
+            linkage_method=linkage_method,
+            neighbor_k=neighbor_k,
+            clonal_cluster_threshold=clonal_cluster_threshold,
+            strain_cluster_threshold=strain_cluster_threshold,
         )
         if workflow_config is not None and _should_dispatch_stage(execution_config, "genome_view") and not local_child:
             summary = _dispatch_genome_view_jobs(
@@ -1312,6 +1316,72 @@ def sync_genome_views(
     )
     if summary.failed:
         raise click.ClickException("Genome view sync completed with failures. Check the genome-level logs above.")
+
+
+def _resolve_genome_view_options(
+    execution_config: WorkflowConfig,
+    *,
+    min_comp_len: int | None,
+    impute_ani: float | None,
+    max_null_fraction: float | None,
+    max_null_samples: int | None,
+    linkage_method: str | None,
+    neighbor_k: int | None,
+    clonal_cluster_threshold: float | None,
+    strain_cluster_threshold: float | None,
+) -> genome_views.GenomeViewOptions:
+    """Resolve genome-view CLI values over TOML values and built-in defaults."""
+    configured = execution_config.genome_view
+    defaults = genome_views.GenomeViewOptions()
+    resolved_fraction = (
+        max_null_fraction
+        if max_null_fraction is not None
+        else configured.max_null_fraction
+        if configured.max_null_fraction is not None
+        else defaults.max_null_fraction
+    )
+    if max_null_samples is not None:
+        resolved_samples = max_null_samples
+    elif max_null_fraction is not None:
+        resolved_samples = None
+    else:
+        resolved_samples = configured.max_null_samples
+    options = genome_views.GenomeViewOptions(
+        min_comp_len=(
+            min_comp_len
+            if min_comp_len is not None
+            else configured.min_comp_len
+            if configured.min_comp_len is not None
+            else defaults.min_comp_len
+        ),
+        impute_ani=(
+            impute_ani
+            if impute_ani is not None
+            else configured.impute_ani
+            if configured.impute_ani is not None
+            else defaults.impute_ani
+        ),
+        max_null_fraction=resolved_fraction,
+        max_null_samples=resolved_samples,
+        linkage_method=linkage_method or configured.linkage_method or defaults.linkage_method,
+        neighbor_k=neighbor_k or configured.neighbor_k or defaults.neighbor_k,
+        clonal_cluster_threshold=(
+            clonal_cluster_threshold
+            if clonal_cluster_threshold is not None
+            else configured.clonal_cluster_threshold
+            if configured.clonal_cluster_threshold is not None
+            else defaults.clonal_cluster_threshold
+        ),
+        strain_cluster_threshold=(
+            strain_cluster_threshold
+            if strain_cluster_threshold is not None
+            else configured.strain_cluster_threshold
+            if configured.strain_cluster_threshold is not None
+            else defaults.strain_cluster_threshold
+        ),
+    )
+    options.validate()
+    return options
 
 
 def _dispatch_genome_view_jobs(
@@ -1401,8 +1471,8 @@ def _genome_view_child_command(
         str(options.min_comp_len),
         "--impute-ani",
         str(options.impute_ani),
-        "--max-null-samples",
-        str(options.max_null_samples),
+        "--max-null-fraction",
+        str(options.max_null_fraction),
         "--linkage-method",
         options.linkage_method,
         "--neighbor-k",
@@ -1413,6 +1483,8 @@ def _genome_view_child_command(
         str(options.strain_cluster_threshold),
         "--local-child",
     ]
+    if options.max_null_samples is not None:
+        command.extend(["--max-null-samples", str(options.max_null_samples)])
     if force:
         command.append("--force")
     return command

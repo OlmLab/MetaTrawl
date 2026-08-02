@@ -47,7 +47,8 @@ class GenomeViewOptions:
 
     min_comp_len: int = 10_000
     impute_ani: float = 97.0
-    max_null_samples: int = 500
+    max_null_fraction: float = 0.20
+    max_null_samples: int | None = None
     linkage_method: str = "average"
     neighbor_k: int = 20
     clonal_cluster_threshold: float = 99.93
@@ -58,7 +59,9 @@ class GenomeViewOptions:
             raise ValueError("min_comp_len must be non-negative")
         if not 0 <= self.impute_ani <= 100:
             raise ValueError("impute_ani must be between 0 and 100")
-        if self.max_null_samples < 0:
+        if not 0 <= self.max_null_fraction <= 1:
+            raise ValueError("max_null_fraction must be between 0 and 1")
+        if self.max_null_samples is not None and self.max_null_samples < 0:
             raise ValueError("max_null_samples must be non-negative")
         if self.linkage_method not in SUPPORTED_LINKAGE_METHODS:
             choices = ", ".join(SUPPORTED_LINKAGE_METHODS)
@@ -73,15 +76,18 @@ class GenomeViewOptions:
                 raise ValueError(f"{name} must be between 0 and 100")
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        values: dict[str, object] = {
             "min_comp_len": self.min_comp_len,
             "impute_ani": self.impute_ani,
-            "max_null_samples": self.max_null_samples,
+            "max_null_fraction": self.max_null_fraction,
             "linkage_method": self.linkage_method,
             "neighbor_k": self.neighbor_k,
             "clonal_cluster_threshold": self.clonal_cluster_threshold,
             "strain_cluster_threshold": self.strain_cluster_threshold,
         }
+        if self.max_null_samples is not None:
+            values["max_null_samples"] = self.max_null_samples
+        return values
 
 
 @dataclass(frozen=True)
@@ -118,6 +124,7 @@ class _ComparisonDatabaseSchema:
     has_sample_catalog: bool
     has_genome_catalog: bool
     has_completed_pairs: bool
+    has_sample_indices: bool
 
     @property
     def is_legacy(self) -> bool:
@@ -328,6 +335,8 @@ def build_genome_view(
             genome=genome,
             options=options,
             ani_column=compare_schema.ani_column,
+            schema=compare_schema,
+            logger=logger,
         )
 
     logger.emit(step="sync-genome-views", status="loading-stats", genome=genome, samples=len(prepared.samples))
@@ -348,72 +357,125 @@ def _prepare_genome_view(
     genome: str,
     options: GenomeViewOptions,
     ani_column: str = "genome_ani",
+    schema: _ComparisonDatabaseSchema | None = None,
+    logger: WorkflowLogger | None = None,
 ) -> _PreparedGenomeView:
     from scipy.cluster.hierarchy import fcluster, leaves_list, linkage
     from scipy.spatial.distance import squareform
 
+    schema = schema or _detect_comparison_schema(conn)
     quoted_ani = _quote_identifier(ani_column)
-    pairs = conn.execute(
-        f"""
-        SELECT sample_1, sample_2,
-               avg({quoted_ani}) AS genome_ani,
-               max(total_positions) AS total_positions
-        FROM matrix_compare_results
-        WHERE genome = ?
-          AND total_positions > ?
-          AND {quoted_ani} IS NOT NULL
-        GROUP BY sample_1, sample_2
-        """,
-        [genome, options.min_comp_len],
-    ).pl()
-    if pairs.is_empty():
+    _materialize_view_sample_catalog(conn, genome=genome, schema=schema)
+    _materialize_qualifying_pairs(
+        conn,
+        genome=genome,
+        min_comp_len=options.min_comp_len,
+        quoted_ani=quoted_ani,
+        has_sample_indices=schema.has_sample_indices,
+    )
+    degree_rows = conn.execute(
+        """
+        SELECT sample_idx, count(*) AS comparable_pairs
+        FROM (
+          SELECT sample_idx_1 AS sample_idx FROM metatrawl_view_pairs
+          UNION ALL
+          SELECT sample_idx_2 AS sample_idx FROM metatrawl_view_pairs
+        )
+        GROUP BY sample_idx
+        ORDER BY sample_idx
+        """
+    ).fetchall()
+    if len(degree_rows) < 2:
         raise ValueError(
             f"No comparisons for genome={genome} pass min_comp_len={options.min_comp_len}"
         )
 
-    samples = sorted(
-        set(pairs.get_column("sample_1").to_list())
-        | set(pairs.get_column("sample_2").to_list())
+    candidate_count = len(degree_rows)
+    possible_neighbors = candidate_count - 1
+    retained_ids: list[int] = []
+    degrees: list[int] = []
+    for sample_idx, degree in degree_rows:
+        degree = int(degree)
+        degrees.append(degree)
+        missing = possible_neighbors - degree
+        if options.max_null_samples is not None:
+            keep = missing <= options.max_null_samples
+        else:
+            keep = missing / possible_neighbors <= options.max_null_fraction
+        if keep:
+            retained_ids.append(int(sample_idx))
+
+    allowed_missing = (
+        options.max_null_samples
+        if options.max_null_samples is not None
+        else math.floor(possible_neighbors * options.max_null_fraction)
     )
-    comparable_counts: dict[str, int] = {sample: 1 for sample in samples}
-    for sample in pairs.get_column("sample_1"):
-        comparable_counts[str(sample)] += 1
-    for sample in pairs.get_column("sample_2"):
-        comparable_counts[str(sample)] += 1
-    total_sample_count = len(samples)
-    excluded = {
-        sample
-        for sample, count in comparable_counts.items()
-        if total_sample_count - count > options.max_null_samples
-    }
-    if excluded:
-        samples = [sample for sample in samples if sample not in excluded]
-        pairs = pairs.filter(
-            (~pl.col("sample_1").is_in(excluded))
-            & (~pl.col("sample_2").is_in(excluded))
+    if logger is not None:
+        logger.emit(
+            step="sync-genome-views",
+            status="connectivity-filter",
+            genome=genome,
+            candidates=candidate_count,
+            retained=len(retained_ids),
+            allowed_missing=allowed_missing,
+            max_null_fraction=options.max_null_fraction,
+            max_null_samples=options.max_null_samples,
+            minimum_neighbors=min(degrees),
+            median_neighbors=float(np.median(degrees)),
+            maximum_neighbors=max(degrees),
         )
-    if len(samples) < 2:
+    if len(retained_ids) < 2:
         raise ValueError(
-            "At least two sufficiently connected samples are required. "
-            "Relax max_null_samples or min_comp_len."
+            f"At least two sufficiently connected samples are required for genome={genome}: "
+            f"candidates={candidate_count}, retained={len(retained_ids)}, "
+            f"allowed_missing={allowed_missing}, neighbor_range={min(degrees)}-{max(degrees)}. "
+            "Relax max_null_fraction, max_null_samples, or min_comp_len."
         )
 
-    sample_index = {sample: idx for idx, sample in enumerate(samples)}
+    conn.execute("CREATE OR REPLACE TEMP TABLE metatrawl_view_retained (sample_idx INTEGER PRIMARY KEY)")
+    conn.executemany(
+        "INSERT INTO metatrawl_view_retained VALUES (?)",
+        [(sample_idx,) for sample_idx in retained_ids],
+    )
+    catalog_rows = conn.execute(
+        """
+        SELECT c.sample_idx, c.sample_name
+        FROM metatrawl_view_sample_catalog c
+        JOIN metatrawl_view_retained r USING (sample_idx)
+        ORDER BY c.sample_name
+        """
+    ).fetchall()
+    samples = [str(sample_name) for _, sample_name in catalog_rows]
+    sample_index = {int(sample_idx): idx for idx, (sample_idx, _) in enumerate(catalog_rows)}
+    pair_columns = conn.execute(
+        """
+        SELECT p.sample_idx_1, p.sample_idx_2, p.genome_ani, p.total_positions
+        FROM metatrawl_view_pairs p
+        JOIN metatrawl_view_retained r1 ON r1.sample_idx = p.sample_idx_1
+        JOIN metatrawl_view_retained r2 ON r2.sample_idx = p.sample_idx_2
+        """
+    ).fetchnumpy()
+    pair_count = len(pair_columns["sample_idx_1"])
+    if pair_count == 0:
+        raise ValueError(
+            f"No retained sample pairs remain for genome={genome}; relax the connectivity filter."
+        )
+
     similarity = np.full((len(samples), len(samples)), np.nan, dtype=np.float32)
     total_positions_matrix = np.zeros((len(samples), len(samples)), dtype=np.uint64)
     np.fill_diagonal(similarity, 100.0)
     idx_1 = np.fromiter(
-        (sample_index[str(value)] for value in pairs.get_column("sample_1")),
-        dtype=np.int64,
-        count=pairs.height,
+        (sample_index[int(value)] for value in pair_columns["sample_idx_1"]),
+        dtype=np.int32,
+        count=pair_count,
     )
     idx_2 = np.fromiter(
-        (sample_index[str(value)] for value in pairs.get_column("sample_2")),
-        dtype=np.int64,
-        count=pairs.height,
+        (sample_index[int(value)] for value in pair_columns["sample_idx_2"]),
+        dtype=np.int32,
+        count=pair_count,
     )
-    ani_values = pairs.get_column("genome_ani").cast(pl.Float64).to_numpy()
-    total_position_values = pairs.get_column("total_positions").cast(pl.UInt64).to_numpy()
+    ani_values = np.asarray(pair_columns["genome_ani"], dtype=np.float32)
+    total_position_values = np.asarray(pair_columns["total_positions"], dtype=np.uint64)
     similarity[idx_1, idx_2] = ani_values
     similarity[idx_2, idx_1] = ani_values
     total_positions_matrix[idx_1, idx_2] = total_position_values
@@ -458,6 +520,92 @@ def _prepare_genome_view(
         neighbor_edges=neighbor_edges,
         pair_ani=ani_values.astype(np.float32, copy=False),
         pair_total_positions=total_position_values,
+    )
+
+
+def _materialize_view_sample_catalog(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    genome: str,
+    schema: _ComparisonDatabaseSchema,
+) -> None:
+    if schema.has_sample_catalog:
+        conn.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE metatrawl_view_sample_catalog AS
+            SELECT CAST(sample_idx AS INTEGER) AS sample_idx,
+                   CAST(sample_name AS VARCHAR) AS sample_name
+            FROM matrix_compare_samples
+            """
+        )
+    elif schema.has_sample_indices:
+        conn.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE metatrawl_view_sample_catalog AS
+            SELECT sample_idx, min(sample_name) AS sample_name
+            FROM (
+              SELECT CAST(sample_idx_1 AS INTEGER) AS sample_idx, sample_1 AS sample_name
+              FROM matrix_compare_results WHERE genome = ?
+              UNION ALL
+              SELECT CAST(sample_idx_2 AS INTEGER) AS sample_idx, sample_2 AS sample_name
+              FROM matrix_compare_results WHERE genome = ?
+            )
+            GROUP BY sample_idx
+            """,
+            [genome, genome],
+        )
+    else:
+        conn.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE metatrawl_view_sample_catalog AS
+            SELECT CAST(row_number() OVER (ORDER BY sample_name) - 1 AS INTEGER) AS sample_idx,
+                   sample_name
+            FROM (
+              SELECT sample_1 AS sample_name FROM matrix_compare_results WHERE genome = ?
+              UNION
+              SELECT sample_2 AS sample_name FROM matrix_compare_results WHERE genome = ?
+            )
+            """,
+            [genome, genome],
+        )
+
+
+def _materialize_qualifying_pairs(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    genome: str,
+    min_comp_len: int,
+    quoted_ani: str,
+    has_sample_indices: bool,
+) -> None:
+    if has_sample_indices:
+        sample_columns = (
+            "CAST(r.sample_idx_1 AS INTEGER) AS sample_idx_1, "
+            "CAST(r.sample_idx_2 AS INTEGER) AS sample_idx_2"
+        )
+        joins = ""
+        grouped_columns = "r.sample_idx_1, r.sample_idx_2"
+    else:
+        sample_columns = "c1.sample_idx AS sample_idx_1, c2.sample_idx AS sample_idx_2"
+        joins = (
+            "JOIN metatrawl_view_sample_catalog c1 ON c1.sample_name = r.sample_1 "
+            "JOIN metatrawl_view_sample_catalog c2 ON c2.sample_name = r.sample_2"
+        )
+        grouped_columns = "c1.sample_idx, c2.sample_idx"
+    conn.execute(
+        f"""
+        CREATE OR REPLACE TEMP TABLE metatrawl_view_pairs AS
+        SELECT {sample_columns},
+               CAST(avg(r.{quoted_ani}) AS FLOAT) AS genome_ani,
+               CAST(max(r.total_positions) AS UBIGINT) AS total_positions
+        FROM matrix_compare_results r
+        {joins}
+        WHERE r.genome = ?
+          AND r.total_positions > ?
+          AND r.{quoted_ani} IS NOT NULL
+        GROUP BY {grouped_columns}
+        """,
+        [genome, min_comp_len],
     )
 
 
@@ -1153,6 +1301,7 @@ def _detect_comparison_schema(
         has_sample_catalog="matrix_compare_samples" in existing,
         has_genome_catalog="matrix_compare_genomes" in existing,
         has_completed_pairs="matrix_compare_completed_pair_genomes" in existing,
+        has_sample_indices={"sample_idx_1", "sample_idx_2"}.issubset(result_columns),
     )
 
 

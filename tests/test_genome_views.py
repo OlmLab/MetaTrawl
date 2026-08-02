@@ -94,6 +94,58 @@ def _compare_database(
     return path
 
 
+def _fraction_compare_database(path: Path) -> Path:
+    samples = [f"sample_{letter}" for letter in "abcdef"]
+    qualifying_edges = [
+        (0, 1),
+        (0, 2),
+        (0, 3),
+        (1, 2),
+        (1, 3),
+        (2, 3),
+        (0, 4),
+        (1, 5),
+    ]
+    with duckdb.connect(str(path)) as conn:
+        conn.execute("CREATE TABLE matrix_compare_samples (sample_idx INTEGER, sample_name VARCHAR)")
+        conn.execute("CREATE TABLE matrix_compare_genomes (genome_idx INTEGER, genome VARCHAR)")
+        conn.execute(
+            "CREATE TABLE matrix_compare_completed_pair_genomes "
+            "(sample_idx_1 INTEGER, sample_idx_2 INTEGER, genome_idx INTEGER)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE matrix_compare_results (
+              sample_idx_1 INTEGER,
+              sample_idx_2 INTEGER,
+              sample_1 VARCHAR,
+              sample_2 VARCHAR,
+              genome_idx INTEGER,
+              genome VARCHAR,
+              total_positions BIGINT,
+              share_allele_pos BIGINT,
+              genome_ani DOUBLE,
+              max_consecutive_length BIGINT
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO matrix_compare_samples VALUES (?, ?)",
+            list(enumerate(samples)),
+        )
+        conn.execute("INSERT INTO matrix_compare_genomes VALUES (0, 'genome_a')")
+        all_edges = [(left, right, 0) for left in range(6) for right in range(left + 1, 6)]
+        conn.executemany(
+            "INSERT INTO matrix_compare_completed_pair_genomes VALUES (?, ?, ?)",
+            all_edges,
+        )
+        conn.executemany(
+            "INSERT INTO matrix_compare_results VALUES (?, ?, ?, ?, 0, 'genome_a', 20000, 19980, 99.9, 10000)",
+            [(left, right, samples[left], samples[right]) for left, right in qualifying_edges],
+        )
+    return path
+
+
 def test_sync_genome_views_writes_self_contained_bundle_and_resumes(tmp_path: Path) -> None:
     project_db = _project_database(tmp_path / "metatrawl.duckdb")
     compare_dir = tmp_path / "compares"
@@ -353,6 +405,39 @@ def test_genome_view_clustering_matches_zipstrain_visualization_semantics(tmp_pa
     np.testing.assert_allclose(prepared.linkage_matrix, expected.linkage_matrix, rtol=0, atol=1e-5)
 
 
+def test_genome_view_filters_by_genome_specific_null_fraction(tmp_path: Path) -> None:
+    compare_db = _fraction_compare_database(tmp_path / "genome_a.duckdb")
+    with duckdb.connect(str(compare_db), read_only=True) as conn:
+        prepared = genome_views._prepare_genome_view(
+            conn,
+            genome="genome_a",
+            options=genome_views.GenomeViewOptions(max_null_fraction=0.4),
+        )
+        compact_columns = [
+            row[0]
+            for row in conn.execute("DESCRIBE metatrawl_view_pairs").fetchall()
+        ]
+
+    assert prepared.samples == ["sample_a", "sample_b", "sample_c", "sample_d"]
+    assert prepared.similarity_matrix.shape == (4, 4)
+    assert compact_columns == ["sample_idx_1", "sample_idx_2", "genome_ani", "total_positions"]
+
+
+def test_genome_view_absolute_null_limit_overrides_fraction(tmp_path: Path) -> None:
+    compare_db = _fraction_compare_database(tmp_path / "genome_a.duckdb")
+    with duckdb.connect(str(compare_db), read_only=True) as conn:
+        prepared = genome_views._prepare_genome_view(
+            conn,
+            genome="genome_a",
+            options=genome_views.GenomeViewOptions(
+                max_null_fraction=1.0,
+                max_null_samples=1,
+            ),
+        )
+
+    assert prepared.samples == ["sample_a", "sample_b"]
+
+
 def test_sync_genome_views_cli_dispatches_one_job_per_genome(tmp_path: Path, monkeypatch) -> None:
     compare_dir = tmp_path / "compares"
     compare_dir.mkdir()
@@ -364,6 +449,8 @@ def test_sync_genome_views_cli_dispatches_one_job_per_genome(tmp_path: Path, mon
         'workers = 2\n'
         'threads = 4\n'
         'execution = "slurm"\n'
+        '[genome_view]\n'
+        'max_null_fraction = 0.35\n'
     )
     commands: list[tuple[str, list[str], str]] = []
 
@@ -398,5 +485,7 @@ def test_sync_genome_views_cli_dispatches_one_job_per_genome(tmp_path: Path, mon
     for _, command, _ in commands:
         assert command[:2] == ["metatrawl", "sync-genome-views"]
         assert command[command.index("--neighbor-k") + 1] == "12"
+        assert command[command.index("--max-null-fraction") + 1] == "0.35"
+        assert "--max-null-samples" not in command
         assert "--local-child" in command
     assert "ready=2" in result.output

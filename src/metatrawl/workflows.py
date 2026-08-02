@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -638,7 +638,9 @@ def profile_sra_runs(
 
     ``completion_callback`` runs serially in the coordinator thread as soon as a
     sample finishes. Sync uses it to import each sample before its scratch data is
-    removed, avoiding concurrent DuckDB writers and batch-wide import delays.
+    removed, avoiding concurrent DuckDB writers and batch-wide import delays. A
+    sample worker slot is replenished only after that callback and cleanup finish,
+    so completed profiles cannot accumulate beyond ``sample_workers``.
     """
     logger = logger or WorkflowLogger()
     workflow_config = workflow_config or WorkflowConfig.legacy(threads=threads, sample_count=len(run_ids))
@@ -662,9 +664,17 @@ def profile_sra_runs(
     sylph_db = _resolve_existing_sylph_db(sylph_db) if sylph_db is not None else None
     max_workers = max(1, min(len(run_ids), workflow_config.sample_workers))
     logger.emit(step="profile-sra", status="start", samples=len(run_ids), workers=max_workers, db=db_file)
+    failures: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(
+        pending_run_ids = iter(run_ids)
+        futures: dict[object, str] = {}
+
+        def submit_next_sample() -> bool:
+            try:
+                run_id = next(pending_run_ids)
+            except StopIteration:
+                return False
+            future = executor.submit(
                 _profile_one_sra_run,
                 run_id=run_id,
                 cache_manager=cache_manager,
@@ -675,29 +685,40 @@ def profile_sra_runs(
                 runtime=runtime,
                 profile_config=workflow_config.profile,
                 logger=logger,
-            ): run_id
-            for run_id in run_ids
-        }
-        failures: dict[str, str] = {}
-        for future in as_completed(futures):
-            run_id = futures[future]
-            try:
-                future.result()
-                if completion_callback is not None:
-                    completion_callback(run_id)
-                sample_scratch = Path(scratch_dir) / run_id
-                if sample_scratch.exists():
-                    shutil.rmtree(sample_scratch)
-                    logger.emit(sample=run_id, step="cleanup", status="done", removed=sample_scratch)
-            except Exception as exc:
-                failures[run_id] = str(exc)
-                logger.emit(sample=run_id, step="profile-sra", status="failed", error=exc)
-                logger.emit(
-                    sample=run_id,
-                    step="checkpoint",
-                    status="retained",
-                    path=Path(scratch_dir) / run_id,
-                )
+            )
+            futures[future] = run_id
+            return True
+
+        for _ in range(max_workers):
+            if not submit_next_sample():
+                break
+
+        while futures:
+            completed, _not_completed = wait(
+                tuple(futures),
+                return_when=FIRST_COMPLETED,
+            )
+            for future in completed:
+                run_id = futures.pop(future)
+                try:
+                    future.result()
+                    if completion_callback is not None:
+                        completion_callback(run_id)
+                    sample_scratch = Path(scratch_dir) / run_id
+                    if sample_scratch.exists():
+                        shutil.rmtree(sample_scratch)
+                        logger.emit(sample=run_id, step="cleanup", status="done", removed=sample_scratch)
+                except Exception as exc:
+                    failures[run_id] = str(exc)
+                    logger.emit(sample=run_id, step="profile-sra", status="failed", error=exc)
+                    logger.emit(
+                        sample=run_id,
+                        step="checkpoint",
+                        status="retained",
+                        path=Path(scratch_dir) / run_id,
+                    )
+                finally:
+                    submit_next_sample()
     logger.emit(
         step="profile-sra",
         status="done",

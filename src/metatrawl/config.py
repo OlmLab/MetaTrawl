@@ -20,6 +20,7 @@ STAGE_NAMES = (
     "genome_view",
 )
 READ_INCLUSION_CHOICES = ("proper-pairs", "paired", "all-mapped")
+LINKAGE_METHOD_CHOICES = ("single", "complete", "average", "weighted")
 
 @dataclass(frozen=True)
 class SlurmConfig:
@@ -73,6 +74,18 @@ class MatrixCompareConfig:
         }
         return {key: value for key, value in values.items() if value is not None}
 
+
+@dataclass(frozen=True)
+class GenomeViewConfig:
+    min_comp_len: int | None = None
+    impute_ani: float | None = None
+    max_null_fraction: float | None = None
+    max_null_samples: int | None = None
+    linkage_method: str | None = None
+    neighbor_k: int | None = None
+    clonal_cluster_threshold: float | None = None
+    strain_cluster_threshold: float | None = None
+
 @dataclass(frozen=True)
 class ProfileConfig:
     min_mapq: int = 0
@@ -88,6 +101,7 @@ class WorkflowConfig:
     profile: ProfileConfig = field(default_factory=ProfileConfig)
     matrix_build: MatrixBuildConfig = field(default_factory=MatrixBuildConfig)
     matrix_compare: MatrixCompareConfig = field(default_factory=MatrixCompareConfig)
+    genome_view: GenomeViewConfig = field(default_factory=GenomeViewConfig)
 
     def stage(self, name: str) -> StageConfig:
         try:
@@ -169,6 +183,9 @@ def _parse(raw: dict[str, Any], *, threads: int, sample_count: int) -> WorkflowC
     compare = raw.get("matrix_compare", {})
     if not isinstance(compare, dict):
         raise ValueError("matrix_compare must be a table/object.")
+    view = raw.get("genome_view", {})
+    if not isinstance(view, dict):
+        raise ValueError("genome_view must be a table/object.")
     profile = raw.get("profile", {})
     if not isinstance(profile, dict):
         raise ValueError("profile must be a table/object.")
@@ -203,6 +220,40 @@ def _parse(raw: dict[str, Any], *, threads: int, sample_count: int) -> WorkflowC
         result_transfer_batch_size=_optional_positive(compare.get("result_transfer_batch_size"), "matrix_compare.result_transfer_batch_size"),
         loader_executor_kind=_optional_string(compare.get("loader_executor_kind")),
         writer_executor_kind=_optional_string(compare.get("writer_executor_kind")),
+    ), genome_view=GenomeViewConfig(
+        min_comp_len=(
+            None
+            if view.get("min_comp_len") is None
+            else _nonnegative_int(view.get("min_comp_len"), "genome_view.min_comp_len")
+        ),
+        impute_ani=_optional_bounded_float(view.get("impute_ani"), "genome_view.impute_ani", 0, 100),
+        max_null_fraction=_optional_probability(
+            view.get("max_null_fraction"),
+            "genome_view.max_null_fraction",
+        ),
+        max_null_samples=(
+            None
+            if view.get("max_null_samples") is None
+            else _nonnegative_int(view.get("max_null_samples"), "genome_view.max_null_samples")
+        ),
+        linkage_method=_choice(
+            view.get("linkage_method"),
+            "genome_view.linkage_method",
+            LINKAGE_METHOD_CHOICES,
+        ),
+        neighbor_k=_optional_positive(view.get("neighbor_k"), "genome_view.neighbor_k"),
+        clonal_cluster_threshold=_optional_bounded_float(
+            view.get("clonal_cluster_threshold"),
+            "genome_view.clonal_cluster_threshold",
+            0,
+            100,
+        ),
+        strain_cluster_threshold=_optional_bounded_float(
+            view.get("strain_cluster_threshold"),
+            "genome_view.strain_cluster_threshold",
+            0,
+            100,
+        ),
     ))
 
 def _positive(value: Any, key: str) -> int:
@@ -253,6 +304,23 @@ def _optional_positive_float(value: Any, key: str) -> float | None:
         raise ValueError(f"{key} must be a positive number.") from exc
     if result <= 0:
         raise ValueError(f"{key} must be a positive number.")
+    return result
+
+
+def _optional_bounded_float(
+    value: Any,
+    key: str,
+    minimum: float,
+    maximum: float,
+) -> float | None:
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be between {minimum} and {maximum}.") from exc
+    if not minimum <= result <= maximum:
+        raise ValueError(f"{key} must be between {minimum} and {maximum}.")
     return result
 
 def _optional_probability(value: Any, key: str) -> float | None:

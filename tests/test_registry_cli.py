@@ -5,6 +5,7 @@ import csv
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 import types
 import zipfile
@@ -18,7 +19,7 @@ from metatrawl import cache
 from metatrawl import cli
 from metatrawl import db as registry
 from metatrawl import workflows
-from metatrawl.config import ProfileConfig
+from metatrawl.config import ProfileConfig, WorkflowConfig
 from metatrawl.logging import WorkflowLogger
 
 
@@ -830,6 +831,61 @@ def test_profile_sra_deletes_temporary_reference_files_after_success(tmp_path: P
     )
 
     assert not (scratch_dir / "SRR1").exists()
+
+
+def test_profile_sra_sample_workers_bound_unimported_backlog(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_ids = [f"SRR{index:03d}" for index in range(30)]
+    workflow_config = WorkflowConfig.legacy(
+        threads=3,
+        sample_count=len(run_ids),
+    )
+    lock = threading.Lock()
+    unimported = 0
+    max_unimported = 0
+    imported: list[str] = []
+
+    class FakeGenomeCache:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    def fake_profile_one_sra_run(*, run_id: str, **kwargs) -> None:
+        nonlocal unimported, max_unimported
+        with lock:
+            unimported += 1
+            max_unimported = max(max_unimported, unimported)
+
+    def import_completed_sample(run_id: str) -> None:
+        nonlocal unimported
+        # Give any incorrectly replenished workers time to expose a backlog.
+        time.sleep(0.01)
+        with lock:
+            imported.append(run_id)
+            unimported -= 1
+
+    monkeypatch.setattr(workflows.cache, "GenomeCache", FakeGenomeCache)
+    monkeypatch.setattr(
+        workflows,
+        "_profile_one_sra_run",
+        fake_profile_one_sra_run,
+    )
+
+    failures = workflows.profile_sra_runs(
+        run_ids=run_ids,
+        db_file=tmp_path / "metatrawl.duckdb",
+        cache_dir=tmp_path / "cache",
+        scratch_dir=tmp_path / "scratch",
+        workflow_config=workflow_config,
+        completion_callback=import_completed_sample,
+        logger=WorkflowLogger(),
+    )
+
+    assert failures == {}
+    assert sorted(imported) == run_ids
+    assert unimported == 0
+    assert max_unimported <= workflow_config.sample_workers
 
 
 def test_profile_sra_uses_per_sample_accessions_dir(tmp_path: Path, monkeypatch) -> None:
