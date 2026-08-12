@@ -714,6 +714,15 @@ metatrawl sync-profile \
 
 Each stage supports `workers`, `threads`, `execution = "local" | "slurm"`, `retries`, `retry_delay_seconds`, and an optional `environment` table. Slurm stages also accept `time`, `memory_gb`, `partition`, `account`, and arbitrary `extra` `sbatch` options. MetaTrawl submits Slurm jobs with `sbatch --wait`; checkpointing, output publication, and scratch cleanup therefore happen only after the job completes. If a stage fails, MetaTrawl retries that stage command or Slurm job according to the stage retry settings before marking the sample failed.
 
+`sync-profile` publishes each completed sample atomically and sends it to one
+dedicated DuckDB writer. Profiling continues while that writer imports bounded
+microbatches; when the queue reaches either its sample or byte limit, submission
+pauses rather than filling scratch. Pending published bundles are rediscovered on
+the next run. MetaTrawl deletes the SRA archive after validated FASTQ creation,
+deletes reads and Bowtie indexes after BAM validation, and deletes the BAM and
+sample reference after publication. Published profile files are deleted only
+after their DuckDB transaction commits.
+
 The configurable stages are `sra_download`, `sylph`, `genome_download`, `prodigal`, `prepare_profile`, `bowtie_build`, `alignment`, `profile`, `matrix_build`, `matrix_compare`, and `genome_view`. Without `--workflow-config`, `--threads` retains the previous profiling behavior.
 
 The same file can configure ZipStrain `profile-single` read filters under `[profile]`: `min_mapq`, `min_baseq`, `min_freq`, `min_read_ani`, and `read_inclusion`. Matrix construction settings belong under `[matrix_build]`: `storage_mode`, `count_dtype`, `min_cov`, `memory_limit_gb`, `export_batch_mb`, and `duckdb_export_threads`. New matrices use compact bitmask storage by default; choose count storage when `conani` or `cosani_<threshold>` is required. An `allele-mask` database rejects count storage and any `min_cov` different from its database contract before creating or resizing a matrix. Comparison settings under `[matrix_compare]` include `calculate`, `ani_method`, `genome`, `backend`, optional `min_cov`, `memory_limit_gb`, and queue/executor controls. When comparison `min_cov` is omitted, ZipStrain uses the build threshold stored in the HDF5 file. `matrix sync-build` can use `[stages.matrix_build]` to submit one build/append job per genome, `matrix sync-compare` can use `[stages.matrix_compare]` to submit one compare job per matrix, and `sync-genome-views` can use `[stages.genome_view]` to submit one artifact job per genome. Explicit CLI values override the matching TOML values.
@@ -817,6 +826,14 @@ min_baseq = 13
 min_freq = 0.0
 min_read_ani = 0.95
 read_inclusion = "paired"
+
+[profile_import]
+# One larger-than-limit sample is always allowed through by itself.
+queue_max_samples = 8
+queue_max_gb = 32
+batch_max_samples = 4
+batch_max_gb = 8
+batch_wait_seconds = 1
 
 [matrix_build]
 storage_mode = "bitmask" # use "counts" for conANI/cosANI

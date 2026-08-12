@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import csv
 from pathlib import Path
 import subprocess
@@ -19,7 +20,7 @@ from metatrawl import cache
 from metatrawl import cli
 from metatrawl import db as registry
 from metatrawl import workflows
-from metatrawl.config import ProfileConfig, WorkflowConfig
+from metatrawl.config import ProfileConfig, ProfileImportConfig, WorkflowConfig
 from metatrawl.logging import WorkflowLogger
 
 
@@ -888,6 +889,211 @@ def test_profile_sra_sample_workers_bound_unimported_backlog(
     assert max_unimported <= workflow_config.sample_workers
 
 
+def test_profile_importer_batches_bundles_on_one_writer_and_cleans_after_commit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_file = tmp_path / "metatrawl.duckdb"
+    output_dir = tmp_path / "outputs"
+    output_dir.mkdir()
+    run_ids = ["SRR1", "SRR2", "SRR3"]
+    with registry.connect(db_file) as conn:
+        registry.add_runs(conn, run_ids)
+    for run_id in run_ids:
+        bundle = _write_bundle_files(output_dir, run_id)
+        bundle.profile_file.rename(output_dir / f"{run_id}.profile.parquet")
+
+    original_import = registry.import_profile_bundles
+    batch_sizes: list[int] = []
+    writer_threads: set[str] = set()
+
+    def recording_import(conn, bundles, **kwargs) -> None:
+        batch_sizes.append(len(bundles))
+        writer_threads.add(threading.current_thread().name)
+        original_import(conn, bundles, **kwargs)
+
+    monkeypatch.setattr(registry, "import_profile_bundles", recording_import)
+    importer = workflows._ProfileBundleImporter(
+        db_file=db_file,
+        output_dir=output_dir,
+        cache_dir=tmp_path / "cache",
+        config=ProfileImportConfig(
+            queue_max_samples=4,
+            queue_max_gb=1,
+            batch_max_samples=4,
+            batch_max_gb=1,
+            batch_wait_seconds=0.5,
+        ),
+        cleanup_outputs=True,
+        logger=WorkflowLogger(),
+    )
+    for run_id in run_ids:
+        importer.submit(run_id)
+    importer.finish()
+
+    assert importer.imported == 3
+    assert importer.failures == {}
+    assert sum(batch_sizes) == 3
+    assert any(size > 1 for size in batch_sizes)
+    assert writer_threads == {"metatrawl-profile-importer"}
+    assert importer.cleaned_files == 12
+    assert not list(output_dir.iterdir())
+    with registry.connect(db_file) as conn:
+        assert registry.completed_sample_ids(conn) == run_ids
+
+
+def test_profile_importer_falls_back_to_individual_transactions_on_bad_bundle(
+    tmp_path: Path,
+) -> None:
+    db_file = tmp_path / "metatrawl.duckdb"
+    output_dir = tmp_path / "outputs"
+    output_dir.mkdir()
+    run_ids = ["SRR_GOOD", "SRR_BAD"]
+    with registry.connect(db_file) as conn:
+        registry.add_runs(conn, run_ids)
+    for run_id in run_ids:
+        bundle = _write_bundle_files(output_dir, run_id)
+        bundle.profile_file.rename(output_dir / f"{run_id}.profile.parquet")
+    (output_dir / "SRR_BAD.genome_stats.parquet").write_text("not parquet")
+
+    importer = workflows._ProfileBundleImporter(
+        db_file=db_file,
+        output_dir=output_dir,
+        cache_dir=tmp_path / "cache",
+        config=ProfileImportConfig(
+            queue_max_samples=2,
+            queue_max_gb=1,
+            batch_max_samples=2,
+            batch_max_gb=1,
+            batch_wait_seconds=0.5,
+        ),
+        cleanup_outputs=True,
+        logger=WorkflowLogger(),
+    )
+    for run_id in run_ids:
+        importer.submit(run_id)
+    importer.finish()
+
+    assert importer.imported == 1
+    assert set(importer.failures) == {"SRR_BAD"}
+    assert not (output_dir / "SRR_GOOD.profile.parquet").exists()
+    assert (output_dir / "SRR_BAD.profile.parquet").exists()
+    with registry.connect(db_file) as conn:
+        assert registry.completed_sample_ids(conn) == ["SRR_GOOD"]
+        assert conn.execute(
+            "SELECT count(*) FROM profile_positions WHERE sample_id = 'SRR_BAD'"
+        ).fetchone()[0] == 0
+
+
+def test_sync_profile_replenishes_workers_while_single_importer_is_busy(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_file = tmp_path / "metatrawl.duckdb"
+    output_dir = tmp_path / "outputs"
+    run_ids = [f"SRR{index}" for index in range(6)]
+    with registry.connect(db_file) as conn:
+        registry.add_runs(conn, run_ids)
+
+    profiled = 0
+    profiled_lock = threading.Lock()
+    profiles_ahead = threading.Event()
+    release_import = threading.Event()
+    import_started = threading.Event()
+
+    class FakeGenomeCache:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    def fake_profile_one_sra_run(*, run_id: str, **kwargs) -> None:
+        nonlocal profiled
+        output_dir.mkdir(parents=True, exist_ok=True)
+        bundle = _write_bundle_files(output_dir, run_id)
+        bundle.profile_file.rename(output_dir / f"{run_id}.profile.parquet")
+        with profiled_lock:
+            profiled += 1
+            if profiled >= 3:
+                profiles_ahead.set()
+
+    original_import = registry.import_profile_bundles
+    first_import = True
+
+    def blocking_import(conn, bundles, **kwargs) -> None:
+        nonlocal first_import
+        if first_import:
+            first_import = False
+            import_started.set()
+            assert release_import.wait(timeout=5)
+        original_import(conn, bundles, **kwargs)
+
+    monkeypatch.setattr(workflows.cache, "GenomeCache", FakeGenomeCache)
+    monkeypatch.setattr(workflows, "_profile_one_sra_run", fake_profile_one_sra_run)
+    monkeypatch.setattr(registry, "import_profile_bundles", blocking_import)
+    config = replace(
+        WorkflowConfig.legacy(threads=2, sample_count=len(run_ids)),
+        sample_workers=2,
+        profile_import=ProfileImportConfig(
+            queue_max_samples=2,
+            queue_max_gb=1,
+            batch_max_samples=1,
+            batch_max_gb=1,
+            batch_wait_seconds=0,
+        ),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            workflows.sync_remaining_profiles,
+            db_file=db_file,
+            cache_dir=tmp_path / "cache",
+            scratch_dir=tmp_path / "scratch",
+            output_dir=output_dir,
+            workflow_config=config,
+            check_dependencies=False,
+            logger=WorkflowLogger(),
+        )
+        assert import_started.wait(timeout=3)
+        assert profiles_ahead.wait(timeout=3)
+        release_import.set()
+        summary = future.result(timeout=10)
+
+    assert summary.imported == len(run_ids)
+    assert summary.failed == 0
+    with registry.connect(db_file) as conn:
+        assert registry.completed_sample_ids(conn) == run_ids
+
+
+def test_profile_sra_requeues_an_existing_published_bundle_without_reprofiling(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    output_dir = tmp_path / "outputs"
+    output_dir.mkdir()
+    bundle = _write_bundle_files(output_dir, "SRR1")
+    bundle.profile_file.rename(output_dir / "SRR1.profile.parquet")
+    bundle.sylph_abundance_file.rename(output_dir / "SRR1.sylph.tsv")
+    completed: list[str] = []
+
+    class FakeGenomeCache:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    monkeypatch.setattr(workflows.cache, "GenomeCache", FakeGenomeCache)
+    failures = workflows.profile_sra_runs(
+        run_ids=["SRR1"],
+        db_file=tmp_path / "metatrawl.duckdb",
+        cache_dir=tmp_path / "cache",
+        scratch_dir=tmp_path / "scratch",
+        output_dir=output_dir,
+        completion_callback=completed.append,
+        logger=WorkflowLogger(),
+    )
+
+    assert failures == {}
+    assert completed == ["SRR1"]
+    assert not (tmp_path / "scratch" / "SRR1").exists()
+
+
 def test_profile_sra_uses_per_sample_accessions_dir(tmp_path: Path, monkeypatch) -> None:
     scratch_dir = tmp_path / "scratch"
     accessions_dir = tmp_path / "accessions"
@@ -1028,6 +1234,8 @@ def test_alignment_and_profile_stage_publishes_outputs(tmp_path: Path, monkeypat
 
     monkeypatch.setattr(workflows, "_run", fake_run)
     monkeypatch.setattr(workflows, "_run_alignment_shell", fake_shell)
+    (tmp_path / "outputs").mkdir()
+    (tmp_path / "outputs" / "SRR1.sylph.tsv").write_text("Genome_file\tabundance\nGCF_1\t1\n")
 
     workflows._run_alignment_and_profile(
         run_id="SRR1",
@@ -1065,6 +1273,10 @@ def test_alignment_and_profile_stage_publishes_outputs(tmp_path: Path, monkeypat
     assert (tmp_path / "outputs" / "SRR1.profile.parquet").read_text() == "profile"
     assert (tmp_path / "outputs" / "SRR1.genome_stats.parquet").read_text() == "genome"
     assert (tmp_path / "outputs" / "SRR1.gene_stats.parquet").read_text() == "gene"
+    assert (tmp_path / "outputs" / ".SRR1.bundle.ready").exists()
+    assert not list(sample_scratch.rglob("*.fastq"))
+    assert not (sample_scratch / "SRR1.bam").exists()
+    assert not reference_dir.exists()
 
 
 def test_alignment_profile_builds_null_model_when_prepare_does_not(tmp_path: Path, monkeypatch) -> None:
@@ -1107,6 +1319,8 @@ def test_alignment_profile_builds_null_model_when_prepare_does_not(tmp_path: Pat
         "_run_alignment_shell",
         lambda **kwargs: (sample_scratch / "SRR1.bam.tmp").write_text("bam"),
     )
+    (tmp_path / "outputs").mkdir()
+    (tmp_path / "outputs" / "SRR1.sylph.tsv").write_text("Genome_file\tabundance\nGCF_1\t1\n")
 
     workflows._run_alignment_and_profile(
         run_id="SRR1",
@@ -1120,9 +1334,64 @@ def test_alignment_profile_builds_null_model_when_prepare_does_not(tmp_path: Pat
 
     assert any(call[:3] == ["zipstrain", "utilities", "build-null-model"] for call in run_calls)
     profile_call = next(call for call in run_calls if call[:3] == ["zipstrain", "utilities", "profile-single"])
-    assert (sample_scratch / "zipstrain_profile" / "null_model.parquet").exists()
+    assert not (sample_scratch / "zipstrain_profile").exists()
     assert profile_call[profile_call.index("--null-model") + 1].endswith("null_model.parquet")
     assert profile_call[profile_call.index("--read-inclusion") + 1] == "all-mapped"
+
+
+def test_profile_failure_keeps_validated_bam_after_releasing_reads(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    sample_scratch = tmp_path / "scratch" / "SRR1"
+    sample_scratch.mkdir(parents=True)
+    (sample_scratch / "SRR1.fastq").write_text("@r1\nACGT\n+\n!!!!\n")
+    reference_dir = sample_scratch / "reference"
+    reference_dir.mkdir()
+    reference = cache.PreparedReference(
+        reference_fasta=reference_dir / "reference.fna",
+        gene_fasta=reference_dir / "genes.fna",
+        stb_file=reference_dir / "reference.stb",
+    )
+    reference.reference_fasta.write_text(">contig\nACGT\n")
+    reference.gene_fasta.write_text(">gene\nAC\n")
+    reference.stb_file.write_text("contig\tGCF_1\n")
+
+    def fake_run(cmd: list[str], *, sample: str, step: str) -> None:
+        if cmd[:3] == ["zipstrain", "utilities", "prepare_profiling"]:
+            profile_work = Path(cmd[cmd.index("--output-dir") + 1])
+            (profile_work / "reference.fasta").write_text(">contig\nACGT\n")
+            (profile_work / "genomes_bed_file.bed").write_text("contig\t1\t4\n")
+            (profile_work / "gene_range_table.tsv").write_text("gene\tcontig\t1\t2\n")
+            (profile_work / "profiling_contract.json").write_text("{}")
+        elif cmd[:3] == ["zipstrain", "utilities", "build-null-model"]:
+            Path(cmd[cmd.index("--output-file") + 1]).write_text("null")
+        elif cmd[:2] == ["samtools", "faidx"]:
+            Path(str(cmd[2]) + ".fai").write_text("contig\t4\t8\t4\t5\n")
+        elif cmd[:3] == ["zipstrain", "utilities", "profile-single"]:
+            raise RuntimeError("profile interrupted")
+
+    monkeypatch.setattr(workflows, "_run", fake_run)
+    monkeypatch.setattr(
+        workflows,
+        "_run_alignment_shell",
+        lambda **kwargs: (sample_scratch / "SRR1.bam.tmp").write_text("bam"),
+    )
+
+    with pytest.raises(RuntimeError, match="profile interrupted"):
+        workflows._run_alignment_and_profile(
+            run_id="SRR1",
+            sample_scratch=sample_scratch,
+            reference=reference,
+            output_dir=tmp_path / "outputs",
+            threads=1,
+            logger=WorkflowLogger(),
+        )
+
+    assert (sample_scratch / "SRR1.bam").exists()
+    assert not list(sample_scratch.rglob("*.fastq"))
+    assert (sample_scratch / "read_layout.txt").read_text().strip() == "single"
+    assert reference_dir.exists()
 
 
 def test_sylph_single_end_reads_are_positional_not_dash_u(tmp_path: Path, monkeypatch) -> None:
@@ -1165,8 +1434,6 @@ def test_sync_profiles_remaining_runs_and_imports_outputs(tmp_path: Path, monkey
         bundle = _write_bundle_files(output_dir, "SRR2")
         bundle.profile_file.rename(output_dir / "SRR2.profile.parquet")
         kwargs["completion_callback"]("SRR2")
-        with registry.connect(db_file) as conn:
-            assert conn.execute("SELECT status FROM sra_runs WHERE run_id = 'SRR2'").fetchone() == ("complete",)
 
     monkeypatch.setattr(workflows, "profile_sra_runs", fake_profile_sra_runs)
 
@@ -1205,6 +1472,10 @@ def test_profile_sra_scopes_prefetch_to_sample_scratch_and_retains_failed_work(t
 
     def fake_run(cmd: list[str], **kwargs):
         calls.append(cmd)
+        if cmd[0] == "prefetch":
+            archive = scratch_dir / "SRR1" / "sra" / "SRR1" / "SRR1.sra"
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            archive.write_text("archive")
         if cmd[0] == "fasterq-dump":
             reads_dir = Path(cmd[cmd.index("--outdir") + 1])
             reads_dir.mkdir(parents=True, exist_ok=True)
@@ -1231,6 +1502,7 @@ def test_profile_sra_scopes_prefetch_to_sample_scratch_and_retains_failed_work(t
     ]
     assert "SRR1" in failures
     assert (scratch_dir / "SRR1" / "reads" / "SRR1.fastq").exists()
+    assert not (scratch_dir / "SRR1" / "sra").exists()
 
 
 def test_profile_sra_reuses_downloaded_reads_on_retry(tmp_path: Path, monkeypatch) -> None:

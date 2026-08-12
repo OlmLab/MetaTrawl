@@ -53,6 +53,12 @@ min_baseq = 25
 min_freq = 0.02
 min_read_ani = 0.97
 read_inclusion = "proper-pairs"
+[profile_import]
+queue_max_samples = 6
+queue_max_gb = 24
+batch_max_samples = 3
+batch_max_gb = 6
+batch_wait_seconds = 0.25
 ''')
     config = load_workflow_config(path, threads=4, sample_count=20)
     assert config.sample_workers == 9
@@ -88,6 +94,11 @@ read_inclusion = "proper-pairs"
     assert config.profile.min_freq == 0.02
     assert config.profile.min_read_ani == 0.97
     assert config.profile.read_inclusion == "proper-pairs"
+    assert config.profile_import.queue_max_samples == 6
+    assert config.profile_import.queue_max_gb == 24.0
+    assert config.profile_import.batch_max_samples == 3
+    assert config.profile_import.batch_max_gb == 6.0
+    assert config.profile_import.batch_wait_seconds == 0.25
 
 
 def test_json_config_is_supported(tmp_path: Path) -> None:
@@ -101,6 +112,8 @@ def test_json_config_is_supported(tmp_path: Path) -> None:
     assert config.profile.min_read_ani == 0.95
     assert config.profile.read_inclusion == "paired"
     assert config.matrix_compare.min_cov is None
+    assert config.profile_import.queue_max_samples == 8
+    assert config.profile_import.queue_max_gb == 32.0
 
 
 def test_config_rejects_unknown_stage(tmp_path: Path) -> None:

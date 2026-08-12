@@ -5,12 +5,16 @@ from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
+import queue
 import re
 import shlex
 import shutil
 import subprocess
 from tempfile import TemporaryDirectory
+import threading
+import time
 from typing import Callable
+import uuid
 
 import polars as pl
 
@@ -18,7 +22,7 @@ from metatrawl import cache
 from metatrawl import db
 from metatrawl import healthcheck
 from metatrawl import matrix_hdf5
-from metatrawl.config import MatrixCompareConfig, ProfileConfig, WorkflowConfig
+from metatrawl.config import MatrixCompareConfig, ProfileConfig, ProfileImportConfig, WorkflowConfig
 from metatrawl.execution import WorkflowRuntime
 from metatrawl.logging import ThrottledMatrixLogger, WorkflowLogger
 
@@ -37,6 +41,198 @@ class SyncSummary:
     skipped: int
     failed: int
     cleaned_files: int
+
+
+@dataclass(frozen=True)
+class _ProfileImportItem:
+    run_id: str
+    bundle: db.ProfileBundle
+    size_bytes: int
+
+
+_IMPORT_STOP = object()
+
+
+class _ProfileBundleImporter:
+    """Import published bundles through one byte-bounded DuckDB writer."""
+
+    def __init__(
+        self,
+        *,
+        db_file: Path,
+        output_dir: Path,
+        cache_dir: Path,
+        config: ProfileImportConfig,
+        cleanup_outputs: bool,
+        logger: WorkflowLogger,
+    ) -> None:
+        self.db_file = Path(db_file)
+        self.output_dir = Path(output_dir)
+        self.cache_dir = Path(cache_dir)
+        self.config = config
+        self.cleanup_outputs = cleanup_outputs
+        self.logger = logger
+        self.imported = 0
+        self.cleaned_files = 0
+        self.failures: dict[str, str] = {}
+        self._queue: queue.Queue[_ProfileImportItem | object] = queue.Queue()
+        self._capacity = threading.Condition()
+        self._pending_samples = 0
+        self._pending_bytes = 0
+        self._closed = False
+        self._fatal_error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="metatrawl-profile-importer",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, run_id: str) -> None:
+        """Queue one durable output bundle, blocking only for backpressure."""
+        bundle = discover_profile_bundle(output_dir=self.output_dir, run_id=run_id)
+        item = _ProfileImportItem(
+            run_id=run_id,
+            bundle=bundle,
+            size_bytes=_profile_bundle_size(bundle),
+        )
+        max_bytes = int(self.config.queue_max_gb * 1024**3)
+        with self._capacity:
+            while (
+                self._pending_samples >= self.config.queue_max_samples
+                or (
+                    self._pending_samples > 0
+                    and self._pending_bytes + item.size_bytes > max_bytes
+                )
+            ):
+                self._raise_if_failed()
+                self._capacity.wait(timeout=0.5)
+            self._raise_if_failed()
+            if self._closed:
+                raise RuntimeError("Profile importer is already closed.")
+            self._pending_samples += 1
+            self._pending_bytes += item.size_bytes
+            pending_samples = self._pending_samples
+            pending_gb = self._pending_bytes / 1024**3
+        self._queue.put(item)
+        self.logger.emit(
+            sample=run_id,
+            step="import",
+            status="queued",
+            queued_samples=pending_samples,
+            queued_gb=f"{pending_gb:.2f}",
+        )
+
+    def finish(self) -> None:
+        """Drain all queued bundles and propagate an importer-thread failure."""
+        with self._capacity:
+            self._closed = True
+        self._queue.put(_IMPORT_STOP)
+        self._thread.join()
+        self._raise_if_failed()
+
+    def _raise_if_failed(self) -> None:
+        if self._fatal_error is not None:
+            raise RuntimeError(f"Profile importer stopped unexpectedly: {self._fatal_error}") from self._fatal_error
+
+    def _run(self) -> None:
+        carry: _ProfileImportItem | None = None
+        stopping = False
+        try:
+            with db.connect(self.db_file) as conn:
+                while not stopping or carry is not None:
+                    if carry is None:
+                        queued = self._queue.get()
+                        if queued is _IMPORT_STOP:
+                            break
+                        carry = queued  # type: ignore[assignment]
+                    batch = [carry]
+                    carry = None
+                    batch_bytes = batch[0].size_bytes
+                    deadline = time.monotonic() + self.config.batch_wait_seconds
+                    while len(batch) < self.config.batch_max_samples and not stopping:
+                        timeout = max(0.0, deadline - time.monotonic())
+                        try:
+                            queued = self._queue.get(timeout=timeout)
+                        except queue.Empty:
+                            break
+                        if queued is _IMPORT_STOP:
+                            stopping = True
+                            break
+                        candidate = queued  # type: ignore[assignment]
+                        max_batch_bytes = int(self.config.batch_max_gb * 1024**3)
+                        if batch_bytes + candidate.size_bytes > max_batch_bytes:
+                            carry = candidate
+                            break
+                        batch.append(candidate)
+                        batch_bytes += candidate.size_bytes
+                    self._import_batch(conn, batch)
+        except BaseException as exc:
+            self._fatal_error = exc
+        finally:
+            with self._capacity:
+                self._capacity.notify_all()
+
+    def _import_batch(self, conn, items: list[_ProfileImportItem]) -> None:
+        self.logger.emit(
+            step="import",
+            status="batch-start",
+            samples=len(items),
+            input_gb=f"{sum(item.size_bytes for item in items) / 1024**3:.2f}",
+        )
+        try:
+            db.import_profile_bundles(
+                conn,
+                [item.bundle for item in items],
+                cache_dir=self.cache_dir,
+            )
+        except Exception as batch_error:
+            if len(items) > 1:
+                self.logger.emit(
+                    step="import",
+                    status="batch-retry-individual",
+                    samples=len(items),
+                    error=batch_error,
+                )
+                for item in items:
+                    self._import_one(conn, item)
+                return
+            self._record_failure(items[0], batch_error)
+            return
+        for item in items:
+            self._record_success(item)
+
+    def _import_one(self, conn, item: _ProfileImportItem) -> None:
+        try:
+            db.import_profile_bundle(conn, item.bundle, cache_dir=self.cache_dir)
+        except Exception as exc:
+            self._record_failure(item, exc)
+        else:
+            self._record_success(item)
+
+    def _record_success(self, item: _ProfileImportItem) -> None:
+        self.imported += 1
+        self.logger.emit(sample=item.run_id, step="import", status="done", imported=self.imported)
+        if self.cleanup_outputs:
+            try:
+                removed = cleanup_profile_bundle(item.bundle)
+            except OSError as exc:
+                self.logger.emit(sample=item.run_id, step="cleanup", status="failed", error=exc)
+            else:
+                self.cleaned_files += removed
+                self.logger.emit(sample=item.run_id, step="cleanup", status="done", removed_files=removed)
+        self._release(item)
+
+    def _record_failure(self, item: _ProfileImportItem, exc: BaseException) -> None:
+        self.failures[item.run_id] = str(exc)
+        self.logger.emit(sample=item.run_id, step="import", status="failed", error=exc)
+        self._release(item)
+
+    def _release(self, item: _ProfileImportItem) -> None:
+        with self._capacity:
+            self._pending_samples -= 1
+            self._pending_bytes -= item.size_bytes
+            self._capacity.notify_all()
 
 
 @dataclass(frozen=True)
@@ -637,10 +833,9 @@ def profile_sra_runs(
     """Profile SRA runs, retaining failed stage outputs for resumable retries.
 
     ``completion_callback`` runs serially in the coordinator thread as soon as a
-    sample finishes. Sync uses it to import each sample before its scratch data is
-    removed, avoiding concurrent DuckDB writers and batch-wide import delays. A
-    sample worker slot is replenished only after that callback and cleanup finish,
-    so completed profiles cannot accumulate beyond ``sample_workers``.
+    sample finishes. Sync uses a fast, bounded enqueue callback; a dedicated
+    single-writer thread performs DuckDB imports while the coordinator replenishes
+    sample workers. A full queue blocks the callback and provides disk backpressure.
     """
     logger = logger or WorkflowLogger()
     workflow_config = workflow_config or WorkflowConfig.legacy(threads=threads, sample_count=len(run_ids))
@@ -760,27 +955,21 @@ def sync_remaining_profiles(
         logger.emit(step="sync", status="done", remaining=0, imported=0)
         return SyncSummary(requested=0, imported=0, skipped=0, failed=0, cleaned_files=0)
 
+    workflow_config = workflow_config or WorkflowConfig.legacy(
+        threads=threads,
+        sample_count=len(run_ids),
+    )
     logger.emit(step="sync", status="start", remaining=len(run_ids), output_dir=output_dir)
-    imported = 0
     skipped = 0
-    cleaned_files = 0
-    with db.connect(db_file) as conn:
-        def import_completed_sample(run_id: str) -> None:
-            nonlocal imported, cleaned_files
-            try:
-                bundle = discover_profile_bundle(output_dir=output_dir, run_id=run_id)
-            except FileNotFoundError as exc:
-                logger.emit(sample=run_id, step="import", status="missing-output", error=exc)
-                raise
-            logger.emit(sample=run_id, step="import", status="start")
-            db.import_profile_bundle(conn, bundle, cache_dir=cache_dir)
-            imported += 1
-            logger.emit(sample=run_id, step="import", status="done", imported=imported)
-            if cleanup_outputs:
-                removed = cleanup_profile_bundle(bundle)
-                cleaned_files += removed
-                logger.emit(sample=run_id, step="cleanup", status="done", removed_files=removed)
-
+    importer = _ProfileBundleImporter(
+        db_file=db_file,
+        output_dir=output_dir,
+        cache_dir=cache_dir,
+        config=workflow_config.profile_import,
+        cleanup_outputs=cleanup_outputs,
+        logger=logger,
+    )
+    try:
         failures = profile_sra_runs(
             run_ids=run_ids,
             db_file=db_file,
@@ -793,27 +982,32 @@ def sync_remaining_profiles(
             workflow_config=workflow_config,
             logger=logger,
             raise_on_error=False,
-            completion_callback=import_completed_sample,
+            completion_callback=importer.submit,
         ) or {}
-        for run_id, error in failures.items():
-            db.mark_run_failed(conn, run_id=run_id, error=error)
+    finally:
+        importer.finish()
+    failures.update(importer.failures)
+    if failures:
+        with db.connect(db_file) as conn:
+            for run_id, error in failures.items():
+                db.mark_run_failed(conn, run_id=run_id, error=error)
 
     failed = len(failures)
     logger.emit(
         step="sync",
         status="done",
         remaining=len(run_ids),
-        imported=imported,
+        imported=importer.imported,
         skipped=skipped,
         failed=failed,
-        cleaned_files=cleaned_files,
+        cleaned_files=importer.cleaned_files,
     )
     return SyncSummary(
         requested=len(run_ids),
-        imported=imported,
+        imported=importer.imported,
         skipped=skipped,
         failed=failed,
-        cleaned_files=cleaned_files,
+        cleaned_files=importer.cleaned_files,
     )
 
 
@@ -887,7 +1081,22 @@ def cleanup_profile_bundle(bundle: db.ProfileBundle) -> int:
         if clean_path.exists():
             clean_path.unlink()
             removed += 1
+    _profile_bundle_ready_marker(bundle.profile_file.parent, bundle.run_id).unlink(missing_ok=True)
     return removed
+
+
+def _profile_bundle_size(bundle: db.ProfileBundle) -> int:
+    paths = {
+        Path(path)
+        for path in (
+            bundle.profile_file,
+            bundle.genome_stats_file,
+            bundle.gene_stats_file,
+            bundle.sylph_abundance_file,
+        )
+        if path is not None
+    }
+    return sum(path.stat().st_size for path in paths)
 
 
 def _profile_one_sra_run(
@@ -902,6 +1111,17 @@ def _profile_one_sra_run(
     profile_config: ProfileConfig,
     logger: WorkflowLogger,
 ) -> None:
+    if output_dir is not None and _published_profile_bundle_complete(
+        run_id=run_id,
+        output_dir=Path(output_dir),
+    ):
+        logger.emit(
+            sample=run_id,
+            step="checkpoint",
+            status="published-bundle",
+            path=Path(output_dir),
+        )
+        return
     sample_scratch = Path(scratch_dir) / run_id
     sample_scratch.mkdir(parents=True, exist_ok=True)
     reads_dir = sample_scratch / "reads"
@@ -909,7 +1129,11 @@ def _profile_one_sra_run(
     sra_dir = sample_scratch / "sra"
     sra_archive = sra_dir / run_id / f"{run_id}.sra"
 
-    if not _sample_fastqs(sample_scratch, required=False):
+    bam_file = sample_scratch / f"{run_id}.bam"
+    read_layout = _read_layout(sample_scratch)
+    if not _sample_fastqs(sample_scratch, required=False) and not (
+        _valid_file(bam_file) and read_layout is not None
+    ):
         logger.emit(sample=run_id, step="download", status="start")
         download_threads = runtime.threads("sra_download")
         if not _valid_file(sra_archive):
@@ -926,9 +1150,29 @@ def _profile_one_sra_run(
             ["fasterq-dump", str(sra_archive), "--outdir", str(reads_dir), "--threads", str(download_threads)],
             sample=run_id,
         )
-        logger.emit(sample=run_id, step="download", status="done", fastqs=len(_sample_fastqs(sample_scratch)))
+        fastqs = _sample_fastqs(sample_scratch)
+        _write_read_layout(sample_scratch, fastqs)
+        removed_bytes = _remove_path(sra_dir)
+        logger.emit(
+            sample=run_id,
+            step="download",
+            status="done",
+            fastqs=len(fastqs),
+            freed_sra_gb=f"{removed_bytes / 1024**3:.2f}",
+        )
+    elif _valid_file(bam_file) and read_layout is not None:
+        logger.emit(sample=run_id, step="download", status="checkpointed-bam", bam=bam_file)
     else:
-        logger.emit(sample=run_id, step="download", status="cached", fastqs=len(_sample_fastqs(sample_scratch)))
+        fastqs = _sample_fastqs(sample_scratch)
+        _write_read_layout(sample_scratch, fastqs)
+        removed_bytes = _remove_path(sra_dir)
+        logger.emit(
+            sample=run_id,
+            step="download",
+            status="cached",
+            fastqs=len(fastqs),
+            freed_sra_gb=f"{removed_bytes / 1024**3:.2f}",
+        )
 
     accessions_file = sample_scratch / "accessions.txt"
     if not accessions_file.exists() and accessions_dir is not None:
@@ -962,7 +1206,7 @@ def _profile_one_sra_run(
         output_dir.mkdir(parents=True, exist_ok=True)
         published_sylph = output_dir / f"{run_id}.sylph.tsv"
         if not _valid_file(published_sylph):
-            shutil.copy2(sylph_output, published_sylph)
+            _atomic_copy(sylph_output, published_sylph)
             logger.emit(sample=run_id, step="sylph", status="published", file=published_sylph)
 
     accessions = cache.read_accessions_file(accessions_file)
@@ -991,6 +1235,37 @@ def _profile_one_sra_run(
 
 def _valid_file(path: Path) -> bool:
     return path.is_file() and path.stat().st_size > 0
+
+
+def _read_layout(sample_scratch: Path) -> str | None:
+    path = sample_scratch / "read_layout.txt"
+    if not path.is_file():
+        return None
+    value = path.read_text().strip()
+    return value if value in {"paired", "single"} else None
+
+
+def _write_read_layout(sample_scratch: Path, fastqs: list[Path]) -> str:
+    layout = "paired" if len(fastqs) == 2 else "single"
+    path = sample_scratch / "read_layout.txt"
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(layout + "\n")
+    temporary.replace(path)
+    return layout
+
+
+def _remove_path(path: Path) -> int:
+    """Remove a scratch path and return its approximate released bytes."""
+    path = Path(path)
+    if not path.exists():
+        return 0
+    if path.is_dir():
+        size = sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+        shutil.rmtree(path)
+        return size
+    size = path.stat().st_size
+    path.unlink()
+    return size
 
 
 def _cached_reference(reference_dir: Path) -> cache.PreparedReference | None:
@@ -1085,32 +1360,27 @@ def _run_alignment_and_profile(
     _ensure_null_model(profile_work=profile_work, run_id=run_id, logger=logger, runtime=runtime)
     _ensure_reference_fai(profile_work=profile_work, run_id=run_id, logger=logger, runtime=runtime)
 
-    if not _bowtie_index_complete(reference.reference_fasta):
-        logger.emit(sample=run_id, step="bowtie2-build", status="start")
-        bowtie_threads = runtime.threads("bowtie_build")
-        runtime.run(
-            "bowtie_build",
-            ["bowtie2-build", "--threads", str(bowtie_threads), str(reference.reference_fasta), str(reference.reference_fasta)],
-            sample=run_id,
-        )
-        logger.emit(sample=run_id, step="bowtie2-build", status="done")
-    else:
-        logger.emit(sample=run_id, step="bowtie2-build", status="cached")
-
-    fastqs = _sample_fastqs(sample_scratch)
-    read_inclusion = profile_config.read_inclusion if len(fastqs) == 2 else "all-mapped"
-    if read_inclusion != profile_config.read_inclusion:
-        logger.emit(
-            sample=run_id,
-            step="profile",
-            status="read-inclusion-override",
-            requested=profile_config.read_inclusion,
-            using=read_inclusion,
-            reason="single-end reads",
-        )
-
     bam_file = sample_scratch / f"{run_id}.bam"
     if not _valid_file(bam_file):
+        fastqs = _sample_fastqs(sample_scratch)
+        read_layout = _write_read_layout(sample_scratch, fastqs)
+        if not _bowtie_index_complete(reference.reference_fasta):
+            logger.emit(sample=run_id, step="bowtie2-build", status="start")
+            bowtie_threads = runtime.threads("bowtie_build")
+            runtime.run(
+                "bowtie_build",
+                [
+                    "bowtie2-build",
+                    "--threads",
+                    str(bowtie_threads),
+                    str(reference.reference_fasta),
+                    str(reference.reference_fasta),
+                ],
+                sample=run_id,
+            )
+            logger.emit(sample=run_id, step="bowtie2-build", status="done")
+        else:
+            logger.emit(sample=run_id, step="bowtie2-build", status="cached")
         logger.emit(sample=run_id, step="align", status="start", bam=bam_file)
         temporary_bam = bam_file.with_suffix(".bam.tmp")
         temporary_bam.unlink(missing_ok=True)
@@ -1126,10 +1396,46 @@ def _run_alignment_and_profile(
         )
         if not _valid_file(temporary_bam):
             raise RuntimeError(f"sample={run_id} step=align did not produce a non-empty BAM: {temporary_bam}")
+        _validate_bam(temporary_bam, run_id=run_id)
         temporary_bam.replace(bam_file)
         logger.emit(sample=run_id, step="align", status="done", bam=bam_file)
     else:
+        _validate_bam(bam_file, run_id=run_id)
+        read_layout = _read_layout(sample_scratch)
+        if read_layout is None:
+            fastqs = _sample_fastqs(sample_scratch, required=False)
+            if not fastqs:
+                raise RuntimeError(
+                    f"sample={run_id} step=align has a checkpointed BAM but no read-layout checkpoint: "
+                    f"{sample_scratch / 'read_layout.txt'}"
+                )
+            read_layout = _write_read_layout(sample_scratch, fastqs)
         logger.emit(sample=run_id, step="align", status="cached", bam=bam_file)
+
+    read_inclusion = profile_config.read_inclusion if read_layout == "paired" else "all-mapped"
+    if read_inclusion != profile_config.read_inclusion:
+        logger.emit(
+            sample=run_id,
+            step="profile",
+            status="read-inclusion-override",
+            requested=profile_config.read_inclusion,
+            using=read_inclusion,
+            reason="single-end reads",
+        )
+    released = 0
+    for fastq in _sample_fastqs(sample_scratch, required=False):
+        released += _remove_path(fastq)
+    reads_dir = sample_scratch / "reads"
+    if reads_dir.exists() and not any(reads_dir.iterdir()):
+        reads_dir.rmdir()
+    for index_file in _bowtie_index_paths(reference.reference_fasta):
+        released += _remove_path(index_file)
+    logger.emit(
+        sample=run_id,
+        step="scratch",
+        status="released-alignment-inputs",
+        freed_gb=f"{released / 1024**3:.2f}",
+    )
 
     if not _published_profile_bundle_complete(run_id=run_id, output_dir=output_dir):
         logger.emit(sample=run_id, step="profile", status="start")
@@ -1172,9 +1478,22 @@ def _run_alignment_and_profile(
             sample=run_id,
         )
         _publish_profile_outputs(run_id=run_id, profile_work=profile_work, output_dir=output_dir)
+        _publish_bundle_ready_marker(output_dir, run_id)
         logger.emit(sample=run_id, step="profile", status="done", output_dir=output_dir)
     else:
+        _publish_bundle_ready_marker(output_dir, run_id)
         logger.emit(sample=run_id, step="profile", status="cached", output_dir=output_dir)
+    released = _remove_path(bam_file)
+    released += _remove_path(profile_work)
+    reference_parent = reference.reference_fasta.parent
+    if reference_parent.resolve().is_relative_to(sample_scratch.resolve()):
+        released += _remove_path(reference_parent)
+    logger.emit(
+        sample=run_id,
+        step="scratch",
+        status="released-profile-inputs",
+        freed_gb=f"{released / 1024**3:.2f}",
+    )
 
 
 def _sample_fastqs(sample_scratch: Path, *, required: bool = True) -> list[Path]:
@@ -1187,10 +1506,41 @@ def _sample_fastqs(sample_scratch: Path, *, required: bool = True) -> list[Path]
     return fastqs
 
 
+def _validate_bam(bam_file: Path, *, run_id: str) -> None:
+    _run(
+        ["samtools", "quickcheck", str(bam_file)],
+        sample=run_id,
+        step="align-validation",
+    )
+
+
+def _bowtie_index_paths(reference_fasta: Path) -> list[Path]:
+    suffixes = ("1", "2", "3", "4", "rev.1", "rev.2")
+    return [
+        Path(f"{reference_fasta}.{suffix}.{extension}")
+        for extension in ("bt2", "bt2l")
+        for suffix in suffixes
+    ]
+
+
 def _bowtie_index_complete(reference_fasta: Path) -> bool:
-    small = [Path(f"{reference_fasta}.{suffix}.bt2") for suffix in ("1", "2", "3", "4", "rev.1", "rev.2")]
-    large = [Path(f"{reference_fasta}.{suffix}.bt2l") for suffix in ("1", "2", "3", "4", "rev.1", "rev.2")]
+    paths = _bowtie_index_paths(reference_fasta)
+    small = paths[:6]
+    large = paths[6:]
     return all(_valid_file(path) for path in small) or all(_valid_file(path) for path in large)
+
+
+def _profile_bundle_ready_marker(output_dir: Path, run_id: str) -> Path:
+    return Path(output_dir) / f".{run_id}.bundle.ready"
+
+
+def _publish_bundle_ready_marker(output_dir: Path, run_id: str) -> None:
+    if not _published_profile_bundle_complete(run_id=run_id, output_dir=output_dir):
+        raise RuntimeError(f"sample={run_id} step=profile cannot publish an incomplete output bundle")
+    marker = _profile_bundle_ready_marker(output_dir, run_id)
+    temporary = marker.with_name(f".{marker.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text("ready\n")
+    temporary.replace(marker)
 
 
 def _published_profile_bundle_complete(*, run_id: str, output_dir: Path) -> bool:
@@ -1273,7 +1623,19 @@ def _publish_profile_outputs(*, run_id: str, profile_work: Path, output_dir: Pat
     if missing:
         raise FileNotFoundError(f"sample={run_id} step=profile missing expected ZipStrain outputs: {', '.join(missing)}")
     for source, destination in outputs.items():
-        shutil.copy2(source, destination)
+        _atomic_copy(source, destination)
+
+
+def _atomic_copy(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        shutil.copy2(source, temporary)
+        if not _valid_file(temporary):
+            raise RuntimeError(f"Atomic publication produced an empty file: {temporary}")
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _run_sylph_profile(

@@ -494,6 +494,52 @@ def import_profile_bundle(
     cache_dir: Path | None = None,
 ) -> None:
     """Import profile, stat, and abundance files into project tables."""
+    import_profile_bundles(
+        conn,
+        [bundle],
+        add_runs_if_missing=add_run_if_missing,
+        cache_dir=cache_dir,
+    )
+
+
+def import_profile_bundles(
+    conn: duckdb.DuckDBPyConnection,
+    bundles: list[ProfileBundle],
+    *,
+    add_runs_if_missing: bool = False,
+    cache_dir: Path | None = None,
+) -> None:
+    """Import multiple bundles in one transaction using one DuckDB writer."""
+    if not bundles:
+        return
+    for bundle in bundles:
+        _validate_profile_bundle(
+            conn,
+            bundle,
+            add_run_if_missing=add_runs_if_missing,
+        )
+    storage = profile_storage_config(conn)
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        for bundle in bundles:
+            _import_profile_bundle_rows(
+                conn,
+                bundle,
+                storage=storage,
+                cache_dir=cache_dir,
+            )
+        conn.execute("COMMIT")
+    except Exception:
+        _rollback_quietly(conn)
+        raise
+
+
+def _validate_profile_bundle(
+    conn: duckdb.DuckDBPyConnection,
+    bundle: ProfileBundle,
+    *,
+    add_run_if_missing: bool,
+) -> None:
     if conn.execute("SELECT 1 FROM sra_runs WHERE run_id = ?", [bundle.run_id]).fetchone() is None:
         if not add_run_if_missing:
             raise ValueError(f"Cannot import profile for unknown run_id: {bundle.run_id}")
@@ -504,75 +550,83 @@ def import_profile_bundle(
     if bundle.gene_stats_file is not None:
         _require_existing_file(bundle.gene_stats_file, "gene_stats_file")
 
+
+def _import_profile_bundle_rows(
+    conn: duckdb.DuckDBPyConnection,
+    bundle: ProfileBundle,
+    *,
+    storage: ProfileStorageConfig,
+    cache_dir: Path | None,
+) -> None:
     sample_id = bundle.run_id
     now = time.time()
-    storage = profile_storage_config(conn)
-    conn.execute("BEGIN TRANSACTION")
+    conn.execute("DELETE FROM profile_positions WHERE sample_id = ?", [sample_id])
+    conn.execute(
+        "DELETE FROM allele_mask_profile_blocks WHERE sample_id = ?",
+        [sample_id],
+    )
+    conn.execute("DELETE FROM genome_stats WHERE sample_id = ?", [sample_id])
+    conn.execute("DELETE FROM gene_stats WHERE sample_id = ?", [sample_id])
+    conn.execute("DELETE FROM sylph_abundance WHERE sample_id = ?", [sample_id])
+
+    if storage.mode == allele_mask.PROFILE_STORAGE_ALLELE_MASK:
+        allele_mask.store_profile_parquet(
+            conn,
+            sample_id=sample_id,
+            profile_file=bundle.profile_file,
+            min_cov=int(storage.min_cov),
+            cache_dir=cache_dir,
+        )
+    else:
+        _insert_profile_positions(
+            conn,
+            sample_id=sample_id,
+            profile_file=bundle.profile_file,
+        )
+    _insert_genome_stats(conn, sample_id=sample_id, stats_file=bundle.genome_stats_file)
+    if bundle.gene_stats_file is not None:
+        _insert_gene_stats(conn, sample_id=sample_id, stats_file=bundle.gene_stats_file)
+    _insert_sylph_abundance(conn, sample_id=sample_id, abundance_file=bundle.sylph_abundance_file)
+
+    existing = conn.execute("SELECT created_at FROM samples WHERE sample_id = ?", [sample_id]).fetchone()
+    created_at = float(existing[0]) if existing is not None else now
+    conn.execute(
+        "INSERT OR REPLACE INTO samples VALUES (?, ?, 'complete', ?, ?)",
+        [sample_id, bundle.run_id, created_at, now],
+    )
+    profile_existing = conn.execute("SELECT created_at FROM profiles WHERE run_id = ?", [bundle.run_id]).fetchone()
+    profile_created_at = float(profile_existing[0]) if profile_existing is not None else now
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO profiles
+          (run_id, profile_file, genome_stats_file, gene_stats_file,
+           sylph_abundance_file, profile_storage_mode, profile_min_cov,
+           created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            bundle.run_id,
+            str(bundle.profile_file),
+            str(bundle.genome_stats_file),
+            str(bundle.gene_stats_file) if bundle.gene_stats_file is not None else None,
+            str(bundle.sylph_abundance_file),
+            storage.mode,
+            storage.min_cov,
+            profile_created_at,
+            now,
+        ],
+    )
+    conn.execute(
+        "UPDATE sra_runs SET status = 'complete', updated_at = ? WHERE run_id = ?",
+        [now, bundle.run_id],
+    )
+
+
+def _rollback_quietly(conn: duckdb.DuckDBPyConnection) -> None:
     try:
-        conn.execute("DELETE FROM profile_positions WHERE sample_id = ?", [sample_id])
-        conn.execute(
-            "DELETE FROM allele_mask_profile_blocks WHERE sample_id = ?",
-            [sample_id],
-        )
-        conn.execute("DELETE FROM genome_stats WHERE sample_id = ?", [sample_id])
-        conn.execute("DELETE FROM gene_stats WHERE sample_id = ?", [sample_id])
-        conn.execute("DELETE FROM sylph_abundance WHERE sample_id = ?", [sample_id])
-
-        if storage.mode == allele_mask.PROFILE_STORAGE_ALLELE_MASK:
-            allele_mask.store_profile_parquet(
-                conn,
-                sample_id=sample_id,
-                profile_file=bundle.profile_file,
-                min_cov=int(storage.min_cov),
-                cache_dir=cache_dir,
-            )
-        else:
-            _insert_profile_positions(
-                conn,
-                sample_id=sample_id,
-                profile_file=bundle.profile_file,
-            )
-        _insert_genome_stats(conn, sample_id=sample_id, stats_file=bundle.genome_stats_file)
-        if bundle.gene_stats_file is not None:
-            _insert_gene_stats(conn, sample_id=sample_id, stats_file=bundle.gene_stats_file)
-        _insert_sylph_abundance(conn, sample_id=sample_id, abundance_file=bundle.sylph_abundance_file)
-
-        existing = conn.execute("SELECT created_at FROM samples WHERE sample_id = ?", [sample_id]).fetchone()
-        created_at = float(existing[0]) if existing is not None else now
-        conn.execute(
-            "INSERT OR REPLACE INTO samples VALUES (?, ?, 'complete', ?, ?)",
-            [sample_id, bundle.run_id, created_at, now],
-        )
-        profile_existing = conn.execute("SELECT created_at FROM profiles WHERE run_id = ?", [bundle.run_id]).fetchone()
-        profile_created_at = float(profile_existing[0]) if profile_existing is not None else now
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO profiles
-              (run_id, profile_file, genome_stats_file, gene_stats_file,
-               sylph_abundance_file, profile_storage_mode, profile_min_cov,
-               created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                bundle.run_id,
-                str(bundle.profile_file),
-                str(bundle.genome_stats_file),
-                str(bundle.gene_stats_file) if bundle.gene_stats_file is not None else None,
-                str(bundle.sylph_abundance_file),
-                storage.mode,
-                storage.min_cov,
-                profile_created_at,
-                now,
-            ],
-        )
-        conn.execute(
-            "UPDATE sra_runs SET status = 'complete', updated_at = ? WHERE run_id = ?",
-            [now, bundle.run_id],
-        )
-        conn.execute("COMMIT")
-    except Exception:
         conn.execute("ROLLBACK")
-        raise
+    except Exception:
+        pass
 
 
 def add_profiles(

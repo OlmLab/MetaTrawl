@@ -94,11 +94,23 @@ class ProfileConfig:
     min_read_ani: float | None = 0.95
     read_inclusion: str = "paired"
 
+
+@dataclass(frozen=True)
+class ProfileImportConfig:
+    """Backpressure and transaction limits for the single DuckDB importer."""
+
+    queue_max_samples: int = 8
+    queue_max_gb: float = 32.0
+    batch_max_samples: int = 4
+    batch_max_gb: float = 8.0
+    batch_wait_seconds: float = 1.0
+
 @dataclass(frozen=True)
 class WorkflowConfig:
     sample_workers: int
     stages: dict[str, StageConfig]
     profile: ProfileConfig = field(default_factory=ProfileConfig)
+    profile_import: ProfileImportConfig = field(default_factory=ProfileImportConfig)
     matrix_build: MatrixBuildConfig = field(default_factory=MatrixBuildConfig)
     matrix_compare: MatrixCompareConfig = field(default_factory=MatrixCompareConfig)
     genome_view: GenomeViewConfig = field(default_factory=GenomeViewConfig)
@@ -189,6 +201,9 @@ def _parse(raw: dict[str, Any], *, threads: int, sample_count: int) -> WorkflowC
     profile = raw.get("profile", {})
     if not isinstance(profile, dict):
         raise ValueError("profile must be a table/object.")
+    profile_import = raw.get("profile_import", {})
+    if not isinstance(profile_import, dict):
+        raise ValueError("profile_import must be a table/object.")
     read_inclusion = str(profile.get("read_inclusion", ProfileConfig.read_inclusion)).strip()
     if read_inclusion not in READ_INCLUSION_CHOICES:
         raise ValueError(f"profile.read_inclusion must be one of: {', '.join(READ_INCLUSION_CHOICES)}")
@@ -201,6 +216,27 @@ def _parse(raw: dict[str, Any], *, threads: int, sample_count: int) -> WorkflowC
             "profile.min_read_ani",
         ),
         read_inclusion=read_inclusion,
+    ), profile_import=ProfileImportConfig(
+        queue_max_samples=_positive(
+            profile_import.get("queue_max_samples", ProfileImportConfig.queue_max_samples),
+            "profile_import.queue_max_samples",
+        ),
+        queue_max_gb=_positive_float(
+            profile_import.get("queue_max_gb", ProfileImportConfig.queue_max_gb),
+            "profile_import.queue_max_gb",
+        ),
+        batch_max_samples=_positive(
+            profile_import.get("batch_max_samples", ProfileImportConfig.batch_max_samples),
+            "profile_import.batch_max_samples",
+        ),
+        batch_max_gb=_positive_float(
+            profile_import.get("batch_max_gb", ProfileImportConfig.batch_max_gb),
+            "profile_import.batch_max_gb",
+        ),
+        batch_wait_seconds=_nonnegative_float(
+            profile_import.get("batch_wait_seconds", ProfileImportConfig.batch_wait_seconds),
+            "profile_import.batch_wait_seconds",
+        ),
     ), matrix_build=MatrixBuildConfig(
         memory_limit_gb=_optional_positive_float(build.get("memory_limit_gb"), "matrix_build.memory_limit_gb"),
         export_batch_mb=_optional_positive_float(build.get("export_batch_mb"), "matrix_build.export_batch_mb"),
@@ -303,6 +339,13 @@ def _optional_positive_float(value: Any, key: str) -> float | None:
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{key} must be a positive number.") from exc
     if result <= 0:
+        raise ValueError(f"{key} must be a positive number.")
+    return result
+
+
+def _positive_float(value: Any, key: str) -> float:
+    result = _optional_positive_float(value, key)
+    if result is None:
         raise ValueError(f"{key} must be a positive number.")
     return result
 
