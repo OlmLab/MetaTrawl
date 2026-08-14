@@ -1681,7 +1681,7 @@ def test_matrix_build_filters_samples_exports_selected_and_passes_sparse(tmp_pat
         conn.execute(
             """
             INSERT INTO profile_positions
-            VALUES ('SRR_PASS', 'other_contig', 1, 'other_genome', 'geneX', 1, 0, 0, 0, NULL)
+            VALUES ('SRR_PASS', 'other_contig', 1, 'other_genome', 1, 0, 0, 0, NULL)
             """
         )
     bed_file, stb_file = _matrix_contract_files(tmp_path)
@@ -2214,7 +2214,7 @@ def test_matrix_append_exports_only_eligible_samples_and_matrix_genome(tmp_path:
         conn.execute(
             """
             INSERT INTO profile_positions
-            VALUES ('SRR_PASS', 'other_contig', 1, 'other_genome', 'geneX', 1, 0, 0, 0, NULL)
+            VALUES ('SRR_PASS', 'other_contig', 1, 'other_genome', 1, 0, 0, 0, NULL)
             """
         )
         registry.register_matrix_store(

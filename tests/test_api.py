@@ -37,11 +37,11 @@ def _database(tmp_path: Path) -> Path:
             ],
         )
         conn.executemany(
-            "INSERT INTO profile_positions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO profile_positions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
-                ("sample_a", "contig_1", 1, "genome_1", "gene_1", 5.0, 0.0, 0.0, 0.0, 1),
-                ("sample_a", "contig_1", 2, "genome_1", "gene_1", 0.0, 5.0, 0.0, 0.0, 2),
-                ("sample_b", "contig_1", 1, "genome_1", "gene_1", 6.0, 0.0, 0.0, 0.0, 1),
+                ("sample_a", "contig_1", 1, "genome_1", 5.0, 0.0, 0.0, 0.0, 1),
+                ("sample_a", "contig_1", 2, "genome_1", 0.0, 5.0, 0.0, 0.0, 2),
+                ("sample_b", "contig_1", 1, "genome_1", 6.0, 0.0, 0.0, 0.0, 1),
             ],
         )
         conn.executemany(
@@ -75,8 +75,8 @@ def test_sample_view_queries_profiles_genomes_and_genes(tmp_path: Path) -> None:
 
     assert sample.genome_stats().collect()["genome"].to_list() == ["genome_1", "genome_2"]
     assert sample.gene_stats(genome="genome_1").collect()["gene"].to_list() == ["gene_1", "gene_2"]
-    profile = sample.profile(genome="genome_1", gene="gene_1").collect()
-    assert profile.shape == (2, 10)
+    profile = sample.profile(genome="genome_1").collect()
+    assert profile.shape == (2, 9)
     assert profile["pos"].to_list() == [1, 2]
     assert profile["ref_base_bitmask"].to_list() == [1, 2]
     assert profile.select("A", "C", "G", "T").schema == {
@@ -103,7 +103,7 @@ def test_query_sinks_directly_to_parquet(tmp_path: Path) -> None:
 
     assert returned == output.resolve()
     exported = pl.read_parquet(output)
-    assert exported.shape == (3, 10)
+    assert exported.shape == (3, 9)
     assert set(exported["sample_id"]) == {"sample_a", "sample_b"}
     with pytest.raises(FileExistsError):
         query.sink_parquet(output)
@@ -189,6 +189,8 @@ def test_connect_normalizes_existing_sylph_genome_paths(tmp_path: Path) -> None:
                 "gtdb/database/GCF/901/875/305/GCF_901875305.1_genomic.fna.gz",
             ],
         )
+        # A database written by a pre-migration MetaTrawl has no migration marker.
+        conn.execute("DELETE FROM metatrawl_migrations WHERE name = 'normalize_sylph_genomes'")
 
     with registry.connect(db_path) as conn:
         value = conn.execute(
@@ -196,6 +198,27 @@ def test_connect_normalizes_existing_sylph_genome_paths(tmp_path: Path) -> None:
         ).fetchone()
 
     assert value == ("GCF_901875305.1", "GCF_901875305.1")
+
+
+def test_sylph_normalization_runs_only_once(tmp_path: Path) -> None:
+    db_path = _database(tmp_path)
+    with registry.connect(db_path) as conn:
+        applied = conn.execute(
+            "SELECT count(*) FROM metatrawl_migrations WHERE name = 'normalize_sylph_genomes'"
+        ).fetchone()[0]
+    assert applied == 1
+
+    # Once recorded, a later connection must not rescan/rewrite sylph_abundance.
+    with registry.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE sylph_abundance SET genome = ? WHERE sample_id = 'sample_a'",
+            ["gtdb/database/GCF/901/875/305/GCF_901875305.1_genomic.fna.gz"],
+        )
+    with registry.connect(db_path) as conn:
+        value = conn.execute(
+            "SELECT genome FROM sylph_abundance WHERE sample_id = 'sample_a'"
+        ).fetchone()[0]
+    assert value == "gtdb/database/GCF/901/875/305/GCF_901875305.1_genomic.fna.gz"
 
 
 def test_database_lists_distinct_genomes_and_samples(tmp_path: Path) -> None:

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import os
 import re
 import time
-from typing import Callable
+from typing import Callable, Iterable
 
 import duckdb
 import polars as pl
@@ -52,7 +53,6 @@ CREATE TABLE IF NOT EXISTS profile_positions (
     chrom VARCHAR NOT NULL,
     pos BIGINT NOT NULL,
     genome VARCHAR NOT NULL,
-    gene VARCHAR,
     A USMALLINT NOT NULL,
     C USMALLINT NOT NULL,
     G USMALLINT NOT NULL,
@@ -179,7 +179,16 @@ CREATE TABLE IF NOT EXISTS matrix_compares (
     created_at DOUBLE NOT NULL,
     updated_at DOUBLE NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS metatrawl_migrations (
+    name VARCHAR PRIMARY KEY,
+    applied_at DOUBLE NOT NULL
+);
 """
+
+DEFAULT_MEMORY_LIMIT_GB = 20.0
+MEMORY_LIMIT_ENV_VAR = "METATRAWL_MEMORY_LIMIT_GB"
+THREADS_ENV_VAR = "METATRAWL_THREADS"
 
 
 @dataclass(frozen=True)
@@ -225,18 +234,75 @@ class ProfileStorageConfig:
     allele_bit_order: str | None = None
 
 
-def connect(db_path: str | Path) -> duckdb.DuckDBPyConnection:
+def connect(
+    db_path: str | Path,
+    *,
+    memory_limit_gb: float | None = None,
+    threads: int | None = None,
+) -> duckdb.DuckDBPyConnection:
     """Open a DuckDB connection and ensure the MetaTrawl schema exists."""
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = duckdb.connect(str(path))
+    _apply_connection_settings(conn, memory_limit_gb=memory_limit_gb, threads=threads)
     init_schema(conn)
     return conn
 
 
-def connect_read_only(db_path: str | Path) -> duckdb.DuckDBPyConnection:
+def connect_read_only(
+    db_path: str | Path,
+    *,
+    memory_limit_gb: float | None = None,
+    threads: int | None = None,
+) -> duckdb.DuckDBPyConnection:
     """Open a read-only DuckDB connection for concurrent matrix jobs."""
-    return duckdb.connect(str(Path(db_path)), read_only=True)
+    conn = duckdb.connect(str(Path(db_path)), read_only=True)
+    _apply_connection_settings(conn, memory_limit_gb=memory_limit_gb, threads=threads)
+    return conn
+
+
+def resolve_memory_limit_gb(memory_limit_gb: float | None = None) -> float | None:
+    """Resolve the connection memory limit from the argument, env var, or default.
+
+    A non-positive value disables the limit and restores DuckDB's own default.
+    """
+    if memory_limit_gb is None:
+        raw = os.environ.get(MEMORY_LIMIT_ENV_VAR)
+        if raw is not None and raw.strip():
+            try:
+                memory_limit_gb = float(raw)
+            except ValueError as exc:
+                raise ValueError(f"{MEMORY_LIMIT_ENV_VAR} must be a number, got: {raw!r}") from exc
+        else:
+            memory_limit_gb = DEFAULT_MEMORY_LIMIT_GB
+    return memory_limit_gb if memory_limit_gb > 0 else None
+
+
+def _resolve_threads(threads: int | None) -> int | None:
+    if threads is not None:
+        return max(1, int(threads))
+    raw = os.environ.get(THREADS_ENV_VAR)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return max(1, int(raw))
+    except ValueError as exc:
+        raise ValueError(f"{THREADS_ENV_VAR} must be an integer, got: {raw!r}") from exc
+
+
+def _apply_connection_settings(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    memory_limit_gb: float | None,
+    threads: int | None,
+) -> None:
+    """Bound DuckDB memory so long imports spill instead of exhausting the host."""
+    resolved_memory = resolve_memory_limit_gb(memory_limit_gb)
+    if resolved_memory is not None:
+        conn.execute(f"SET memory_limit = {_sql_literal(f'{resolved_memory}GB')}")
+    resolved_threads = _resolve_threads(threads)
+    if resolved_threads is not None:
+        conn.execute(f"SET threads = {resolved_threads}")
 
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
@@ -282,8 +348,11 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         """,
         [allele_mask.ALLELE_MASK_FORMAT_VERSION],
     )
+    # MetaTrawl never reads profile_positions.gene: the matrix export selects
+    # chrom/pos/ACGT only. Dropping it is metadata-only and idempotent.
+    conn.execute("ALTER TABLE profile_positions DROP COLUMN IF EXISTS gene")
     _migrate_profile_counts_to_uint16(conn)
-    _normalize_existing_sylph_genomes(conn)
+    _run_once(conn, "normalize_sylph_genomes", _normalize_existing_sylph_genomes)
     if had_legacy_matrix_profiles:
         conn.execute(
             """
@@ -1060,23 +1129,21 @@ def _insert_profile_positions(conn: duckdb.DuckDBPyConnection, *, sample_id: str
         _insert_profile_positions_via_polars(conn, sample_id=sample_id, profile_file=profile_file)
         return
 
-    columns = _duckdb_parquet_columns(conn, profile_file)
+    columns = set(_duckdb_parquet_schema(conn, profile_file))
     required = {"chrom", "pos", "genome", "A", "C", "G", "T"}
     missing = required - columns
     if missing:
         raise ValueError(f"profile_file missing required columns: {', '.join(sorted(missing))}")
-    gene_expr = "CAST(gene AS VARCHAR)" if "gene" in columns else "'NA'"
     ref_expr = "CAST(ref_base_bitmask AS UTINYINT)" if "ref_base_bitmask" in columns else "CAST(NULL AS UTINYINT)"
     conn.execute(
         f"""
         INSERT INTO profile_positions
-          (sample_id, chrom, pos, genome, gene, A, C, G, T, ref_base_bitmask)
+          (sample_id, chrom, pos, genome, A, C, G, T, ref_base_bitmask)
         SELECT
           ? AS sample_id,
           CAST(chrom AS VARCHAR) AS chrom,
           CAST(pos AS BIGINT) AS pos,
           CAST(genome AS VARCHAR) AS genome,
-          {gene_expr} AS gene,
           CAST(A AS USMALLINT) AS A,
           CAST(C AS USMALLINT) AS C,
           CAST(G AS USMALLINT) AS G,
@@ -1094,14 +1161,11 @@ def _insert_profile_positions_via_polars(conn: duckdb.DuckDBPyConnection, *, sam
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"profile_file missing required columns: {', '.join(sorted(missing))}")
-    if "gene" not in df.columns:
-        df = df.with_columns(pl.lit("NA").alias("gene"))
     df = df.select(
         pl.lit(sample_id).alias("sample_id"),
         pl.col("chrom").cast(pl.Utf8),
         pl.col("pos").cast(pl.Int64),
         pl.col("genome").cast(pl.Utf8),
-        pl.col("gene").cast(pl.Utf8),
         pl.col("A").cast(pl.UInt16),
         pl.col("C").cast(pl.UInt16),
         pl.col("G").cast(pl.UInt16),
@@ -1116,91 +1180,184 @@ def _insert_profile_positions_via_polars(conn: duckdb.DuckDBPyConnection, *, sam
     try:
         conn.execute(
             """INSERT INTO profile_positions
-               (sample_id, chrom, pos, genome, gene, A, C, G, T, ref_base_bitmask)
-               SELECT sample_id, chrom, pos, genome, gene, A, C, G, T, ref_base_bitmask
+               (sample_id, chrom, pos, genome, A, C, G, T, ref_base_bitmask)
+               SELECT sample_id, chrom, pos, genome, A, C, G, T, ref_base_bitmask
                FROM _metatrawl_profile_positions"""
         )
     finally:
         conn.unregister("_metatrawl_profile_positions")
 
 
-def _duckdb_parquet_columns(conn: duckdb.DuckDBPyConnection, path: Path) -> set[str]:
+def _duckdb_parquet_schema(conn: duckdb.DuckDBPyConnection, path: Path) -> dict[str, str]:
+    """Return the parquet column names mapped to their DuckDB type names."""
     rows = conn.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(path)]).fetchall()
-    return {str(row[0]) for row in rows}
+    return {str(row[0]): str(row[1]).upper() for row in rows}
+
+
+def _sql_identifier(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+_FLOAT_PARQUET_TYPES = {"FLOAT", "DOUBLE", "REAL", "DECIMAL"}
+
+
+def _is_float_type(type_name: str) -> bool:
+    return any(type_name.startswith(candidate) for candidate in _FLOAT_PARQUET_TYPES)
+
+
+def _optional_sql_expr(schema: dict[str, str], names: list[str], sql_type: str) -> str:
+    """Mirror `_optional_*_expr`, but as SQL over `read_parquet`.
+
+    Polars casts float -> integer by truncating toward zero while DuckDB rounds,
+    so float sources are truncated explicitly to keep imported values identical.
+    """
+    for name in names:
+        if name in schema:
+            column = _sql_identifier(name)
+            if sql_type == "BIGINT" and _is_float_type(schema[name]):
+                return f"CAST(TRUNC({column}) AS BIGINT)"
+            return f"CAST({column} AS {sql_type})"
+    return f"CAST(NULL AS {sql_type})"
+
+
+GENOME_COLUMN_CANDIDATES = ["genome", "genome_name", "reference", "accession"]
+
+# (target column, source column candidates, SQL type). Shared by the parquet and
+# the CSV/TSV import paths so the two cannot drift apart.
+_GENOME_STATS_FIELDS: tuple[tuple[str, list[str], str], ...] = (
+    ("coverage", ["coverage", "cov", "mean_coverage"], "DOUBLE"),
+    ("breadth", ["breadth", "breadth_coverage", "breadth_cov"], "DOUBLE"),
+    ("ber", ["ber", "BER"], "DOUBLE"),
+    ("ref_ani", ["ref_ani", "reference_ani"], "DOUBLE"),
+    ("coverage_median", ["coverage_median"], "DOUBLE"),
+    ("coverage_std", ["coverage_std"], "DOUBLE"),
+    ("genome_length", ["genome_length", "length"], "BIGINT"),
+    ("gap_mean", ["gap_mean"], "DOUBLE"),
+    ("gap_std", ["gap_std"], "DOUBLE"),
+    ("5x_cov_sites", ["5x_cov_sites"], "BIGINT"),
+    ("heterogeneity", ["heterogeneity"], "DOUBLE"),
+    ("fug", ["fug", "FUG"], "DOUBLE"),
+    ("reads_mapped", ["reads_mapped"], "BIGINT"),
+    ("conANI_reference", ["conANI_reference", "conani_reference"], "DOUBLE"),
+    ("SNS_count", ["SNS_count", "sns_count"], "BIGINT"),
+    ("SNV_count", ["SNV_count", "snv_count"], "BIGINT"),
+    ("presence", ["presence"], "VARCHAR"),
+    ("genome_taxonomy", ["genome_taxonomy", "taxonomy"], "VARCHAR"),
+)
+
+_GENE_STATS_FIELDS: tuple[tuple[str, list[str], str], ...] = (
+    ("coverage", ["coverage", "cov", "mean_coverage"], "DOUBLE"),
+    ("breadth", ["breadth", "breadth_coverage", "breadth_cov"], "DOUBLE"),
+    ("ber", ["ber", "BER"], "DOUBLE"),
+    ("ref_ani", ["ref_ani", "reference_ani"], "DOUBLE"),
+    ("length", ["length", "gene_length"], "BIGINT"),
+)
+
+
+def _polars_optional_expr(df: pl.DataFrame, names: list[str], sql_type: str) -> pl.Expr:
+    if sql_type == "DOUBLE":
+        return _optional_float_expr(df, names)
+    if sql_type == "BIGINT":
+        return _optional_int_expr(df, names)
+    return _optional_string_expr(df, names)
 
 
 def _insert_genome_stats(conn: duckdb.DuckDBPyConnection, *, sample_id: str, stats_file: Path) -> None:
+    target_columns = ["sample_id", "genome"] + [field[0] for field in _GENOME_STATS_FIELDS]
+    if stats_file.suffix.lower() == ".parquet":
+        schema = _duckdb_parquet_schema(conn, stats_file)
+        genome_col = _first_existing_name(schema, GENOME_COLUMN_CANDIDATES)
+        if genome_col is None:
+            raise ValueError("genome_stats_file missing a genome column")
+        selects = [
+            "? AS sample_id",
+            f"CAST({_sql_identifier(genome_col)} AS VARCHAR) AS genome",
+        ] + [
+            f"{_optional_sql_expr(schema, names, sql_type)} AS {_sql_identifier(column)}"
+            for column, names, sql_type in _GENOME_STATS_FIELDS
+        ]
+        conn.execute(
+            f"""INSERT INTO genome_stats ({', '.join(_sql_identifier(c) for c in target_columns)})
+                SELECT {', '.join(selects)}
+                FROM read_parquet(?)""",
+            [sample_id, str(stats_file)],
+        )
+        return
+
     df = _read_table(stats_file)
-    genome_col = _first_existing(df, ["genome", "genome_name", "reference", "accession"])
+    genome_col = _first_existing(df, GENOME_COLUMN_CANDIDATES)
     if genome_col is None:
         raise ValueError("genome_stats_file missing a genome column")
     df = df.select(
         pl.lit(sample_id).alias("sample_id"),
         pl.col(genome_col).cast(pl.Utf8).alias("genome"),
-        _optional_float_expr(df, ["coverage", "cov", "mean_coverage"]).alias("coverage"),
-        _optional_float_expr(df, ["breadth", "breadth_coverage", "breadth_cov"]).alias("breadth"),
-        _optional_float_expr(df, ["ber", "BER"]).alias("ber"),
-        _optional_float_expr(df, ["ref_ani", "reference_ani"]).alias("ref_ani"),
-        _optional_float_expr(df, ["coverage_median"]).alias("coverage_median"),
-        _optional_float_expr(df, ["coverage_std"]).alias("coverage_std"),
-        _optional_int_expr(df, ["genome_length", "length"]).alias("genome_length"),
-        _optional_float_expr(df, ["gap_mean"]).alias("gap_mean"),
-        _optional_float_expr(df, ["gap_std"]).alias("gap_std"),
-        _optional_int_expr(df, ["5x_cov_sites"]).alias("5x_cov_sites"),
-        _optional_float_expr(df, ["heterogeneity"]).alias("heterogeneity"),
-        _optional_float_expr(df, ["fug", "FUG"]).alias("fug"),
-        _optional_int_expr(df, ["reads_mapped"]).alias("reads_mapped"),
-        _optional_float_expr(df, ["conANI_reference", "conani_reference"]).alias("conANI_reference"),
-        _optional_int_expr(df, ["SNS_count", "sns_count"]).alias("SNS_count"),
-        _optional_int_expr(df, ["SNV_count", "snv_count"]).alias("SNV_count"),
-        _optional_string_expr(df, ["presence"]).alias("presence"),
-        _optional_string_expr(df, ["genome_taxonomy", "taxonomy"]).alias("genome_taxonomy"),
+        *[
+            _polars_optional_expr(df, names, sql_type).alias(column)
+            for column, names, sql_type in _GENOME_STATS_FIELDS
+        ],
     )
-    conn.register("_metatrawl_genome_stats", df)
-    try:
-        conn.execute(
-            """INSERT INTO genome_stats (
-                 sample_id, genome, coverage, breadth, ber, ref_ani,
-                 coverage_median, coverage_std, genome_length, gap_mean, gap_std,
-                 "5x_cov_sites", heterogeneity, fug, reads_mapped, conANI_reference,
-                 SNS_count, SNV_count, presence, genome_taxonomy
-               )
-               SELECT
-                 sample_id, genome, coverage, breadth, ber, ref_ani,
-                 coverage_median, coverage_std, genome_length, gap_mean, gap_std,
-                 "5x_cov_sites", heterogeneity, fug, reads_mapped, conANI_reference,
-                 SNS_count, SNV_count, presence, genome_taxonomy
-               FROM _metatrawl_genome_stats"""
-        )
-    finally:
-        conn.unregister("_metatrawl_genome_stats")
+    _insert_registered_frame(conn, "_metatrawl_genome_stats", df, table="genome_stats", columns=target_columns)
 
 
 def _insert_gene_stats(conn: duckdb.DuckDBPyConnection, *, sample_id: str, stats_file: Path) -> None:
+    target_columns = ["sample_id", "genome", "gene"] + [field[0] for field in _GENE_STATS_FIELDS]
+    if stats_file.suffix.lower() == ".parquet":
+        schema = _duckdb_parquet_schema(conn, stats_file)
+        gene_col = _first_existing_name(schema, ["gene", "gene_id"])
+        if gene_col is None:
+            raise ValueError("gene_stats_file missing a gene column")
+        genome_col = _first_existing_name(schema, GENOME_COLUMN_CANDIDATES)
+        selects = [
+            "? AS sample_id",
+            (
+                f"CAST({_sql_identifier(genome_col)} AS VARCHAR) AS genome"
+                if genome_col is not None
+                else "CAST(NULL AS VARCHAR) AS genome"
+            ),
+            f"CAST({_sql_identifier(gene_col)} AS VARCHAR) AS gene",
+        ] + [
+            f"{_optional_sql_expr(schema, names, sql_type)} AS {_sql_identifier(column)}"
+            for column, names, sql_type in _GENE_STATS_FIELDS
+        ]
+        conn.execute(
+            f"""INSERT INTO gene_stats ({', '.join(_sql_identifier(c) for c in target_columns)})
+                SELECT {', '.join(selects)}
+                FROM read_parquet(?)""",
+            [sample_id, str(stats_file)],
+        )
+        return
+
     df = _read_table(stats_file)
     gene_col = _first_existing(df, ["gene", "gene_id"])
     if gene_col is None:
         raise ValueError("gene_stats_file missing a gene column")
-    genome_col = _first_existing(df, ["genome", "genome_name", "reference", "accession"])
+    genome_col = _first_existing(df, GENOME_COLUMN_CANDIDATES)
     df = df.select(
         pl.lit(sample_id).alias("sample_id"),
         (pl.col(genome_col).cast(pl.Utf8) if genome_col else pl.lit(None, dtype=pl.Utf8)).alias("genome"),
         pl.col(gene_col).cast(pl.Utf8).alias("gene"),
-        _optional_float_expr(df, ["coverage", "cov", "mean_coverage"]).alias("coverage"),
-        _optional_float_expr(df, ["breadth", "breadth_coverage", "breadth_cov"]).alias("breadth"),
-        _optional_float_expr(df, ["ber", "BER"]).alias("ber"),
-        _optional_float_expr(df, ["ref_ani", "reference_ani"]).alias("ref_ani"),
-        _optional_int_expr(df, ["length", "gene_length"]).alias("length"),
+        *[
+            _polars_optional_expr(df, names, sql_type).alias(column)
+            for column, names, sql_type in _GENE_STATS_FIELDS
+        ],
     )
-    conn.register("_metatrawl_gene_stats", df)
+    _insert_registered_frame(conn, "_metatrawl_gene_stats", df, table="gene_stats", columns=target_columns)
+
+
+def _insert_registered_frame(
+    conn: duckdb.DuckDBPyConnection,
+    view_name: str,
+    df: pl.DataFrame,
+    *,
+    table: str,
+    columns: list[str],
+) -> None:
+    column_sql = ", ".join(_sql_identifier(column) for column in columns)
+    conn.register(view_name, df)
     try:
-        conn.execute(
-            """INSERT INTO gene_stats (sample_id, genome, gene, coverage, breadth, ber, ref_ani, length)
-               SELECT sample_id, genome, gene, coverage, breadth, ber, ref_ani, length
-               FROM _metatrawl_gene_stats"""
-        )
+        conn.execute(f"INSERT INTO {table} ({column_sql}) SELECT {column_sql} FROM {view_name}")
     finally:
-        conn.unregister("_metatrawl_gene_stats")
+        conn.unregister(view_name)
 
 
 def _insert_sylph_abundance(conn: duckdb.DuckDBPyConnection, *, sample_id: str, abundance_file: Path) -> None:
@@ -1281,7 +1438,11 @@ def _optional_string_expr(df: pl.DataFrame, names: list[str]) -> pl.Expr:
 
 
 def _first_existing(df: pl.DataFrame, names: list[str]) -> str | None:
-    columns = set(df.columns)
+    return _first_existing_name(df.columns, names)
+
+
+def _first_existing_name(available: Iterable[str], names: list[str]) -> str | None:
+    columns = set(available)
     for name in names:
         if name in columns:
             return name
@@ -1339,8 +1500,32 @@ def _migrate_profile_counts_to_uint16(conn: duckdb.DuckDBPyConnection) -> None:
             )
 
 
+def _run_once(
+    conn: duckdb.DuckDBPyConnection,
+    name: str,
+    migration: Callable[[duckdb.DuckDBPyConnection], None],
+) -> bool:
+    """Run a one-time migration and record it so later connections skip the scan."""
+    applied = conn.execute(
+        "SELECT 1 FROM metatrawl_migrations WHERE name = ?",
+        [name],
+    ).fetchone()
+    if applied is not None:
+        return False
+    migration(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO metatrawl_migrations (name, applied_at) VALUES (?, ?)",
+        [name, time.time()],
+    )
+    return True
+
+
 def _normalize_existing_sylph_genomes(conn: duckdb.DuckDBPyConnection) -> None:
-    """Replace legacy Sylph database paths with canonical assembly accessions."""
+    """Replace legacy Sylph database paths with canonical assembly accessions.
+
+    Rows written by `_insert_sylph_abundance` are already canonical, so this only
+    needs to run once per database.
+    """
     pattern = ACCESSION_PATTERN.pattern.replace("'", "''")
     conn.execute(
         f"""

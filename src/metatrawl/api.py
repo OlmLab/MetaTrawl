@@ -158,22 +158,17 @@ class GenomeView:
             tuple(parameters),
         )
 
-    def profiles(self, gene: str | None = None) -> Query:
+    def profiles(self) -> Query:
         """Return profile positions across samples."""
         _require_full_profile_storage(self.db_path)
-        conditions = ["genome = ?"]
-        parameters: list[Any] = [self.genome]
-        if gene is not None:
-            conditions.append("gene = ?")
-            parameters.append(_required_text(gene, "gene"))
         return Query(
             self.db_path,
-            f"""
-            SELECT sample_id, chrom, pos, genome, gene, A, C, G, T, ref_base_bitmask
+            """
+            SELECT sample_id, chrom, pos, genome, A, C, G, T, ref_base_bitmask
             FROM profile_positions
-            WHERE {' AND '.join(conditions)}
+            WHERE genome = ?
             """,
-            tuple(parameters),
+            (self.genome,),
         )
 
     def sylph_abundance(self) -> Query:
@@ -216,14 +211,13 @@ class SampleView:
             order_by="genome, gene",
         )
 
-    def profile(self, genome: str | None = None, gene: str | None = None) -> Query:
+    def profile(self, genome: str | None = None) -> Query:
         """Return profile positions stored for this sample."""
         _require_full_profile_storage(self.db_path)
         return self._filtered_query(
             table="profile_positions",
-            columns="sample_id, chrom, pos, genome, gene, A, C, G, T, ref_base_bitmask",
+            columns="sample_id, chrom, pos, genome, A, C, G, T, ref_base_bitmask",
             genome=genome,
-            gene=gene,
         )
 
     def sylph_abundance(self, genome: str | None = None) -> Query:
