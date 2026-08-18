@@ -144,6 +144,23 @@ def _import_bundle(runner: CliRunner, db_file: Path, bundle: registry.ProfileBun
     assert result.exit_code == 0, result.output
 
 
+class _RecordingConnection:
+    """Record SQL while preserving the DuckDB connection interface."""
+
+    def __init__(self, conn) -> None:
+        self.conn = conn
+        self.statements: list[str] = []
+
+    def execute(self, query, parameters=None):
+        self.statements.append(" ".join(str(query).split()))
+        if parameters is None:
+            return self.conn.execute(query)
+        return self.conn.execute(query, parameters)
+
+    def __getattr__(self, name):
+        return getattr(self.conn, name)
+
+
 def test_init_creates_duckdb_schema(tmp_path: Path) -> None:
     runner = CliRunner()
     db_file = tmp_path / "metatrawl.duckdb"
@@ -272,6 +289,65 @@ def test_profiles_import_stores_profile_stats_gene_and_abundance_tables(tmp_path
             "G": "USMALLINT",
             "T": "USMALLINT",
         }
+
+
+def test_first_profile_import_is_append_only_and_replacement_deletes_old_rows(
+    tmp_path: Path,
+) -> None:
+    db_file = tmp_path / "metatrawl.duckdb"
+    bundle = _write_bundle_files(tmp_path, "SRR1")
+
+    with registry.connect(db_file) as conn:
+        registry.add_runs(conn, ["SRR1"])
+        recording = _RecordingConnection(conn)
+        registry.import_profile_bundle(recording, bundle)
+
+        assert not any(
+            sql.startswith("DELETE FROM") for sql in recording.statements
+        )
+
+        replacement = _write_bundle_files(tmp_path, "SRR1", coverage=7.5)
+        recording.statements.clear()
+        registry.import_profile_bundle(recording, replacement)
+
+        replacement_deletes = {
+            sql.split()[2]
+            for sql in recording.statements
+            if sql.startswith("DELETE FROM")
+        }
+        assert replacement_deletes == {
+            "profile_positions",
+            "allele_mask_profile_blocks",
+            "genome_stats",
+            "gene_stats",
+            "sylph_abundance",
+        }
+        assert conn.execute(
+            "SELECT count(*) FROM profile_positions WHERE sample_id = 'SRR1'"
+        ).fetchone() == (2,)
+        assert conn.execute(
+            "SELECT coverage FROM genome_stats WHERE sample_id = 'SRR1'"
+        ).fetchone() == (7.5,)
+
+
+def test_batched_first_profile_imports_do_not_delete_payload_rows(
+    tmp_path: Path,
+) -> None:
+    db_file = tmp_path / "metatrawl.duckdb"
+    bundles = [
+        _write_bundle_files(tmp_path, "SRR1"),
+        _write_bundle_files(tmp_path, "SRR2"),
+    ]
+
+    with registry.connect(db_file) as conn:
+        registry.add_runs(conn, [bundle.run_id for bundle in bundles])
+        recording = _RecordingConnection(conn)
+        registry.import_profile_bundles(recording, bundles)
+
+        assert not any(
+            sql.startswith("DELETE FROM") for sql in recording.statements
+        )
+        assert registry.completed_sample_ids(conn) == ["SRR1", "SRR2"]
 
 
 def test_profiles_import_normalizes_sylph_genome_paths(tmp_path: Path) -> None:
@@ -892,6 +968,7 @@ def test_profile_sra_sample_workers_bound_unimported_backlog(
 def test_profile_importer_batches_bundles_on_one_writer_and_cleans_after_commit(
     tmp_path: Path,
     monkeypatch,
+    capsys,
 ) -> None:
     db_file = tmp_path / "metatrawl.duckdb"
     output_dir = tmp_path / "outputs"
@@ -910,9 +987,11 @@ def test_profile_importer_batches_bundles_on_one_writer_and_cleans_after_commit(
     def recording_import(conn, bundles, **kwargs) -> None:
         batch_sizes.append(len(bundles))
         writer_threads.add(threading.current_thread().name)
+        time.sleep(0.03)
         original_import(conn, bundles, **kwargs)
 
     monkeypatch.setattr(registry, "import_profile_bundles", recording_import)
+    monkeypatch.setattr(workflows, "_IMPORT_HEARTBEAT_SECONDS", 0.01)
     importer = workflows._ProfileBundleImporter(
         db_file=db_file,
         output_dir=output_dir,
@@ -938,6 +1017,9 @@ def test_profile_importer_batches_bundles_on_one_writer_and_cleans_after_commit(
     assert writer_threads == {"metatrawl-profile-importer"}
     assert importer.cleaned_files == 12
     assert not list(output_dir.iterdir())
+    import_logs = capsys.readouterr().err
+    assert "step=import status=batch-active" in import_logs
+    assert "step=import status=batch-done" in import_logs
     with registry.connect(db_file) as conn:
         assert registry.completed_sample_ids(conn) == run_ids
 

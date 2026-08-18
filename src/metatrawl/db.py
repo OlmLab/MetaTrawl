@@ -629,14 +629,12 @@ def _import_profile_bundle_rows(
 ) -> None:
     sample_id = bundle.run_id
     now = time.time()
-    conn.execute("DELETE FROM profile_positions WHERE sample_id = ?", [sample_id])
-    conn.execute(
-        "DELETE FROM allele_mask_profile_blocks WHERE sample_id = ?",
+    existing = conn.execute(
+        "SELECT created_at FROM samples WHERE sample_id = ?",
         [sample_id],
-    )
-    conn.execute("DELETE FROM genome_stats WHERE sample_id = ?", [sample_id])
-    conn.execute("DELETE FROM gene_stats WHERE sample_id = ?", [sample_id])
-    conn.execute("DELETE FROM sylph_abundance WHERE sample_id = ?", [sample_id])
+    ).fetchone()
+    if existing is not None:
+        _delete_existing_profile_rows(conn, sample_id=sample_id)
 
     if storage.mode == allele_mask.PROFILE_STORAGE_ALLELE_MASK:
         allele_mask.store_profile_parquet(
@@ -657,7 +655,6 @@ def _import_profile_bundle_rows(
         _insert_gene_stats(conn, sample_id=sample_id, stats_file=bundle.gene_stats_file)
     _insert_sylph_abundance(conn, sample_id=sample_id, abundance_file=bundle.sylph_abundance_file)
 
-    existing = conn.execute("SELECT created_at FROM samples WHERE sample_id = ?", [sample_id]).fetchone()
     created_at = float(existing[0]) if existing is not None else now
     conn.execute(
         "INSERT OR REPLACE INTO samples VALUES (?, ?, 'complete', ?, ?)",
@@ -689,6 +686,22 @@ def _import_profile_bundle_rows(
         "UPDATE sra_runs SET status = 'complete', updated_at = ? WHERE run_id = ?",
         [now, bundle.run_id],
     )
+
+
+def _delete_existing_profile_rows(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    sample_id: str,
+) -> None:
+    """Remove old payload rows only when explicitly replacing a sample."""
+    conn.execute("DELETE FROM profile_positions WHERE sample_id = ?", [sample_id])
+    conn.execute(
+        "DELETE FROM allele_mask_profile_blocks WHERE sample_id = ?",
+        [sample_id],
+    )
+    conn.execute("DELETE FROM genome_stats WHERE sample_id = ?", [sample_id])
+    conn.execute("DELETE FROM gene_stats WHERE sample_id = ?", [sample_id])
+    conn.execute("DELETE FROM sylph_abundance WHERE sample_id = ?", [sample_id])
 
 
 def _rollback_quietly(conn: duckdb.DuckDBPyConnection) -> None:

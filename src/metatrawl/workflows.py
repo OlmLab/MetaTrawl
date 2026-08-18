@@ -51,6 +51,7 @@ class _ProfileImportItem:
 
 
 _IMPORT_STOP = object()
+_IMPORT_HEARTBEAT_SECONDS = 60.0
 
 
 class _ProfileBundleImporter:
@@ -174,12 +175,21 @@ class _ProfileBundleImporter:
                 self._capacity.notify_all()
 
     def _import_batch(self, conn, items: list[_ProfileImportItem]) -> None:
+        started_at = time.monotonic()
         self.logger.emit(
             step="import",
             status="batch-start",
             samples=len(items),
             input_gb=f"{sum(item.size_bytes for item in items) / 1024**3:.2f}",
         )
+        heartbeat_stop = threading.Event()
+        heartbeat = threading.Thread(
+            target=self._emit_batch_heartbeat,
+            args=(heartbeat_stop, started_at, len(items)),
+            name="metatrawl-import-heartbeat",
+            daemon=True,
+        )
+        heartbeat.start()
         try:
             db.import_profile_bundles(
                 conn,
@@ -199,8 +209,31 @@ class _ProfileBundleImporter:
                 return
             self._record_failure(items[0], batch_error)
             return
+        finally:
+            heartbeat_stop.set()
+            heartbeat.join()
+        self.logger.emit(
+            step="import",
+            status="batch-done",
+            samples=len(items),
+            batch_elapsed=f"{time.monotonic() - started_at:.1f}s",
+        )
         for item in items:
             self._record_success(item)
+
+    def _emit_batch_heartbeat(
+        self,
+        stop: threading.Event,
+        started_at: float,
+        sample_count: int,
+    ) -> None:
+        while not stop.wait(_IMPORT_HEARTBEAT_SECONDS):
+            self.logger.emit(
+                step="import",
+                status="batch-active",
+                samples=sample_count,
+                batch_elapsed=f"{time.monotonic() - started_at:.1f}s",
+            )
 
     def _import_one(self, conn, item: _ProfileImportItem) -> None:
         try:
