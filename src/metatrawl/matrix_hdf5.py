@@ -8,8 +8,11 @@ files produced here.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+import signal
+import threading
 from typing import Callable
 
 import duckdb
@@ -44,6 +47,24 @@ CURRENT_MATRIX_HDF5_SPARSE_BITMASK_LAYOUT = "per_genome_sample_major_sparse_bitm
 MATRIX_HDF5_FILE_VERSION = "1"
 MATRIX_HDF5_CONTRACT_GENOMES_GROUP = "contract_genomes"
 MATRIX_HDF5_CONTRACT_SCAFFOLDS_GROUP = "contract_genome_scaffolds"
+MATRIX_BUILD_STATE_ATTR = "metatrawl_build_state"
+MATRIX_COMMITTED_SAMPLE_COUNT_ATTR = "metatrawl_committed_sample_count"
+MATRIX_BUILD_STATE_BUILDING = "building"
+MATRIX_BUILD_STATE_APPENDING = "appending"
+MATRIX_BUILD_STATE_COMPLETE = "complete"
+
+_RESUME_METADATA_KEYS = (
+    "profile_format",
+    "genome_scope",
+    "storage_mode",
+    "matrix_dtype",
+    "count_dtype",
+    "layout",
+    "matrix_value_semantics",
+    "coverage_filter_min_cov",
+    "separator_rows_between_scaffolds",
+    "has_gene_ranges",
+)
 
 
 @dataclass(frozen=True)
@@ -179,40 +200,46 @@ def build_matrix_hdf5_from_duckdb(
     if output_file.exists():
         raise FileExistsError(f"Output file already exists: {output_file}")
 
-    memory_limit_bytes = _memory_limit_bytes(memory_limit_gb)
-    total_work = len(sample_ids) * len(genomes)
-    completed_work = 0
-    stored_rows = 0
-    _emit_progress(progress_callback, "start", completed_work, total_work, "", genome_scope or "all", stored_rows)
+    if len(set(sample_ids)) != len(sample_ids):
+        raise ValueError("Matrix sample IDs must be unique.")
 
+    memory_limit_bytes = _memory_limit_bytes(memory_limit_gb)
     h5py = _import_h5py()
     tmp_output = output_file.with_suffix(output_file.suffix + ".tmp")
-    if tmp_output.exists():
-        tmp_output.unlink()
-    build_succeeded = False
+    metadata_rows = _metadata_rows(
+        genome=genome_scope or "all",
+        count_dtype=count_dtype,
+        storage_mode=storage_mode,
+        min_cov=min_cov,
+        memory_limit_gb=memory_limit_gb,
+        export_batch_mb=export_batch_mb,
+        sparse=sparse,
+        bed_file=bed_file,
+        stb_file=stb_file,
+        gene_range_table=gene_range_table,
+        has_gene_ranges=bool(gene_ranges),
+        profile_format=_matrix_profile_format(profile_storage),
+    )
+    scaffolds_by_genome_idx = _group_scaffolds_by_genome(genome_scaffolds)
+
+    open_mode = "r+" if tmp_output.exists() else "w"
     try:
-        sample_rows = [(idx, sample_id) for idx, sample_id in enumerate(sample_ids)]
-        metadata_rows = _metadata_rows(
-            genome=genome_scope or "all",
-            count_dtype=count_dtype,
-            storage_mode=storage_mode,
-            min_cov=min_cov,
-            memory_limit_gb=memory_limit_gb,
-            export_batch_mb=export_batch_mb,
-            sparse=sparse,
-            bed_file=bed_file,
-            stb_file=stb_file,
-            gene_range_table=gene_range_table,
-            has_gene_ranges=bool(gene_ranges),
-            profile_format=_matrix_profile_format(profile_storage),
-        )
-        scaffolds_by_genome_idx = _group_scaffolds_by_genome(genome_scaffolds)
-        with h5py.File(str(tmp_output), "w") as handle:
+        handle_context = h5py.File(str(tmp_output), open_mode)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Could not open resumable matrix checkpoint {tmp_output}. "
+            "The file may have been interrupted during an HDF5 write; inspect or remove "
+            "the checkpoint before rebuilding."
+        ) from exc
+
+    with handle_context as handle, _matrix_write_termination_guard(tmp_output):
+        if open_mode == "w":
             _initialize_hdf5_store(
                 handle,
                 h5py_module=h5py,
                 metadata_rows=metadata_rows,
-                sample_rows=sample_rows,
+                sample_rows=[],
+                expected_sample_count=len(sample_ids),
                 genomes=genomes,
                 genome_scaffolds=genome_scaffolds,
                 contract_genomes=contract_genomes,
@@ -223,8 +250,81 @@ def build_matrix_hdf5_from_duckdb(
                 export_batch_mb=export_batch_mb,
                 sparse=sparse,
             )
-            sparse_states = _initial_sparse_states(handle, genomes) if sparse else {}
-            for sample_row, sample_id in sample_rows:
+            handle.attrs[MATRIX_BUILD_STATE_ATTR] = MATRIX_BUILD_STATE_BUILDING
+            handle.attrs[MATRIX_COMMITTED_SAMPLE_COUNT_ATTR] = 0
+            handle.flush()
+            committed_samples: list[tuple[int, str]] = []
+        else:
+            committed_samples = _resume_hdf5_build_checkpoint(
+                handle,
+                metadata_rows=metadata_rows,
+                genomes=genomes,
+                genome_scaffolds=genome_scaffolds,
+                contract_genomes=contract_genomes,
+                contract_genome_scaffolds=contract_genome_scaffolds,
+                gene_ranges=gene_ranges,
+            )
+
+        committed_names = [sample_name for _sample_idx, sample_name in committed_samples]
+        missing_from_request = sorted(set(committed_names) - set(sample_ids))
+        if missing_from_request:
+            raise ValueError(
+                "Resumable matrix checkpoint contains samples that are no longer selected: "
+                + ", ".join(missing_from_request[:20])
+                + (" ..." if len(missing_from_request) > 20 else "")
+                + f". Remove {tmp_output} to rebuild with the changed selection."
+            )
+        committed_name_set = set(committed_names)
+        pending_sample_ids = [sample_id for sample_id in sample_ids if sample_id not in committed_name_set]
+        if pending_sample_ids:
+            handle.attrs[MATRIX_BUILD_STATE_ATTR] = MATRIX_BUILD_STATE_BUILDING
+            handle.flush()
+        final_sample_count = len(committed_samples) + len(pending_sample_ids)
+        total_work = final_sample_count * len(genomes)
+        completed_work = len(committed_samples) * len(genomes)
+        stored_rows = completed_work
+        if committed_samples:
+            _emit_progress(
+                progress_callback,
+                "resume",
+                completed_work,
+                total_work,
+                "",
+                genome_scope or "all",
+                stored_rows,
+            )
+        _emit_progress(
+            progress_callback,
+            "start",
+            completed_work,
+            total_work,
+            "",
+            genome_scope or "all",
+            stored_rows,
+        )
+
+        checkpoint_sample_count = _matrix_checkpoint_sample_count(
+            genomes=genomes,
+            storage_mode=storage_mode,
+            count_dtype=count_dtype,
+            target_batch_mb=export_batch_mb,
+        )
+        for batch_start in range(0, len(pending_sample_ids), checkpoint_sample_count):
+            batch_ids = pending_sample_ids[batch_start : batch_start + checkpoint_sample_count]
+            matrix_start = len(committed_samples)
+            matrix_stop = matrix_start + len(batch_ids)
+            sparse_states = _prepare_hdf5_matrix_rows(
+                handle,
+                genomes=genomes,
+                start_sample_count=matrix_start,
+                target_sample_count=matrix_stop,
+                sparse=sparse,
+            )
+            batch_sample_rows = [
+                (matrix_start + offset, sample_id)
+                for offset, sample_id in enumerate(batch_ids)
+            ]
+            for sample_row, sample_id in batch_sample_rows:
                 for spec in genomes:
                     _check_matrix_memory(
                         spec,
@@ -232,6 +332,186 @@ def build_matrix_hdf5_from_duckdb(
                         count_dtype=count_dtype,
                         memory_limit_bytes=memory_limit_bytes,
                     )
+                    _emit_progress(
+                        progress_callback,
+                        "processing",
+                        completed_work,
+                        total_work,
+                        sample_id,
+                        spec.genome,
+                        stored_rows,
+                    )
+                    matrix = _load_duckdb_sample_genome_matrix(
+                        conn,
+                        sample_id=sample_id,
+                        genome_spec=spec,
+                        genome_offsets=scaffolds_by_genome_idx[spec.genome_idx],
+                        count_dtype=count_dtype,
+                        storage_mode=storage_mode,
+                        min_cov=min_cov,
+                    )
+                    if sparse:
+                        indptr_ds, indices_ds, values_ds, current_nnz = sparse_states[spec.genome_idx]
+                        flat_indices, values = _dense_matrix_to_sparse(matrix)
+                        current_nnz = _append_sparse_hdf5_matrix_row(
+                            indptr_dataset=indptr_ds,
+                            indices_dataset=indices_ds,
+                            values_dataset=values_ds,
+                            sample_row=sample_row,
+                            flat_indices=flat_indices,
+                            values=values,
+                            current_nnz=current_nnz,
+                        )
+                        sparse_states[spec.genome_idx] = (
+                            indptr_ds,
+                            indices_ds,
+                            values_ds,
+                            current_nnz,
+                        )
+                    else:
+                        handle[_hdf5_matrix_dataset_path(spec.genome_idx)][sample_row, ...] = matrix
+                    stored_rows += 1
+                    completed_work += 1
+                    _emit_progress(
+                        progress_callback,
+                        "advance",
+                        completed_work,
+                        total_work,
+                        sample_id,
+                        spec.genome,
+                        stored_rows,
+                    )
+
+            _resize_sample_datasets(
+                handle["samples"],
+                existing_samples=committed_samples,
+                sample_rows=batch_sample_rows,
+            )
+            committed_samples.extend(batch_sample_rows)
+            handle.attrs[MATRIX_COMMITTED_SAMPLE_COUNT_ATTR] = len(committed_samples)
+            handle.flush()
+            _emit_progress(
+                progress_callback,
+                "checkpoint",
+                completed_work,
+                total_work,
+                "",
+                genome_scope or "all",
+                stored_rows,
+            )
+
+        handle.attrs[MATRIX_BUILD_STATE_ATTR] = MATRIX_BUILD_STATE_COMPLETE
+        handle.flush()
+
+    tmp_output.replace(output_file)
+
+    _emit_progress(progress_callback, "done", completed_work, total_work, "", genome_scope or "all", stored_rows)
+    return DirectMatrixBuildSummary(
+        output_file=output_file,
+        sample_count=len(sample_ids),
+        stored_rows=stored_rows,
+        storage_layout=_matrix_layout(storage_mode=storage_mode, sparse=sparse),
+        genome_scope=genome_scope or "all",
+    )
+
+
+def append_matrix_hdf5_from_duckdb(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    sample_ids: list[str],
+    matrix_hdf5_file: Path,
+    memory_limit_gb: float = 16.0,
+    export_batch_mb: float = 128.0,
+    duckdb_threads: int = 1,
+    progress_callback: BuildProgressCallback | None = None,
+) -> DirectMatrixAppendSummary:
+    """Append samples directly from MetaTrawl DuckDB rows into an existing HDF5 matrix."""
+    if not sample_ids:
+        raise ValueError("No samples were provided for matrix append.")
+    if len(set(sample_ids)) != len(sample_ids):
+        raise ValueError("Matrix append sample IDs must be unique.")
+    if export_batch_mb <= 0:
+        raise ValueError("export_batch_mb must be > 0")
+    _configure_duckdb_for_matrix(conn, memory_limit_gb=memory_limit_gb, threads=duckdb_threads)
+    matrix_hdf5_file = Path(matrix_hdf5_file).expanduser().resolve()
+    if not matrix_hdf5_file.exists():
+        raise FileNotFoundError(f"Matrix store file does not exist: {matrix_hdf5_file}")
+
+    h5py = _import_h5py()
+    memory_limit_bytes = _memory_limit_bytes(memory_limit_gb)
+    stored_rows = 0
+    completed_work = 0
+    with h5py.File(str(matrix_hdf5_file), "r+") as handle, _matrix_write_termination_guard(matrix_hdf5_file):
+        metadata = {str(k): str(v) for k, v in handle["metadata"].attrs.items()}
+        storage_mode = _storage_mode_from_metadata(metadata)
+        count_dtype = str(metadata.get("count_dtype", "uint16"))
+        min_cov = int(metadata.get("coverage_filter_min_cov", MATRIX_BUILD_MIN_COV))
+        _validate_profile_storage_for_matrix(
+            conn,
+            storage_mode=storage_mode,
+            min_cov=min_cov,
+        )
+        layout = str(metadata.get("layout", CURRENT_MATRIX_HDF5_LAYOUT))
+        genome_scope = str(metadata.get("genome_scope", "all"))
+        sparse = layout in {CURRENT_MATRIX_HDF5_SPARSE_LAYOUT, CURRENT_MATRIX_HDF5_SPARSE_BITMASK_LAYOUT}
+        genomes = _read_genomes(handle["genomes"])
+        genome_scaffolds = _read_genome_scaffolds(handle["genome_scaffolds"])
+        existing_samples = _resume_hdf5_append_checkpoint(
+            handle,
+            genomes=genomes,
+            sparse=sparse,
+        )
+        existing_names = {name for _idx, name in existing_samples}
+        duplicates = sorted(set(sample_ids) & existing_names)
+        if duplicates:
+            raise ValueError("Cannot append samples already present in matrix store: " + ", ".join(duplicates))
+        observed = _observed_genomes_for_samples(
+            conn,
+            sample_ids=sample_ids,
+            genome=None if genome_scope == "all" else genome_scope,
+        )
+        allowed = {spec.genome for spec in genomes}
+        missing = observed - allowed
+        if missing:
+            raise ValueError("Profiles contain genomes missing from existing matrix store: " + ", ".join(sorted(missing)))
+
+        total_sample_count = len(existing_samples) + len(sample_ids)
+        total_work = len(sample_ids) * len(genomes)
+        _emit_progress(progress_callback, "start", completed_work, total_work, "", genome_scope, stored_rows)
+        scaffolds_by_genome_idx = _group_scaffolds_by_genome(genome_scaffolds)
+        for spec in genomes:
+            _check_matrix_memory(
+                spec,
+                storage_mode=storage_mode,
+                count_dtype=count_dtype,
+                memory_limit_bytes=memory_limit_bytes,
+            )
+
+        handle.attrs[MATRIX_BUILD_STATE_ATTR] = MATRIX_BUILD_STATE_APPENDING
+        handle.flush()
+        checkpoint_sample_count = _matrix_checkpoint_sample_count(
+            genomes=genomes,
+            storage_mode=storage_mode,
+            count_dtype=count_dtype,
+            target_batch_mb=export_batch_mb,
+        )
+        for batch_start in range(0, len(sample_ids), checkpoint_sample_count):
+            batch_ids = sample_ids[batch_start : batch_start + checkpoint_sample_count]
+            matrix_start = len(existing_samples)
+            matrix_stop = matrix_start + len(batch_ids)
+            sparse_states = _prepare_hdf5_matrix_rows(
+                handle,
+                genomes=genomes,
+                start_sample_count=matrix_start,
+                target_sample_count=matrix_stop,
+                sparse=sparse,
+            )
+            batch_sample_rows = [
+                (matrix_start + offset, sample_id)
+                for offset, sample_id in enumerate(batch_ids)
+            ]
+            for sample_row, sample_id in batch_sample_rows:
+                for spec in genomes:
                     _emit_progress(progress_callback, "processing", completed_work, total_work, sample_id, spec.genome, stored_rows)
                     matrix = _load_duckdb_sample_genome_matrix(
                         conn,
@@ -260,130 +540,27 @@ def build_matrix_hdf5_from_duckdb(
                     stored_rows += 1
                     completed_work += 1
                     _emit_progress(progress_callback, "advance", completed_work, total_work, sample_id, spec.genome, stored_rows)
-        tmp_output.replace(output_file)
-        build_succeeded = True
-    finally:
-        if not build_succeeded and tmp_output.exists():
-            tmp_output.unlink(missing_ok=True)
-        if not build_succeeded and output_file.exists():
-            output_file.unlink(missing_ok=True)
 
-    _emit_progress(progress_callback, "done", completed_work, total_work, "", genome_scope or "all", stored_rows)
-    return DirectMatrixBuildSummary(
-        output_file=output_file,
-        sample_count=len(sample_ids),
-        stored_rows=stored_rows,
-        storage_layout=_matrix_layout(storage_mode=storage_mode, sparse=sparse),
-        genome_scope=genome_scope or "all",
-    )
-
-
-def append_matrix_hdf5_from_duckdb(
-    conn: duckdb.DuckDBPyConnection,
-    *,
-    sample_ids: list[str],
-    matrix_hdf5_file: Path,
-    memory_limit_gb: float = 16.0,
-    duckdb_threads: int = 1,
-    progress_callback: BuildProgressCallback | None = None,
-) -> DirectMatrixAppendSummary:
-    """Append samples directly from MetaTrawl DuckDB rows into an existing HDF5 matrix."""
-    if not sample_ids:
-        raise ValueError("No samples were provided for matrix append.")
-    _configure_duckdb_for_matrix(conn, memory_limit_gb=memory_limit_gb, threads=duckdb_threads)
-    matrix_hdf5_file = Path(matrix_hdf5_file).expanduser().resolve()
-    if not matrix_hdf5_file.exists():
-        raise FileNotFoundError(f"Matrix store file does not exist: {matrix_hdf5_file}")
-
-    h5py = _import_h5py()
-    memory_limit_bytes = _memory_limit_bytes(memory_limit_gb)
-    stored_rows = 0
-    completed_work = 0
-    with h5py.File(str(matrix_hdf5_file), "r+") as handle:
-        metadata = {str(k): str(v) for k, v in handle["metadata"].attrs.items()}
-        storage_mode = _storage_mode_from_metadata(metadata)
-        count_dtype = str(metadata.get("count_dtype", "uint16"))
-        min_cov = int(metadata.get("coverage_filter_min_cov", MATRIX_BUILD_MIN_COV))
-        _validate_profile_storage_for_matrix(
-            conn,
-            storage_mode=storage_mode,
-            min_cov=min_cov,
-        )
-        layout = str(metadata.get("layout", CURRENT_MATRIX_HDF5_LAYOUT))
-        genome_scope = str(metadata.get("genome_scope", "all"))
-        sparse = layout in {CURRENT_MATRIX_HDF5_SPARSE_LAYOUT, CURRENT_MATRIX_HDF5_SPARSE_BITMASK_LAYOUT}
-        genomes = _read_genomes(handle["genomes"])
-        genome_scaffolds = _read_genome_scaffolds(handle["genome_scaffolds"])
-        existing_samples = _read_samples(handle["samples"])
-        existing_names = {name for _idx, name in existing_samples}
-        duplicates = sorted(set(sample_ids) & existing_names)
-        if duplicates:
-            raise ValueError("Cannot append samples already present in matrix store: " + ", ".join(duplicates))
-        observed = _observed_genomes_for_samples(
-            conn,
-            sample_ids=sample_ids,
-            genome=None if genome_scope == "all" else genome_scope,
-        )
-        allowed = {spec.genome for spec in genomes}
-        missing = observed - allowed
-        if missing:
-            raise ValueError("Profiles contain genomes missing from existing matrix store: " + ", ".join(sorted(missing)))
-
-        total_sample_count = len(existing_samples) + len(sample_ids)
-        existing_sample_count = len(existing_samples)
-        sample_rows = [(existing_sample_count + offset, sample_id) for offset, sample_id in enumerate(sample_ids)]
-        _resize_sample_datasets(handle["samples"], existing_samples=existing_samples, sample_rows=sample_rows)
-        total_work = len(sample_rows) * len(genomes)
-        _emit_progress(progress_callback, "start", completed_work, total_work, "", genome_scope, stored_rows)
-        scaffolds_by_genome_idx = _group_scaffolds_by_genome(genome_scaffolds)
-        sparse_states: dict[int, tuple[object, object, object | None, int]] = {}
-        for spec in genomes:
-            _check_matrix_memory(
-                spec,
-                storage_mode=storage_mode,
-                count_dtype=count_dtype,
-                memory_limit_bytes=memory_limit_bytes,
+            _resize_sample_datasets(
+                handle["samples"],
+                existing_samples=existing_samples,
+                sample_rows=batch_sample_rows,
             )
-            node = handle[_hdf5_matrix_dataset_path(spec.genome_idx)]
-            if sparse:
-                indptr = node["indptr"]
-                indices = node["indices"]
-                indptr.resize((total_sample_count + 1,))
-                values = node.get("values")
-                sparse_states[spec.genome_idx] = (indptr, indices, values, int(indptr[existing_sample_count]))
-            else:
-                node.resize((total_sample_count, *node.shape[1:]))
+            existing_samples.extend(batch_sample_rows)
+            handle.attrs[MATRIX_COMMITTED_SAMPLE_COUNT_ATTR] = len(existing_samples)
+            handle.flush()
+            _emit_progress(
+                progress_callback,
+                "checkpoint",
+                completed_work,
+                total_work,
+                "",
+                genome_scope,
+                stored_rows,
+            )
 
-        for sample_row, sample_id in sample_rows:
-            for spec in genomes:
-                _emit_progress(progress_callback, "processing", completed_work, total_work, sample_id, spec.genome, stored_rows)
-                matrix = _load_duckdb_sample_genome_matrix(
-                    conn,
-                    sample_id=sample_id,
-                    genome_spec=spec,
-                    genome_offsets=scaffolds_by_genome_idx[spec.genome_idx],
-                    count_dtype=count_dtype,
-                    storage_mode=storage_mode,
-                    min_cov=min_cov,
-                )
-                if sparse:
-                    indptr_ds, indices_ds, values_ds, current_nnz = sparse_states[spec.genome_idx]
-                    flat_indices, values = _dense_matrix_to_sparse(matrix)
-                    current_nnz = _append_sparse_hdf5_matrix_row(
-                        indptr_dataset=indptr_ds,
-                        indices_dataset=indices_ds,
-                        values_dataset=values_ds,
-                        sample_row=sample_row,
-                        flat_indices=flat_indices,
-                        values=values,
-                        current_nnz=current_nnz,
-                    )
-                    sparse_states[spec.genome_idx] = (indptr_ds, indices_ds, values_ds, current_nnz)
-                else:
-                    handle[_hdf5_matrix_dataset_path(spec.genome_idx)][sample_row, ...] = matrix
-                stored_rows += 1
-                completed_work += 1
-                _emit_progress(progress_callback, "advance", completed_work, total_work, sample_id, spec.genome, stored_rows)
+        handle.attrs[MATRIX_BUILD_STATE_ATTR] = MATRIX_BUILD_STATE_COMPLETE
+        handle.flush()
         _emit_progress(progress_callback, "done", completed_work, total_work, "", genome_scope, stored_rows)
     return DirectMatrixAppendSummary(
         output_file=matrix_hdf5_file,
@@ -512,6 +689,7 @@ def _initialize_hdf5_store(
     h5py_module,
     metadata_rows: dict[str, str],
     sample_rows: list[tuple[int, str]],
+    expected_sample_count: int | None = None,
     genomes: list[GenomeSpec],
     genome_scaffolds: list[GenomeScaffoldOffset],
     contract_genomes: list[GenomeSpec],
@@ -527,7 +705,8 @@ def _initialize_hdf5_store(
     for key, value in metadata_rows.items():
         metadata.attrs[str(key)] = str(value)
     sample_count = len(sample_rows)
-    sample_chunk_len = _matrix_hdf5_sample_axis_chunk_length(sample_count)
+    expected_sample_count = max(sample_count, int(expected_sample_count or sample_count))
+    sample_chunk_len = _matrix_hdf5_sample_axis_chunk_length(expected_sample_count)
     samples_group = handle.create_group("samples")
     samples_group.create_dataset(
         "sample_idx",
@@ -561,6 +740,7 @@ def _initialize_hdf5_store(
                 matrices_group,
                 genome_idx=spec.genome_idx,
                 sample_count=sample_count,
+                expected_sample_count=expected_sample_count,
                 matrix_length=spec.matrix_length,
                 dtype_name=BITMASK_DTYPE_NAME if storage_mode == MATRIX_STORAGE_BITMASK else count_dtype,
             )
@@ -576,7 +756,7 @@ def _initialize_hdf5_store(
                 else (None, spec.matrix_length, 4)
             )
             chunk_samples = _matrix_hdf5_chunk_sample_count(
-                sample_count=sample_count,
+                sample_count=expected_sample_count,
                 matrix_length=spec.matrix_length,
                 dtype_name=BITMASK_DTYPE_NAME if storage_mode == MATRIX_STORAGE_BITMASK else count_dtype,
                 channels=1 if storage_mode == MATRIX_STORAGE_BITMASK else 4,
@@ -906,6 +1086,244 @@ def _read_samples(group) -> list[tuple[int, str]]:
     return list(zip(np.asarray(group["sample_idx"][...], dtype=np.int64).astype(int).tolist(), _read_hdf5_string_dataset(group["sample_name"])))
 
 
+def _read_gene_ranges(group) -> list[GeneRangeSpec]:
+    return [
+        GeneRangeSpec(
+            int(gene_idx),
+            str(gene),
+            int(genome_idx),
+            str(genome),
+            str(chrom),
+            int(axis_start),
+            int(axis_end),
+        )
+        for gene_idx, gene, genome_idx, genome, chrom, axis_start, axis_end in zip(
+            np.asarray(group["gene_idx"][...], dtype=np.int64).tolist(),
+            _read_hdf5_string_dataset(group["gene"]),
+            np.asarray(group["genome_idx"][...], dtype=np.int64).tolist(),
+            _read_hdf5_string_dataset(group["genome"]),
+            _read_hdf5_string_dataset(group["chrom"]),
+            np.asarray(group["axis_start"][...], dtype=np.int64).tolist(),
+            np.asarray(group["axis_end"][...], dtype=np.int64).tolist(),
+        )
+    ]
+
+
+@contextmanager
+def _matrix_write_termination_guard(checkpoint_file: Path):
+    """Let the active HDF5 context close cleanly when Slurm sends SIGTERM."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    previous_handler = signal.getsignal(signal.SIGTERM)
+
+    def interrupt_build(_signum, _frame) -> None:
+        raise RuntimeError(
+            f"Matrix write was terminated; committed work remains in {checkpoint_file}. "
+            "Rerun the same command to resume."
+        )
+
+    signal.signal(signal.SIGTERM, interrupt_build)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
+
+
+def _resume_hdf5_append_checkpoint(
+    handle,
+    *,
+    genomes: list[GenomeSpec],
+    sparse: bool,
+) -> list[tuple[int, str]]:
+    """Recover an interrupted append, while accepting matrices from older releases."""
+    has_state = MATRIX_BUILD_STATE_ATTR in handle.attrs
+    has_committed_count = MATRIX_COMMITTED_SAMPLE_COUNT_ATTR in handle.attrs
+    if has_state != has_committed_count:
+        raise ValueError(f"Matrix {handle.filename} has incomplete MetaTrawl checkpoint metadata.")
+
+    samples = _read_samples(handle["samples"])
+    if not has_state:
+        handle.attrs[MATRIX_BUILD_STATE_ATTR] = MATRIX_BUILD_STATE_COMPLETE
+        handle.attrs[MATRIX_COMMITTED_SAMPLE_COUNT_ATTR] = len(samples)
+        handle.flush()
+        return samples
+
+    state = str(handle.attrs[MATRIX_BUILD_STATE_ATTR])
+    committed_sample_count = int(handle.attrs[MATRIX_COMMITTED_SAMPLE_COUNT_ATTR])
+    if state == MATRIX_BUILD_STATE_COMPLETE and committed_sample_count != len(samples):
+        raise ValueError(
+            f"Completed matrix {handle.filename} records {committed_sample_count} samples "
+            f"but its sample catalog contains {len(samples)}."
+        )
+    if state not in {MATRIX_BUILD_STATE_COMPLETE, MATRIX_BUILD_STATE_APPENDING}:
+        raise ValueError(f"Matrix {handle.filename} cannot be appended while state={state!r}.")
+    _truncate_hdf5_to_committed_samples(
+        handle,
+        genomes=genomes,
+        committed_sample_count=committed_sample_count,
+        sparse=sparse,
+    )
+    samples = _read_samples(handle["samples"])
+    if [sample_idx for sample_idx, _sample_name in samples] != list(range(committed_sample_count)):
+        raise ValueError(f"Matrix {handle.filename} has invalid committed sample indices.")
+    handle.flush()
+    return samples
+
+
+def _resume_hdf5_build_checkpoint(
+    handle,
+    *,
+    metadata_rows: dict[str, str],
+    genomes: list[GenomeSpec],
+    genome_scaffolds: list[GenomeScaffoldOffset],
+    contract_genomes: list[GenomeSpec],
+    contract_genome_scaffolds: list[GenomeScaffoldOffset],
+    gene_ranges: list[GeneRangeSpec],
+) -> list[tuple[int, str]]:
+    """Validate a working HDF5 file and discard rows after its last checkpoint."""
+    if MATRIX_BUILD_STATE_ATTR not in handle.attrs or MATRIX_COMMITTED_SAMPLE_COUNT_ATTR not in handle.attrs:
+        raise ValueError(
+            f"Existing matrix checkpoint {handle.filename} predates resumable builds and "
+            "cannot distinguish completed rows. Remove it and restart this build once."
+        )
+    state = str(handle.attrs[MATRIX_BUILD_STATE_ATTR])
+    if state not in {MATRIX_BUILD_STATE_BUILDING, MATRIX_BUILD_STATE_COMPLETE}:
+        raise ValueError(f"Unsupported matrix checkpoint state in {handle.filename}: {state!r}")
+
+    actual_metadata = {str(key): str(value) for key, value in handle["metadata"].attrs.items()}
+    mismatches = [
+        f"{key} expected={metadata_rows.get(key)!r} actual={actual_metadata.get(key)!r}"
+        for key in _RESUME_METADATA_KEYS
+        if actual_metadata.get(key) != metadata_rows.get(key)
+    ]
+    if mismatches:
+        raise ValueError(
+            f"Existing matrix checkpoint {handle.filename} is incompatible with this build: "
+            + "; ".join(mismatches)
+        )
+    if _read_genomes(handle["genomes"]) != genomes:
+        raise ValueError(f"Existing matrix checkpoint {handle.filename} has a different genome axis.")
+    if _read_genome_scaffolds(handle["genome_scaffolds"]) != genome_scaffolds:
+        raise ValueError(f"Existing matrix checkpoint {handle.filename} has different scaffold coordinates.")
+    if _read_genomes(handle[MATRIX_HDF5_CONTRACT_GENOMES_GROUP]) != contract_genomes:
+        raise ValueError(f"Existing matrix checkpoint {handle.filename} has a different genome contract.")
+    if _read_genome_scaffolds(handle[MATRIX_HDF5_CONTRACT_SCAFFOLDS_GROUP]) != contract_genome_scaffolds:
+        raise ValueError(f"Existing matrix checkpoint {handle.filename} has a different scaffold contract.")
+    checkpoint_gene_ranges = _read_gene_ranges(handle["genes"]) if "genes" in handle else []
+    if checkpoint_gene_ranges != gene_ranges:
+        raise ValueError(f"Existing matrix checkpoint {handle.filename} has different gene ranges.")
+
+    committed_sample_count = int(handle.attrs[MATRIX_COMMITTED_SAMPLE_COUNT_ATTR])
+    if committed_sample_count < 0:
+        raise ValueError(f"Invalid committed sample count in {handle.filename}: {committed_sample_count}")
+    _truncate_hdf5_to_committed_samples(
+        handle,
+        genomes=genomes,
+        committed_sample_count=committed_sample_count,
+        sparse=actual_metadata["layout"]
+        in {CURRENT_MATRIX_HDF5_SPARSE_LAYOUT, CURRENT_MATRIX_HDF5_SPARSE_BITMASK_LAYOUT},
+    )
+    samples = _read_samples(handle["samples"])
+    expected_indices = list(range(committed_sample_count))
+    if [sample_idx for sample_idx, _sample_name in samples] != expected_indices:
+        raise ValueError(f"Matrix checkpoint {handle.filename} has invalid committed sample indices.")
+    handle.flush()
+    return samples
+
+
+def _truncate_hdf5_to_committed_samples(
+    handle,
+    *,
+    genomes: list[GenomeSpec],
+    committed_sample_count: int,
+    sparse: bool,
+) -> None:
+    samples_group = handle["samples"]
+    for name in ("sample_idx", "sample_name"):
+        dataset = samples_group[name]
+        if dataset.shape[0] < committed_sample_count:
+            raise ValueError(
+                f"Matrix checkpoint {handle.filename} records {committed_sample_count} committed "
+                f"samples but {name} contains only {dataset.shape[0]}."
+            )
+        dataset.resize((committed_sample_count,))
+
+    for spec in genomes:
+        node = handle[_hdf5_matrix_dataset_path(spec.genome_idx)]
+        if sparse:
+            indptr = node["indptr"]
+            if indptr.shape[0] < committed_sample_count + 1:
+                raise ValueError(
+                    f"Sparse matrix checkpoint {handle.filename} has an incomplete indptr array."
+                )
+            committed_nnz = int(indptr[committed_sample_count])
+            if committed_nnz < 0 or committed_nnz > node["indices"].shape[0]:
+                raise ValueError(
+                    f"Sparse matrix checkpoint {handle.filename} has an invalid committed nnz count."
+                )
+            node["indices"].resize((committed_nnz,))
+            if "values" in node:
+                if node["values"].shape[0] < committed_nnz:
+                    raise ValueError(
+                        f"Sparse matrix checkpoint {handle.filename} has incomplete committed values."
+                    )
+                node["values"].resize((committed_nnz,))
+            indptr.resize((committed_sample_count + 1,))
+        else:
+            if node.shape[0] < committed_sample_count:
+                raise ValueError(
+                    f"Dense matrix checkpoint {handle.filename} contains fewer rows than its "
+                    "committed sample count."
+                )
+            node.resize((committed_sample_count, *node.shape[1:]))
+
+
+def _prepare_hdf5_matrix_rows(
+    handle,
+    *,
+    genomes: list[GenomeSpec],
+    start_sample_count: int,
+    target_sample_count: int,
+    sparse: bool,
+) -> dict[int, tuple[object, object, object | None, int]]:
+    sparse_states: dict[int, tuple[object, object, object | None, int]] = {}
+    for spec in genomes:
+        node = handle[_hdf5_matrix_dataset_path(spec.genome_idx)]
+        if sparse:
+            indptr = node["indptr"]
+            indices = node["indices"]
+            values = node.get("values")
+            indptr.resize((target_sample_count + 1,))
+            sparse_states[spec.genome_idx] = (
+                indptr,
+                indices,
+                values,
+                int(indptr[start_sample_count]),
+            )
+        else:
+            node.resize((target_sample_count, *node.shape[1:]))
+    return sparse_states
+
+
+def _matrix_checkpoint_sample_count(
+    *,
+    genomes: list[GenomeSpec],
+    storage_mode: str,
+    count_dtype: str,
+    target_batch_mb: float,
+) -> int:
+    channels = 1 if storage_mode == MATRIX_STORAGE_BITMASK else 4
+    dtype = np.uint8 if storage_mode == MATRIX_STORAGE_BITMASK else COUNT_DTYPES[count_dtype]
+    per_sample_bytes = max(
+        1,
+        sum(spec.matrix_length for spec in genomes) * channels * np.dtype(dtype).itemsize,
+    )
+    target_bytes = max(1, int(target_batch_mb * (1024**2)))
+    return max(1, target_bytes // per_sample_bytes)
+
+
 def _resize_sample_datasets(group, *, existing_samples: list[tuple[int, str]], sample_rows: list[tuple[int, str]]) -> None:
     total = len(existing_samples) + len(sample_rows)
     group["sample_idx"].resize((total,))
@@ -945,11 +1363,20 @@ def _create_sparse_hdf5_genome_store(
     *,
     genome_idx: int,
     sample_count: int,
+    expected_sample_count: int | None = None,
     matrix_length: int,
     dtype_name: str,
 ):
     group = matrices_group.create_group(str(genome_idx))
-    group.create_dataset("indptr", shape=(sample_count + 1,), dtype=np.int64, chunks=(_matrix_hdf5_sample_axis_chunk_length(sample_count + 1),), maxshape=(None,), fillvalue=0)
+    expected_sample_count = max(sample_count, int(expected_sample_count or sample_count))
+    group.create_dataset(
+        "indptr",
+        shape=(sample_count + 1,),
+        dtype=np.int64,
+        chunks=(_matrix_hdf5_sample_axis_chunk_length(expected_sample_count + 1),),
+        maxshape=(None,),
+        fillvalue=0,
+    )
     group.create_dataset("indices", shape=(0,), dtype=np.int64, chunks=(_matrix_hdf5_sparse_indices_chunk_length(matrix_length),), maxshape=(None,), fillvalue=0)
     group.create_dataset(
         "values",

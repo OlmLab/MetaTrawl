@@ -47,7 +47,7 @@ class ThrottledMatrixLogger:
         total = int(event.get("total", 0))
         now = time.monotonic()
 
-        if phase in {"start", "done"}:
+        if phase in {"start", "resume", "checkpoint", "done"}:
             self.last_percent_bucket = -1 if total <= 0 else int((completed / max(total, 1)) * 100) // 5
             self.last_log_time = now
             if phase == "start":

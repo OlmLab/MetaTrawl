@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import signal
 
 import duckdb
 import h5py
@@ -282,6 +283,172 @@ def test_full_and_allele_mask_hdf5_payloads_are_identical(
         assert handle["samples"]["sample_name"].asstr()[...].tolist() == list(SAMPLES)
 
 
+@pytest.mark.parametrize("sparse", [False, True])
+def test_matrix_build_resumes_after_a_committed_sample_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sparse: bool,
+) -> None:
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="resumable", mode="full", cache_dir=cache_dir)
+    resumed_h5 = tmp_path / f"resumed-{sparse}.h5"
+    checkpoint_h5 = resumed_h5.with_suffix(resumed_h5.suffix + ".tmp")
+    original_loader = matrix_hdf5._load_duckdb_sample_genome_matrix
+
+    def interrupt_second_sample(*args, **kwargs):
+        if kwargs["sample_id"] == "S2":
+            raise RuntimeError("simulated cancellation")
+        return original_loader(*args, **kwargs)
+
+    monkeypatch.setattr(
+        matrix_hdf5,
+        "_load_duckdb_sample_genome_matrix",
+        interrupt_second_sample,
+    )
+    with db.connect(db_file) as conn:
+        with pytest.raises(RuntimeError, match="simulated cancellation"):
+            matrix_hdf5.build_matrix_hdf5_from_duckdb(
+                conn,
+                sample_ids=list(SAMPLES),
+                output_file=resumed_h5,
+                genome=GENOME,
+                bed_file=bed_file,
+                stb_file=stb_file,
+                gene_range_table=gene_ranges,
+                min_cov=5,
+                export_batch_mb=0.000001,
+                sparse=sparse,
+            )
+
+    assert checkpoint_h5.exists()
+    assert not resumed_h5.exists()
+    with h5py.File(checkpoint_h5, "r") as handle:
+        assert handle.attrs[matrix_hdf5.MATRIX_BUILD_STATE_ATTR] == "building"
+        assert handle.attrs[matrix_hdf5.MATRIX_COMMITTED_SAMPLE_COUNT_ATTR] == 1
+        assert handle["samples"]["sample_name"].asstr()[...].tolist() == ["S1"]
+
+    monkeypatch.setattr(
+        matrix_hdf5,
+        "_load_duckdb_sample_genome_matrix",
+        original_loader,
+    )
+    resume_events: list[dict[str, object]] = []
+    with db.connect(db_file) as conn:
+        matrix_hdf5.build_matrix_hdf5_from_duckdb(
+            conn,
+            sample_ids=list(SAMPLES),
+            output_file=resumed_h5,
+            genome=GENOME,
+            bed_file=bed_file,
+            stb_file=stb_file,
+            gene_range_table=gene_ranges,
+            min_cov=5,
+            export_batch_mb=0.000001,
+            sparse=sparse,
+            progress_callback=resume_events.append,
+        )
+
+    clean_h5 = tmp_path / f"clean-{sparse}.h5"
+    _build_matrix(
+        db_file,
+        clean_h5,
+        bed_file=bed_file,
+        stb_file=stb_file,
+        gene_ranges=gene_ranges,
+        sparse=sparse,
+    )
+    assert not checkpoint_h5.exists()
+    assert any(event["phase"] == "resume" for event in resume_events)
+    assert _hdf_matrix_payload(resumed_h5) == _hdf_matrix_payload(clean_h5)
+    with h5py.File(resumed_h5, "r") as handle:
+        assert handle.attrs[matrix_hdf5.MATRIX_BUILD_STATE_ATTR] == "complete"
+        assert handle.attrs[matrix_hdf5.MATRIX_COMMITTED_SAMPLE_COUNT_ATTR] == len(SAMPLES)
+        assert handle["samples"]["sample_name"].asstr()[...].tolist() == list(SAMPLES)
+
+
+def test_matrix_write_sigterm_guard_preserves_normal_handler() -> None:
+    previous_handler = signal.getsignal(signal.SIGTERM)
+    checkpoint = Path("matrix.h5.tmp")
+    with pytest.raises(RuntimeError, match="Rerun the same command to resume"):
+        with matrix_hdf5._matrix_write_termination_guard(checkpoint):
+            active_handler = signal.getsignal(signal.SIGTERM)
+            assert callable(active_handler)
+            active_handler(signal.SIGTERM, None)
+    assert signal.getsignal(signal.SIGTERM) == previous_handler
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+def test_matrix_build_discards_an_uncommitted_partial_batch_on_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sparse: bool,
+) -> None:
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="partial", mode="full", cache_dir=cache_dir)
+    resumed_h5 = tmp_path / f"partial-{sparse}.h5"
+    checkpoint_h5 = resumed_h5.with_suffix(resumed_h5.suffix + ".tmp")
+    original_loader = matrix_hdf5._load_duckdb_sample_genome_matrix
+
+    def interrupt_second_sample(*args, **kwargs):
+        if kwargs["sample_id"] == "S2":
+            raise RuntimeError("simulated cancellation")
+        return original_loader(*args, **kwargs)
+
+    monkeypatch.setattr(
+        matrix_hdf5,
+        "_load_duckdb_sample_genome_matrix",
+        interrupt_second_sample,
+    )
+    with db.connect(db_file) as conn:
+        with pytest.raises(RuntimeError, match="simulated cancellation"):
+            matrix_hdf5.build_matrix_hdf5_from_duckdb(
+                conn,
+                sample_ids=list(SAMPLES),
+                output_file=resumed_h5,
+                genome=GENOME,
+                bed_file=bed_file,
+                stb_file=stb_file,
+                gene_range_table=gene_ranges,
+                min_cov=5,
+                export_batch_mb=128,
+                sparse=sparse,
+            )
+
+    with h5py.File(checkpoint_h5, "r") as handle:
+        assert handle.attrs[matrix_hdf5.MATRIX_COMMITTED_SAMPLE_COUNT_ATTR] == 0
+        assert handle["samples"]["sample_name"].shape == (0,)
+
+    monkeypatch.setattr(
+        matrix_hdf5,
+        "_load_duckdb_sample_genome_matrix",
+        original_loader,
+    )
+    with db.connect(db_file) as conn:
+        matrix_hdf5.build_matrix_hdf5_from_duckdb(
+            conn,
+            sample_ids=list(SAMPLES),
+            output_file=resumed_h5,
+            genome=GENOME,
+            bed_file=bed_file,
+            stb_file=stb_file,
+            gene_range_table=gene_ranges,
+            min_cov=5,
+            export_batch_mb=128,
+            sparse=sparse,
+        )
+
+    clean_h5 = tmp_path / f"partial-clean-{sparse}.h5"
+    _build_matrix(
+        db_file,
+        clean_h5,
+        bed_file=bed_file,
+        stb_file=stb_file,
+        gene_ranges=gene_ranges,
+        sparse=sparse,
+    )
+    assert _hdf_matrix_payload(resumed_h5) == _hdf_matrix_payload(clean_h5)
+
+
 def test_full_and_allele_mask_popani_ibs_and_gene_results_are_identical(
     tmp_path: Path,
 ) -> None:
@@ -413,6 +580,90 @@ def test_allele_mask_append_matches_fresh_full_matrix(tmp_path: Path) -> None:
         sparse=True,
     )
     assert _hdf_matrix_payload(appended_h5) == _hdf_matrix_payload(fresh_h5)
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+def test_matrix_append_resumes_from_committed_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sparse: bool,
+) -> None:
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    compact = _make_database(
+        tmp_path,
+        name=f"append-resume-{sparse}",
+        mode="allele-mask",
+        cache_dir=cache_dir,
+        samples=("S1",),
+    )
+    matrix_file = tmp_path / f"append-resume-{sparse}.h5"
+    with db.connect(compact) as conn:
+        matrix_hdf5.build_matrix_hdf5_from_duckdb(
+            conn,
+            sample_ids=["S1"],
+            output_file=matrix_file,
+            genome=GENOME,
+            bed_file=bed_file,
+            stb_file=stb_file,
+            gene_range_table=gene_ranges,
+            min_cov=5,
+            sparse=sparse,
+        )
+        for sample in ("S2", "S3"):
+            db.add_runs(conn, [sample])
+            db.import_profile_bundle(conn, _write_bundle(tmp_path, sample), cache_dir=cache_dir)
+
+        original_loader = matrix_hdf5._load_duckdb_sample_genome_matrix
+
+        def interrupt_third_sample(*args, **kwargs):
+            if kwargs["sample_id"] == "S3":
+                raise RuntimeError("simulated append cancellation")
+            return original_loader(*args, **kwargs)
+
+        monkeypatch.setattr(
+            matrix_hdf5,
+            "_load_duckdb_sample_genome_matrix",
+            interrupt_third_sample,
+        )
+        with pytest.raises(RuntimeError, match="simulated append cancellation"):
+            matrix_hdf5.append_matrix_hdf5_from_duckdb(
+                conn,
+                sample_ids=["S2", "S3"],
+                matrix_hdf5_file=matrix_file,
+                export_batch_mb=0.000001,
+            )
+
+        with h5py.File(matrix_file, "r") as handle:
+            assert handle.attrs[matrix_hdf5.MATRIX_BUILD_STATE_ATTR] == "appending"
+            assert handle.attrs[matrix_hdf5.MATRIX_COMMITTED_SAMPLE_COUNT_ATTR] == 2
+            assert handle["samples"]["sample_name"].asstr()[...].tolist() == ["S1", "S2"]
+
+        monkeypatch.setattr(
+            matrix_hdf5,
+            "_load_duckdb_sample_genome_matrix",
+            original_loader,
+        )
+        matrix_hdf5.append_matrix_hdf5_from_duckdb(
+            conn,
+            sample_ids=["S3"],
+            matrix_hdf5_file=matrix_file,
+            export_batch_mb=0.000001,
+        )
+
+    full = _make_database(tmp_path, name=f"append-clean-{sparse}", mode="full", cache_dir=cache_dir)
+    clean_h5 = tmp_path / f"append-clean-{sparse}.h5"
+    _build_matrix(
+        full,
+        clean_h5,
+        bed_file=bed_file,
+        stb_file=stb_file,
+        gene_ranges=gene_ranges,
+        sparse=sparse,
+    )
+    assert _hdf_matrix_payload(matrix_file) == _hdf_matrix_payload(clean_h5)
+    with h5py.File(matrix_file, "r") as handle:
+        assert handle.attrs[matrix_hdf5.MATRIX_BUILD_STATE_ATTR] == "complete"
+        assert handle.attrs[matrix_hdf5.MATRIX_COMMITTED_SAMPLE_COUNT_ATTR] == len(SAMPLES)
 
 
 def test_allele_mask_profile_api_rejects_count_queries(tmp_path: Path) -> None:

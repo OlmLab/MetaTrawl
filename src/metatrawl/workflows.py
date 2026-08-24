@@ -418,6 +418,7 @@ def append_matrix_from_database(
         sample_ids=sample_ids,
         matrix_hdf5_file=context.matrix_file,
         memory_limit_gb=memory_limit_gb,
+        export_batch_mb=export_batch_mb,
         duckdb_threads=duckdb_export_threads,
         progress_callback=ThrottledMatrixLogger("MATRIX-APPEND"),
     )

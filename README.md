@@ -312,6 +312,13 @@ For each genome:
   the HDF5 file;
 - if no new samples are available, the genome is reported as up to date.
 
+New builds checkpoint complete sample batches into
+`matrices/<genome>.h5.tmp`. If a local or Slurm job is cancelled, rerun the same
+command: MetaTrawl validates the checkpoint, discards only an unfinished batch,
+and continues with the remaining samples. The working file is atomically renamed
+to `.h5` after every selected sample has been committed. Do not delete the
+`.h5.tmp` file when resuming a build.
+
 To sync only one genome, add `--genome`:
 
 ```bash
@@ -542,6 +549,12 @@ sample (or just the genomes named with `--genome`).
 - **present** → append only the eligible samples that are *not already in the
   HDF5 file* (it reads the sample list stored inside the file to diff);
 - **present, nothing new** → report the genome as up to date.
+
+While an absent matrix is being built, complete sample batches are flushed to a
+durable `.h5.tmp` checkpoint. Repeating the same command after cancellation
+resumes from the committed sample count; only a batch interrupted during its
+write is repeated. The checkpoint becomes the final `.h5` through an atomic
+rename when the build completes.
 
 **Eligibility.** A sample is eligible for a genome's matrix when it is `complete`
 and clears the stat thresholds: `--min-coverage`, `--min-breadth`, and
