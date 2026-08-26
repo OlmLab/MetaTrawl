@@ -49,6 +49,9 @@ MATRIX_HDF5_CONTRACT_GENOMES_GROUP = "contract_genomes"
 MATRIX_HDF5_CONTRACT_SCAFFOLDS_GROUP = "contract_genome_scaffolds"
 MATRIX_BUILD_STATE_ATTR = "metatrawl_build_state"
 MATRIX_COMMITTED_SAMPLE_COUNT_ATTR = "metatrawl_committed_sample_count"
+# Samples read per bulk block query. One query per (sample, genome) spent ~3.2 ms
+# in dispatch alone; a window amortizes that to ~0.15 ms per sample.
+MATRIX_READ_WINDOW_SAMPLES = 64
 MATRIX_BUILD_STATE_BUILDING = "building"
 MATRIX_BUILD_STATE_APPENDING = "appending"
 MATRIX_BUILD_STATE_COMPLETE = "complete"
@@ -221,6 +224,8 @@ def build_matrix_hdf5_from_duckdb(
         profile_format=_matrix_profile_format(profile_storage),
     )
     scaffolds_by_genome_idx = _group_scaffolds_by_genome(genome_scaffolds)
+    allele_mask_reference_cache: dict[str, dict[int, allele_mask.ReferenceSegment]] = {}
+    allele_mask_block_window = _AlleleMaskBlockWindow(conn, sample_ids=sample_ids)
 
     open_mode = "r+" if tmp_output.exists() else "w"
     try:
@@ -247,7 +252,6 @@ def build_matrix_hdf5_from_duckdb(
                 gene_ranges=gene_ranges,
                 count_dtype=count_dtype,
                 storage_mode=storage_mode,
-                export_batch_mb=export_batch_mb,
                 sparse=sparse,
             )
             handle.attrs[MATRIX_BUILD_STATE_ATTR] = MATRIX_BUILD_STATE_BUILDING
@@ -349,6 +353,9 @@ def build_matrix_hdf5_from_duckdb(
                         count_dtype=count_dtype,
                         storage_mode=storage_mode,
                         min_cov=min_cov,
+                        profile_storage=profile_storage,
+                        allele_mask_reference_cache=allele_mask_reference_cache,
+                        allele_mask_block_window=allele_mask_block_window,
                     )
                     if sparse:
                         indptr_ds, indices_ds, values_ds, current_nnz = sparse_states[spec.genome_idx]
@@ -446,7 +453,7 @@ def append_matrix_hdf5_from_duckdb(
         storage_mode = _storage_mode_from_metadata(metadata)
         count_dtype = str(metadata.get("count_dtype", "uint16"))
         min_cov = int(metadata.get("coverage_filter_min_cov", MATRIX_BUILD_MIN_COV))
-        _validate_profile_storage_for_matrix(
+        profile_storage = _validate_profile_storage_for_matrix(
             conn,
             storage_mode=storage_mode,
             min_cov=min_cov,
@@ -479,6 +486,8 @@ def append_matrix_hdf5_from_duckdb(
         total_work = len(sample_ids) * len(genomes)
         _emit_progress(progress_callback, "start", completed_work, total_work, "", genome_scope, stored_rows)
         scaffolds_by_genome_idx = _group_scaffolds_by_genome(genome_scaffolds)
+        allele_mask_reference_cache: dict[str, dict[int, allele_mask.ReferenceSegment]] = {}
+        allele_mask_block_window = _AlleleMaskBlockWindow(conn, sample_ids=sample_ids)
         for spec in genomes:
             _check_matrix_memory(
                 spec,
@@ -521,6 +530,9 @@ def append_matrix_hdf5_from_duckdb(
                         count_dtype=count_dtype,
                         storage_mode=storage_mode,
                         min_cov=min_cov,
+                        profile_storage=profile_storage,
+                        allele_mask_reference_cache=allele_mask_reference_cache,
+                        allele_mask_block_window=allele_mask_block_window,
                     )
                     if sparse:
                         indptr_ds, indices_ds, values_ds, current_nnz = sparse_states[spec.genome_idx]
@@ -570,6 +582,42 @@ def append_matrix_hdf5_from_duckdb(
     )
 
 
+class _AlleleMaskBlockWindow:
+    """Serve per-sample allele-mask blocks from windowed bulk reads.
+
+    Samples are visited in a known order, so blocks for a whole window can be
+    fetched with one query per genome and served row by row. Only one window is
+    held at a time, and rows stay compressed until each sample is decoded.
+    """
+
+    def __init__(self, conn, *, sample_ids: list[str], window: int = MATRIX_READ_WINDOW_SAMPLES) -> None:
+        self._conn = conn
+        self._order = list(sample_ids)
+        self._position = {sample_id: index for index, sample_id in enumerate(self._order)}
+        self._window = max(1, int(window))
+        self._start: int | None = None
+        self._by_genome: dict[str, dict[str, list[tuple]]] = {}
+
+    def rows_for(self, *, sample_id: str, genome: str, segment_ids: list[int]) -> list[tuple] | None:
+        """Return this sample's raw block rows, or None if it is outside the plan."""
+        position = self._position.get(sample_id)
+        if position is None:
+            return None
+        start = (position // self._window) * self._window
+        if start != self._start:
+            self._start = start
+            self._by_genome = {}
+        cached = self._by_genome.get(genome)
+        if cached is None:
+            cached = allele_mask.fetch_profile_block_rows(
+                self._conn,
+                sample_ids=self._order[start : start + self._window],
+                segment_ids=segment_ids,
+            )
+            self._by_genome[genome] = cached
+        return cached.get(sample_id, [])
+
+
 def _load_duckdb_sample_genome_matrix(
     conn: duckdb.DuckDBPyConnection,
     *,
@@ -579,8 +627,11 @@ def _load_duckdb_sample_genome_matrix(
     count_dtype: str,
     storage_mode: str,
     min_cov: int,
+    profile_storage: db.ProfileStorageConfig | None = None,
+    allele_mask_reference_cache: dict[str, dict[int, allele_mask.ReferenceSegment]] | None = None,
+    allele_mask_block_window: "_AlleleMaskBlockWindow | None" = None,
 ) -> np.ndarray:
-    profile_storage = db.profile_storage_config(conn)
+    profile_storage = profile_storage or db.profile_storage_config(conn)
     if profile_storage.mode == allele_mask.PROFILE_STORAGE_ALLELE_MASK:
         if storage_mode != MATRIX_STORAGE_BITMASK:
             raise ValueError(
@@ -591,12 +642,14 @@ def _load_duckdb_sample_genome_matrix(
             sample_id=sample_id,
             genome_spec=genome_spec,
             genome_offsets=genome_offsets,
+            reference_cache=allele_mask_reference_cache,
+            block_window=allele_mask_block_window,
         )
     if storage_mode == MATRIX_STORAGE_BITMASK:
         matrix = np.zeros((genome_spec.matrix_length,), dtype=np.uint8)
     else:
         matrix = np.zeros((genome_spec.matrix_length, 4), dtype=COUNT_DTYPES[count_dtype])
-    rows = conn.execute(
+    frame = conn.execute(
         """
         SELECT chrom, pos, A, T, C, G
         FROM profile_positions
@@ -604,34 +657,51 @@ def _load_duckdb_sample_genome_matrix(
           AND CAST(A AS BIGINT) + CAST(T AS BIGINT) + CAST(C AS BIGINT) + CAST(G AS BIGINT) >= ?
         """,
         [sample_id, genome_spec.genome, min_cov],
-    ).fetchall()
-    if not rows:
+    ).pl()
+    if frame.height == 0:
         return matrix
-    offsets_by_chrom = {offset.chrom: offset for offset in genome_offsets}
-    for chrom, pos, a, t, c, g in rows:
-        offset = offsets_by_chrom.get(str(chrom))
-        if offset is None:
-            raise ValueError(f"Profile sample {sample_id} has scaffold {chrom} outside matrix contract for genome {genome_spec.genome}.")
-        pos_int = int(pos)
-        if pos_int < offset.min_pos or pos_int > offset.max_pos:
+
+    known_chroms = {offset.chrom for offset in genome_offsets}
+    observed_chroms = {str(chrom) for chrom in frame.get_column("chrom").unique().to_list()}
+    unknown_chroms = sorted(observed_chroms - known_chroms)
+    if unknown_chroms:
+        raise ValueError(
+            f"Profile sample {sample_id} has scaffolds outside the matrix contract for "
+            f"{genome_spec.genome}: " + ", ".join(unknown_chroms)
+        )
+
+    np_dtype = np.dtype(
+        np.uint8 if storage_mode == MATRIX_STORAGE_BITMASK else COUNT_DTYPES[count_dtype]
+    )
+    for offset in genome_offsets:
+        scaffold_frame = frame.filter(pl.col("chrom") == offset.chrom)
+        if scaffold_frame.height == 0:
+            continue
+        positions = scaffold_frame.get_column("pos").to_numpy().astype(np.int64, copy=False)
+        min_pos = int(positions.min())
+        max_pos = int(positions.max())
+        if min_pos < offset.min_pos or max_pos > offset.max_pos:
             raise ValueError(
-                f"Profile sample {sample_id} has out-of-range position {genome_spec.genome}:{chrom}:{pos_int}; "
+                f"Profile sample {sample_id} has out-of-range positions "
+                f"{genome_spec.genome}:{offset.chrom}:{min_pos}-{max_pos}; "
                 f"matrix range is {offset.min_pos}-{offset.max_pos}."
             )
-        axis_pos = pos_int - offset.index_base + offset.axis_start
-        counts = np.asarray([a, t, c, g], dtype=np.int64)
+        axis_pos = positions - offset.index_base + offset.axis_start
+        counts = scaffold_frame.select("A", "T", "C", "G").to_numpy()
         if storage_mode == MATRIX_STORAGE_BITMASK:
-            matrix[axis_pos] = np.bitwise_or.reduce(BITMASK_BASE_BITS[counts > 0], initial=np.uint8(0))
+            matrix[axis_pos] = ((counts > 0) * BITMASK_BASE_BITS).sum(axis=1, dtype=np.uint8)
         elif storage_mode == MATRIX_STORAGE_LEGACY_PRESENCE:
-            matrix[axis_pos, :] = counts > 0
+            matrix[axis_pos, :] = (counts > 0).astype(np_dtype, copy=False)
         else:
             max_value = np.iinfo(COUNT_DTYPES[count_dtype]).max
-            if np.any(counts < 0) or np.any(counts > max_value):
+            min_count = int(counts.min(initial=0))
+            max_count = int(counts.max(initial=0))
+            if min_count < 0 or max_count > max_value:
                 raise OverflowError(
-                    f"Profile count for {sample_id} at {genome_spec.genome}:{chrom}:{pos_int} "
-                    f"does not fit {count_dtype}."
+                    f"Profile counts for {sample_id} at {genome_spec.genome}:{offset.chrom} "
+                    f"do not fit {count_dtype}; observed range={min_count}-{max_count}."
                 )
-            matrix[axis_pos, :] = counts
+            matrix[axis_pos, :] = counts.astype(np_dtype, copy=False)
     return matrix
 
 
@@ -641,14 +711,33 @@ def _load_allele_mask_sample_genome_matrix(
     sample_id: str,
     genome_spec: GenomeSpec,
     genome_offsets: list[GenomeScaffoldOffset],
+    reference_cache: dict[str, dict[int, allele_mask.ReferenceSegment]] | None = None,
+    block_window: "_AlleleMaskBlockWindow | None" = None,
 ) -> np.ndarray:
     """Decode compact blocks directly into ZipStrain's bitmask matrix axis."""
     matrix = np.zeros((genome_spec.matrix_length,), dtype=np.uint8)
     offsets_by_chrom = {offset.chrom: offset for offset in genome_offsets}
+    block_rows = None
+    if block_window is not None:
+        references = (
+            reference_cache.get(genome_spec.genome) if reference_cache is not None else None
+        )
+        if references is None:
+            references = allele_mask._load_reference_segments(conn, genome=genome_spec.genome)
+            if reference_cache is not None:
+                reference_cache[genome_spec.genome] = references
+        if references:
+            block_rows = block_window.rows_for(
+                sample_id=sample_id,
+                genome=genome_spec.genome,
+                segment_ids=list(references),
+            )
     for block in allele_mask.iter_decoded_profile_blocks(
         conn,
         sample_id=sample_id,
         genome=genome_spec.genome,
+        reference_cache=reference_cache,
+        block_rows=block_rows,
     ):
         offset = offsets_by_chrom.get(block.chrom)
         if offset is None:
@@ -697,7 +786,6 @@ def _initialize_hdf5_store(
     gene_ranges: list[GeneRangeSpec],
     count_dtype: str,
     storage_mode: str,
-    export_batch_mb: float,
     sparse: bool,
 ) -> None:
     handle.attrs["zipstrain_hdf5_version"] = MATRIX_HDF5_FILE_VERSION
@@ -755,13 +843,9 @@ def _initialize_hdf5_store(
                 if storage_mode == MATRIX_STORAGE_BITMASK
                 else (None, spec.matrix_length, 4)
             )
-            chunk_samples = _matrix_hdf5_chunk_sample_count(
-                sample_count=expected_sample_count,
-                matrix_length=spec.matrix_length,
-                dtype_name=BITMASK_DTYPE_NAME if storage_mode == MATRIX_STORAGE_BITMASK else count_dtype,
-                channels=1 if storage_mode == MATRIX_STORAGE_BITMASK else 4,
-                target_batch_mb=export_batch_mb,
-            )
+            # Rows arrive one sample at a time. Multi-sample chunks force HDF5
+            # to repeatedly update a very large partial chunk for every row.
+            chunk_samples = 1
             matrices_group.create_dataset(
                 str(spec.genome_idx),
                 shape=matrix_shape,
@@ -1338,20 +1422,6 @@ def _hdf5_matrix_dataset_path(genome_idx: int) -> str:
 
 def _matrix_hdf5_sample_axis_chunk_length(sample_count: int) -> int:
     return max(1, min(int(sample_count), 1024))
-
-
-def _matrix_hdf5_chunk_sample_count(
-    *,
-    sample_count: int,
-    matrix_length: int,
-    dtype_name: str,
-    channels: int,
-    target_batch_mb: float,
-) -> int:
-    dtype = MATRIX_DTYPES[dtype_name]
-    per_sample_bytes = max(1, matrix_length * channels * np.dtype(dtype).itemsize)
-    target_batch_bytes = int(target_batch_mb * (1024 ** 2))
-    return max(1, min(sample_count, int(target_batch_bytes // per_sample_bytes) or 1))
 
 
 def _matrix_hdf5_sparse_indices_chunk_length(matrix_length: int) -> int:

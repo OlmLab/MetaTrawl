@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
+import errno
+import os
 from pathlib import Path
 import queue
 import re
@@ -18,6 +20,7 @@ import uuid
 
 import polars as pl
 
+from metatrawl import allele_mask
 from metatrawl import cache
 from metatrawl import db
 from metatrawl import healthcheck
@@ -73,6 +76,9 @@ class _ProfileBundleImporter:
         self.config = config
         self.cleanup_outputs = cleanup_outputs
         self.logger = logger
+        # One cache for the importer's whole lifetime: reference segments are
+        # immutable once written, so decoding them per sample was pure repeat work.
+        self.reference_cache = allele_mask.AlleleMaskWriteCache()
         self.imported = 0
         self.cleaned_files = 0
         self.failures: dict[str, str] = {}
@@ -195,6 +201,7 @@ class _ProfileBundleImporter:
                 conn,
                 [item.bundle for item in items],
                 cache_dir=self.cache_dir,
+                reference_cache=self.reference_cache,
             )
         except Exception as batch_error:
             if len(items) > 1:
@@ -237,7 +244,12 @@ class _ProfileBundleImporter:
 
     def _import_one(self, conn, item: _ProfileImportItem) -> None:
         try:
-            db.import_profile_bundle(conn, item.bundle, cache_dir=self.cache_dir)
+            db.import_profile_bundle(
+                conn,
+                item.bundle,
+                cache_dir=self.cache_dir,
+                reference_cache=self.reference_cache,
+            )
         except Exception as exc:
             self._record_failure(item, exc)
         else:
@@ -394,11 +406,12 @@ def append_matrix_from_database(
     logger = logger or WorkflowLogger()
     context = read_matrix_file_context(matrix_file)
     matrix_label = matrix_id or str(context.matrix_file)
+    existing_sample_ids = set(context.sample_ids)
     sample_ids = (
         [
             sample_id
             for sample_id in db.completed_sample_ids(conn)
-            if sample_id not in set(context.sample_ids)
+            if sample_id not in existing_sample_ids
         ]
         if context.genome == "all"
         else db.eligible_unmaterialized_sample_ids(
@@ -460,9 +473,25 @@ def sync_build_matrices(
     selected_genomes = _dedupe_preserving_order(genomes) if genomes is not None else db.genomes_with_complete_samples(conn)
     logger.emit(step="matrix-sync-build", status="start", genomes=len(selected_genomes), matrix_dir=matrix_dir)
 
+    candidate_count = len(selected_genomes)
     built = appended = up_to_date = skipped = failed = 0
+    if register:
+        # Only a registering run holds a read-write connection, which is what
+        # reconciling needs. Planning then lets an unchanged genome skip opening
+        # its matrix and decoding the whole sample list just to learn it is current.
+        reconcile_matrix_registry(conn, matrix_dir=matrix_dir, logger=logger)
+        selected_genomes, planned_up_to_date = plan_matrix_sync_build(
+            conn,
+            matrix_dir=matrix_dir,
+            genomes=selected_genomes,
+            filters=filters,
+            logger=logger,
+        )
+        up_to_date += len(planned_up_to_date)
+        for genome in planned_up_to_date:
+            logger.emit(step="matrix-sync-build", status="up-to-date", genome=genome, source="registry")
     for genome in selected_genomes:
-        matrix_file = matrix_dir / f"{_safe_file_stem(genome)}.h5"
+        matrix_file = matrix_file_for_genome(matrix_dir, genome)
         logger.emit(step="matrix-sync-build", status="genome-start", genome=genome, matrix=matrix_file)
         try:
             if matrix_file.exists():
@@ -545,7 +574,7 @@ def sync_build_matrices(
     logger.emit(
         step="matrix-sync-build",
         status="done",
-        genomes=len(selected_genomes),
+        genomes=candidate_count,
         built=built,
         appended=appended,
         up_to_date=up_to_date,
@@ -553,7 +582,7 @@ def sync_build_matrices(
         failed=failed,
     )
     return MatrixSyncBuildSummary(
-        genomes=len(selected_genomes),
+        genomes=candidate_count,
         built=built,
         appended=appended,
         up_to_date=up_to_date,
@@ -618,6 +647,15 @@ def discover_matrix_files(matrix_dir: Path) -> list[Path]:
         raise FileNotFoundError(f"Matrix directory does not exist: {matrix_dir}")
     suffixes = {".h5", ".hdf5", ".hd5"}
     return sorted(path for path in matrix_dir.iterdir() if path.is_file() and path.suffix.lower() in suffixes)
+
+
+def matrix_file_for_genome(matrix_dir: Path, genome: str) -> Path:
+    """Map a genome to its per-genome matrix store path.
+
+    The build, the dispatch planner, and the registry all have to agree on this
+    name, so it lives in one place rather than being spelled out at each site.
+    """
+    return Path(matrix_dir) / f"{_safe_file_stem(genome)}.h5"
 
 
 def _safe_file_stem(value: str) -> str:
@@ -812,6 +850,151 @@ def read_matrix_file_context(matrix_file: Path) -> MatrixFileContext:
         sample_ids=sample_ids,
         filters=filters,
     )
+
+
+def read_matrix_file_state(matrix_file: Path) -> tuple[str, int]:
+    """Read only the build state and committed sample count from a matrix store.
+
+    These live in root attributes, so this costs one open and no dataset decode —
+    cheap enough to check every matrix before deciding whether to launch a job.
+    """
+    h5py = _import_h5py()
+    with h5py.File(str(Path(matrix_file).expanduser().resolve()), "r") as handle:
+        if (
+            matrix_hdf5.MATRIX_BUILD_STATE_ATTR not in handle.attrs
+            or matrix_hdf5.MATRIX_COMMITTED_SAMPLE_COUNT_ATTR not in handle.attrs
+        ):
+            raise ValueError(f"Matrix store predates resumable builds: {matrix_file}")
+        return (
+            str(handle.attrs[matrix_hdf5.MATRIX_BUILD_STATE_ATTR]),
+            int(handle.attrs[matrix_hdf5.MATRIX_COMMITTED_SAMPLE_COUNT_ATTR]),
+        )
+
+
+def register_matrix_file(conn, *, matrix_file: Path, logger: WorkflowLogger | None = None) -> bool:
+    """Record one finished matrix store in the registry, reading it from the file.
+
+    The HDF5 file carries every registered field, including the filters written
+    by ``_write_matrix_hdf5_metatrawl_metadata``, so this needs no rebuild.
+    """
+    logger = logger or WorkflowLogger()
+    matrix_file = Path(matrix_file)
+    state, _committed = read_matrix_file_state(matrix_file)
+    if state != matrix_hdf5.MATRIX_BUILD_STATE_COMPLETE:
+        logger.emit(step="matrix-registry", status="skipped-incomplete", matrix=matrix_file, state=state)
+        return False
+    context = read_matrix_file_context(matrix_file)
+    db.register_matrix_store(
+        conn,
+        matrix_id=matrix_file.stem,
+        genome=context.genome,
+        matrix_file=matrix_file,
+        profile_count=len(context.sample_ids),
+        storage_layout=context.storage_layout,
+        sample_ids=list(context.sample_ids),
+        filters=context.filters,
+        overwrite=True,
+    )
+    return True
+
+
+def reconcile_matrix_registry(
+    conn,
+    *,
+    matrix_dir: Path,
+    logger: WorkflowLogger | None = None,
+) -> int:
+    """Re-register matrix stores whose registry rows are missing or stale.
+
+    Dispatched builds run read-only and so cannot register themselves. Rebuilding
+    the rows from the files keeps the registry usable as a dispatch plan without
+    touching any sample data, and costs one attribute read per matrix that
+    already agrees.
+    """
+    logger = logger or WorkflowLogger()
+    matrix_dir = Path(matrix_dir)
+    if not matrix_dir.is_dir():
+        return 0
+    reconciled = 0
+    for matrix_file in discover_matrix_files(matrix_dir):
+        try:
+            state, committed = read_matrix_file_state(matrix_file)
+        except (OSError, ValueError) as exc:
+            logger.emit(step="matrix-registry", status="unreadable", matrix=matrix_file, error=exc)
+            continue
+        if state != matrix_hdf5.MATRIX_BUILD_STATE_COMPLETE:
+            logger.emit(step="matrix-registry", status="in-progress", matrix=matrix_file, state=state)
+            continue
+        store = db.get_matrix_store(conn, matrix_file.stem)
+        if store is not None and int(store.profile_count) == committed:
+            continue
+        register_matrix_file(conn, matrix_file=matrix_file, logger=logger)
+        reconciled += 1
+        logger.emit(step="matrix-registry", status="reconciled", matrix=matrix_file, samples=committed)
+    if reconciled:
+        logger.emit(step="matrix-registry", status="done", reconciled=reconciled)
+    return reconciled
+
+
+def plan_matrix_sync_build(
+    conn,
+    *,
+    matrix_dir: Path,
+    genomes: list[str],
+    filters: db.MatrixFilters,
+    logger: WorkflowLogger | None = None,
+) -> tuple[list[str], list[str]]:
+    """Split candidate genomes into those needing work and those already current.
+
+    Returns ``(pending, up_to_date)``. A genome is only declared up to date when
+    the registry and the file agree on the committed sample count and the
+    registry shows no eligible sample missing from the matrix; anything the
+    registry cannot vouch for is dispatched, since the job re-checks the file
+    itself and a needless dispatch is merely wasted work.
+    """
+    logger = logger or WorkflowLogger()
+    matrix_dir = Path(matrix_dir)
+    pending: list[str] = []
+    registry_backed: list[tuple[str, str]] = []
+    for genome in genomes:
+        matrix_file = matrix_file_for_genome(matrix_dir, genome)
+        if not matrix_file.exists():
+            pending.append(genome)
+            continue
+        try:
+            state, committed = read_matrix_file_state(matrix_file)
+        except (OSError, ValueError) as exc:
+            logger.emit(step="matrix-sync-build", status="plan-unreadable", genome=genome, error=exc)
+            pending.append(genome)
+            continue
+        if state != matrix_hdf5.MATRIX_BUILD_STATE_COMPLETE:
+            pending.append(genome)
+            continue
+        store = db.get_matrix_store(conn, matrix_file.stem)
+        if store is None or int(store.profile_count) != committed:
+            pending.append(genome)
+            continue
+        registry_backed.append((genome, matrix_file.stem))
+    if registry_backed:
+        behind = set(
+            db.genomes_with_unmaterialized_samples(
+                conn,
+                targets=registry_backed,
+                filters=filters,
+            )
+        )
+        pending.extend(genome for genome, _matrix_id in registry_backed if genome in behind)
+    pending = _dedupe_preserving_order(pending)
+    pending_set = set(pending)
+    up_to_date = [genome for genome in genomes if genome not in pending_set]
+    logger.emit(
+        step="matrix-sync-build",
+        status="planned",
+        candidates=len(genomes),
+        pending=len(pending),
+        up_to_date=len(up_to_date),
+    )
+    return pending, up_to_date
 
 
 def _write_matrix_hdf5_metatrawl_metadata(matrix_file: Path, *, filters: db.MatrixFilters) -> None:
@@ -1657,6 +1840,25 @@ def _publish_profile_outputs(*, run_id: str, profile_work: Path, output_dir: Pat
     if missing:
         raise FileNotFoundError(f"sample={run_id} step=profile missing expected ZipStrain outputs: {', '.join(missing)}")
     for source, destination in outputs.items():
+        _atomic_publish(source, destination)
+
+
+def _atomic_publish(source: Path, destination: Path) -> None:
+    """Move one finished ZipStrain output into the durable output directory.
+
+    ``profile_work`` is deleted immediately after publication, so copying wrote
+    every profile parquet twice and doubled peak disk for the duration. A rename
+    is atomic within one filesystem; node-local scratch with networked output is
+    a different device, so that case still copies.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not _valid_file(source):
+        raise RuntimeError(f"Refusing to publish an empty or missing output: {source}")
+    try:
+        os.replace(source, destination)
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
         _atomic_copy(source, destination)
 
 

@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 from pathlib import Path
+import errno
 import signal
 
 import duckdb
 import h5py
 import numpy as np
 import polars as pl
+import pyarrow as pa
 import pytest
 
 from metatrawl import allele_mask
 from metatrawl import db
 from metatrawl import matrix_hdf5
 from metatrawl import migration
+from metatrawl import workflows
 from metatrawl.api import ProfileCountsUnavailableError, open_database
 
 
@@ -281,6 +284,44 @@ def test_full_and_allele_mask_hdf5_payloads_are_identical(
         assert handle["metadata"].attrs["coverage_filter_min_cov"] == "5"
         assert handle["metadata"].attrs["profile_format"] == "metatrawl_allele_mask_v1"
         assert handle["samples"]["sample_name"].asstr()[...].tolist() == list(SAMPLES)
+        if not sparse:
+            assert handle["matrices"]["0"].chunks[0] == 1
+
+
+def test_allele_mask_matrix_reuses_decoded_reference_segments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_dir, *_ = _project_files(tmp_path)
+    compact = _make_database(tmp_path, name="reference-cache", mode="allele-mask", cache_dir=cache_dir)
+    original_loader = allele_mask._load_reference_segments
+    reference_loads = 0
+
+    def count_reference_loads(*args, **kwargs):
+        nonlocal reference_loads
+        reference_loads += 1
+        return original_loader(*args, **kwargs)
+
+    monkeypatch.setattr(allele_mask, "_load_reference_segments", count_reference_loads)
+    reference_cache: dict[str, dict[int, allele_mask.ReferenceSegment]] = {}
+    with db.connect(compact) as conn:
+        list(
+            allele_mask.iter_decoded_profile_blocks(
+                conn,
+                sample_id="S1",
+                genome=GENOME,
+                reference_cache=reference_cache,
+            )
+        )
+        list(
+            allele_mask.iter_decoded_profile_blocks(
+                conn,
+                sample_id="S2",
+                genome=GENOME,
+                reference_cache=reference_cache,
+            )
+        )
+    assert reference_loads == 1
 
 
 @pytest.mark.parametrize("sparse", [False, True])
@@ -788,3 +829,328 @@ def test_full_database_migration_recovers_incomplete_initial_copy(
         assert conn.execute(
             "SELECT status FROM allele_mask_migration_state WHERE sample_id = 'S1'"
         ).fetchone() == ("done",)
+
+
+def test_group_codes_match_per_row_string_grouping() -> None:
+    """Dictionary codes must find the same scaffold boundaries as per-row strings."""
+    chroms = ["c1"] * 3 + ["c2"] * 2 + ["c1"] * 4
+    genomes = ["g1"] * 5 + ["g2"] * 4
+    batch = pa.RecordBatch.from_arrays(
+        [pa.array(chroms), pa.array(genomes)], ["chrom", "genome"]
+    )
+    chrom_codes, chrom_values = allele_mask._group_codes(batch, "chrom")
+    genome_codes, genome_values = allele_mask._group_codes(batch, "genome")
+
+    expected = np.flatnonzero(
+        (np.asarray(chroms[1:], dtype=object) != np.asarray(chroms[:-1], dtype=object))
+        | (np.asarray(genomes[1:], dtype=object) != np.asarray(genomes[:-1], dtype=object))
+    )
+    actual = np.flatnonzero(
+        (chrom_codes[1:] != chrom_codes[:-1]) | (genome_codes[1:] != genome_codes[:-1])
+    )
+    assert actual.tolist() == expected.tolist()
+    assert [chrom_values[code] for code in chrom_codes] == chroms
+    assert [genome_values[code] for code in genome_codes] == genomes
+
+
+def test_group_codes_spell_nulls_as_the_skipped_genome_marker() -> None:
+    """A null genome must still decode to 'None', which the import skip-list uses."""
+    batch = pa.RecordBatch.from_arrays(
+        [pa.array(["c1", "c1"]), pa.array([None, "g1"])], ["chrom", "genome"]
+    )
+    codes, values = allele_mask._group_codes(batch, "genome")
+    assert values[codes[0]] == "None"
+    assert values[codes[1]] == "g1"
+
+
+def test_dictionary_encoded_input_groups_identically(tmp_path: Path) -> None:
+    """Parquet may hand back dictionary columns; grouping must not care."""
+    plain = pa.RecordBatch.from_arrays(
+        [pa.array(["c1", "c1", "c2"]), pa.array(["g1"] * 3)], ["chrom", "genome"]
+    )
+    encoded = pa.RecordBatch.from_arrays(
+        [plain.column("chrom").dictionary_encode(), plain.column("genome")],
+        ["chrom", "genome"],
+    )
+    plain_codes, plain_values = allele_mask._group_codes(plain, "chrom")
+    encoded_codes, encoded_values = allele_mask._group_codes(encoded, "chrom")
+    assert [plain_values[c] for c in plain_codes] == [encoded_values[c] for c in encoded_codes]
+
+
+def test_blocks_flush_in_batches_without_changing_stored_bytes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Forcing a flush after every block must produce identical rows."""
+    cache_dir, _bed, _stb, _genes = _project_files(tmp_path)
+
+    def stored_blocks(flush_rows: int) -> list[tuple]:
+        monkeypatch.setattr(allele_mask, "BLOCK_FLUSH_MAX_ROWS", flush_rows)
+        db_file = _make_database(
+            tmp_path, name=f"flush{flush_rows}", mode="allele-mask", cache_dir=cache_dir
+        )
+        with db.connect(db_file) as conn:
+            return conn.execute(
+                "SELECT sample_id, segment_id, presence, deviation, covered_positions, "
+                "payload_hash FROM allele_mask_profile_blocks ORDER BY sample_id, segment_id"
+            ).fetchall()
+
+    one_at_a_time = stored_blocks(1)
+    batched = stored_blocks(2048)
+    assert one_at_a_time == batched
+    assert len(batched) > 1
+
+
+def test_reference_cache_is_reused_across_samples(tmp_path: Path, monkeypatch) -> None:
+    """One importer must decode each reference scaffold once, not once per sample."""
+    cache_dir, _bed, _stb, _genes = _project_files(tmp_path)
+    loads: list[tuple[str, str]] = []
+    original = allele_mask.load_reference_segment
+
+    def counting_load(conn, *, genome, chrom):
+        loads.append((genome, chrom))
+        return original(conn, genome=genome, chrom=chrom)
+
+    monkeypatch.setattr(allele_mask, "load_reference_segment", counting_load)
+    shared = allele_mask.AlleleMaskWriteCache()
+    db_file = tmp_path / "shared.duckdb"
+    with db.connect(db_file) as conn:
+        db.configure_profile_storage(conn, mode="allele-mask", min_cov=5)
+        for sample in SAMPLES:
+            db.add_runs(conn, [sample])
+            db.import_profile_bundle(
+                conn,
+                _write_bundle(tmp_path, sample),
+                cache_dir=cache_dir,
+                reference_cache=shared,
+            )
+    # Two scaffolds, three samples: without the shared cache this would be six.
+    assert sorted(loads) == [(GENOME, "contigA"), (GENOME, "contigB")]
+
+
+def test_reference_cache_evicts_beyond_its_base_budget(tmp_path: Path) -> None:
+    """The cache must stay bounded so a wide genome set cannot grow it forever."""
+    cache_dir, _bed, _stb, _genes = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="evict", mode="allele-mask", cache_dir=cache_dir)
+    with db.connect(db_file) as conn:
+        tiny = allele_mask.AlleleMaskWriteCache(max_cached_bases=1)
+        first = tiny.segment(conn, genome=GENOME, chrom="contigA")
+        tiny.segment(conn, genome=GENOME, chrom="contigB")
+        assert len(tiny._segments) == 1
+        again = tiny.segment(conn, genome=GENOME, chrom="contigA")
+        assert np.array_equal(first.masks, again.masks)
+
+
+def test_windowed_block_reads_match_per_sample_reads(tmp_path: Path, monkeypatch) -> None:
+    """Batched block fetches must build byte-identical matrices."""
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="window", mode="allele-mask", cache_dir=cache_dir)
+
+    windowed = tmp_path / "windowed.h5"
+    _build_matrix(
+        db_file, windowed, bed_file=bed_file, stb_file=stb_file,
+        gene_ranges=gene_ranges, sparse=False,
+    )
+
+    # Disable the window so every sample takes the original one-query-per-sample path.
+    monkeypatch.setattr(matrix_hdf5, "_AlleleMaskBlockWindow", lambda *a, **k: None)
+    per_sample = tmp_path / "per_sample.h5"
+    _build_matrix(
+        db_file, per_sample, bed_file=bed_file, stb_file=stb_file,
+        gene_ranges=gene_ranges, sparse=False,
+    )
+    assert _hdf_matrix_payload(windowed) == _hdf_matrix_payload(per_sample)
+
+
+def test_windowed_reads_survive_a_window_smaller_than_the_sample_set(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A window narrower than the build must still return every sample's blocks."""
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="narrow", mode="allele-mask", cache_dir=cache_dir)
+    reference = tmp_path / "reference.h5"
+    _build_matrix(
+        db_file, reference, bed_file=bed_file, stb_file=stb_file,
+        gene_ranges=gene_ranges, sparse=False,
+    )
+    monkeypatch.setattr(matrix_hdf5, "MATRIX_READ_WINDOW_SAMPLES", 1)
+    narrow = tmp_path / "narrow.h5"
+    _build_matrix(
+        db_file, narrow, bed_file=bed_file, stb_file=stb_file,
+        gene_ranges=gene_ranges, sparse=False,
+    )
+    assert _hdf_matrix_payload(narrow) == _hdf_matrix_payload(reference)
+
+
+def test_fetch_profile_block_rows_groups_every_requested_sample(tmp_path: Path) -> None:
+    """Samples with no blocks must still appear, so callers can tell empty from absent."""
+    cache_dir, _bed, _stb, _genes = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="fetch", mode="allele-mask", cache_dir=cache_dir)
+    with db.connect(db_file) as conn:
+        segments = [
+            int(row[0])
+            for row in conn.execute(
+                "SELECT segment_id FROM allele_mask_reference_segments"
+            ).fetchall()
+        ]
+        grouped = allele_mask.fetch_profile_block_rows(
+            conn, sample_ids=["S1", "S2", "missing"], segment_ids=segments
+        )
+    assert set(grouped) == {"S1", "S2", "missing"}
+    assert grouped["missing"] == []
+    assert grouped["S1"]
+
+
+def test_publish_moves_outputs_instead_of_copying(tmp_path: Path) -> None:
+    """Publishing renames, so the profile parquet is not written twice."""
+    source = tmp_path / "work" / "out.parquet"
+    source.parent.mkdir()
+    source.write_bytes(b"payload")
+    destination = tmp_path / "published" / "out.parquet"
+
+    workflows._atomic_publish(source, destination)
+
+    assert destination.read_bytes() == b"payload"
+    assert not source.exists()
+
+
+def test_publish_falls_back_to_copying_across_filesystems(tmp_path: Path, monkeypatch) -> None:
+    """Node-local scratch and networked output are different devices."""
+    source = tmp_path / "work" / "out.parquet"
+    source.parent.mkdir()
+    source.write_bytes(b"payload")
+    destination = tmp_path / "published" / "out.parquet"
+
+    real_replace = workflows.os.replace
+    calls = {"count": 0}
+
+    def cross_device(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise OSError(errno.EXDEV, "Cross-device link")
+        return real_replace(*args, **kwargs)
+
+    monkeypatch.setattr(workflows.os, "replace", cross_device)
+    workflows._atomic_publish(source, destination)
+
+    assert destination.read_bytes() == b"payload"
+    assert source.exists()  # the copy path leaves the caller to clean up
+
+
+def test_publish_refuses_an_empty_output(tmp_path: Path) -> None:
+    """An empty output must never be published as if it were complete."""
+    source = tmp_path / "empty.parquet"
+    source.write_bytes(b"")
+    with pytest.raises(RuntimeError, match="empty or missing"):
+        workflows._atomic_publish(source, tmp_path / "published.parquet")
+
+
+def test_registry_reconcile_rebuilds_rows_from_matrix_files(tmp_path: Path) -> None:
+    """A matrix built read-only can be registered later from the file alone."""
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="reconcile", mode="allele-mask", cache_dir=cache_dir)
+    matrix_dir = tmp_path / "matrices"
+    matrix_dir.mkdir()
+    _build_matrix(
+        db_file, matrix_dir / "GCF_000001.1.h5", bed_file=bed_file, stb_file=stb_file,
+        gene_ranges=gene_ranges, sparse=False,
+    )
+    with db.connect(db_file) as conn:
+        conn.execute("DELETE FROM matrix_stores")
+        conn.execute("DELETE FROM matrix_store_samples")
+
+        assert workflows.reconcile_matrix_registry(conn, matrix_dir=matrix_dir) == 1
+
+        store = db.get_matrix_store(conn, "GCF_000001.1")
+        assert store is not None
+        assert store.genome == GENOME
+        assert store.profile_count == len(SAMPLES)
+        materialized = conn.execute(
+            "SELECT sample_id FROM matrix_store_samples ORDER BY sample_id"
+        ).fetchall()
+        assert [row[0] for row in materialized] == sorted(SAMPLES)
+        # A second pass has nothing left to do.
+        assert workflows.reconcile_matrix_registry(conn, matrix_dir=matrix_dir) == 0
+
+
+def test_plan_skips_current_genomes_and_keeps_unverifiable_ones(tmp_path: Path) -> None:
+    """Only a genome the registry can vouch for may skip its job."""
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="plan", mode="allele-mask", cache_dir=cache_dir)
+    matrix_dir = tmp_path / "matrices"
+    matrix_dir.mkdir()
+    _build_matrix(
+        db_file, matrix_dir / "GCF_000001.1.h5", bed_file=bed_file, stb_file=stb_file,
+        gene_ranges=gene_ranges, sparse=False,
+    )
+    filters = db.MatrixFilters()
+    with db.connect(db_file) as conn:
+        workflows.reconcile_matrix_registry(conn, matrix_dir=matrix_dir)
+
+        pending, up_to_date = workflows.plan_matrix_sync_build(
+            conn, matrix_dir=matrix_dir, genomes=[GENOME], filters=filters
+        )
+        assert (pending, up_to_date) == ([], [GENOME])
+
+        # A genome with no matrix file at all must be dispatched.
+        pending, up_to_date = workflows.plan_matrix_sync_build(
+            conn, matrix_dir=matrix_dir, genomes=[GENOME, "GCF_999999.9"], filters=filters
+        )
+        assert pending == ["GCF_999999.9"]
+
+        # A registry row that disagrees with the file must never allow a skip.
+        conn.execute("UPDATE matrix_stores SET profile_count = 999 WHERE matrix_id = 'GCF_000001.1'")
+        pending, up_to_date = workflows.plan_matrix_sync_build(
+            conn, matrix_dir=matrix_dir, genomes=[GENOME], filters=filters
+        )
+        assert (pending, up_to_date) == ([GENOME], [])
+
+
+def test_plan_dispatches_a_genome_with_an_unmaterialized_sample(tmp_path: Path) -> None:
+    """A newly imported eligible sample must bring its genome back into the plan."""
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="behind", mode="allele-mask", cache_dir=cache_dir)
+    matrix_dir = tmp_path / "matrices"
+    matrix_dir.mkdir()
+    _build_matrix(
+        db_file, matrix_dir / "GCF_000001.1.h5", bed_file=bed_file, stb_file=stb_file,
+        gene_ranges=gene_ranges, sparse=False,
+    )
+    with db.connect(db_file) as conn:
+        workflows.reconcile_matrix_registry(conn, matrix_dir=matrix_dir)
+        assert workflows.plan_matrix_sync_build(
+            conn, matrix_dir=matrix_dir, genomes=[GENOME], filters=db.MatrixFilters()
+        ) == ([], [GENOME])
+
+        # Simulate a sample that is eligible but absent from the matrix, exactly
+        # as a freshly imported sample looks to the planner.
+        conn.execute("DELETE FROM matrix_store_samples WHERE sample_id = ?", ["S3"])
+
+        pending, up_to_date = workflows.plan_matrix_sync_build(
+            conn, matrix_dir=matrix_dir, genomes=[GENOME], filters=db.MatrixFilters()
+        )
+        assert (pending, up_to_date) == ([GENOME], [])
+
+
+def test_plan_never_skips_a_matrix_left_mid_append(tmp_path: Path) -> None:
+    """An interrupted append leaves a real .h5; it must not be trusted."""
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="midappend", mode="allele-mask", cache_dir=cache_dir)
+    matrix_dir = tmp_path / "matrices"
+    matrix_dir.mkdir()
+    matrix_file = matrix_dir / "GCF_000001.1.h5"
+    _build_matrix(
+        db_file, matrix_file, bed_file=bed_file, stb_file=stb_file,
+        gene_ranges=gene_ranges, sparse=False,
+    )
+    with db.connect(db_file) as conn:
+        workflows.reconcile_matrix_registry(conn, matrix_dir=matrix_dir)
+    with h5py.File(matrix_file, "r+") as handle:
+        handle.attrs[matrix_hdf5.MATRIX_BUILD_STATE_ATTR] = matrix_hdf5.MATRIX_BUILD_STATE_APPENDING
+    with db.connect(db_file) as conn:
+        pending, up_to_date = workflows.plan_matrix_sync_build(
+            conn, matrix_dir=matrix_dir, genomes=[GENOME], filters=db.MatrixFilters()
+        )
+        assert (pending, up_to_date) == ([GENOME], [])
+        # ...and reconcile must not register an in-progress file either.
+        conn.execute("DELETE FROM matrix_stores")
+        assert workflows.reconcile_matrix_registry(conn, matrix_dir=matrix_dir) == 0

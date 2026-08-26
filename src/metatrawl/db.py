@@ -561,6 +561,7 @@ def import_profile_bundle(
     *,
     add_run_if_missing: bool = False,
     cache_dir: Path | None = None,
+    reference_cache: allele_mask.AlleleMaskWriteCache | None = None,
 ) -> None:
     """Import profile, stat, and abundance files into project tables."""
     import_profile_bundles(
@@ -568,6 +569,7 @@ def import_profile_bundle(
         [bundle],
         add_runs_if_missing=add_run_if_missing,
         cache_dir=cache_dir,
+        reference_cache=reference_cache,
     )
 
 
@@ -577,6 +579,7 @@ def import_profile_bundles(
     *,
     add_runs_if_missing: bool = False,
     cache_dir: Path | None = None,
+    reference_cache: allele_mask.AlleleMaskWriteCache | None = None,
 ) -> None:
     """Import multiple bundles in one transaction using one DuckDB writer."""
     if not bundles:
@@ -596,6 +599,7 @@ def import_profile_bundles(
                 bundle,
                 storage=storage,
                 cache_dir=cache_dir,
+                reference_cache=reference_cache,
             )
         conn.execute("COMMIT")
     except Exception:
@@ -626,6 +630,7 @@ def _import_profile_bundle_rows(
     *,
     storage: ProfileStorageConfig,
     cache_dir: Path | None,
+    reference_cache: allele_mask.AlleleMaskWriteCache | None = None,
 ) -> None:
     sample_id = bundle.run_id
     now = time.time()
@@ -643,6 +648,7 @@ def _import_profile_bundle_rows(
             profile_file=bundle.profile_file,
             min_cov=int(storage.min_cov),
             cache_dir=cache_dir,
+            reference_cache=reference_cache,
         )
     else:
         _insert_profile_positions(
@@ -811,6 +817,73 @@ def eligible_unmaterialized_sample_ids(
         """,
         [eligible, matrix_id],
     ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def genomes_with_unmaterialized_samples(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    targets: list[tuple[str, str]],
+    filters: MatrixFilters,
+) -> list[str]:
+    """Return target genomes holding eligible samples their matrix does not have.
+
+    ``targets`` pairs each genome with the matrix ID that stores it. One grouped
+    query replaces a per-genome eligibility scan, and lets the caller skip
+    launching a job for a genome that has nothing new to materialize.
+    """
+    if not targets:
+        return []
+    conditions = ["s.status = 'complete'"]
+    params: list[object] = []
+    if filters.min_coverage is not None:
+        conditions.append("COALESCE(gs.coverage, 0) >= ?")
+        params.append(filters.min_coverage)
+    if filters.min_breadth is not None:
+        conditions.append("COALESCE(gs.breadth, 0) >= ?")
+        params.append(filters.min_breadth)
+    if filters.min_ber is not None:
+        conditions.append("COALESCE(gs.ber, 0) >= ?")
+        params.append(filters.min_ber)
+    if filters.min_sylph_abundance is not None:
+        conditions.append(
+            """
+            EXISTS (
+              SELECT 1
+              FROM sylph_abundance sa
+              WHERE sa.sample_id = s.sample_id
+                AND (sa.genome = t.genome OR sa.accession = t.genome)
+                AND COALESCE(sa.abundance, 0) >= ?
+            )
+            """
+        )
+        params.append(filters.min_sylph_abundance)
+    frame = pl.DataFrame(
+        {
+            "genome": [str(genome) for genome, _matrix_id in targets],
+            "matrix_id": [str(matrix_id) for _genome, matrix_id in targets],
+        }
+    )
+    conn.register("_metatrawl_matrix_targets", frame)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT t.genome
+            FROM _metatrawl_matrix_targets t
+            JOIN genome_stats gs ON gs.genome = t.genome
+            JOIN samples s ON s.sample_id = gs.sample_id
+            WHERE {' AND '.join(conditions)}
+              AND NOT EXISTS (
+                SELECT 1
+                FROM matrix_store_samples m
+                WHERE m.matrix_id = t.matrix_id AND m.sample_id = s.sample_id
+              )
+            ORDER BY t.genome
+            """,
+            params,
+        ).fetchall()
+    finally:
+        conn.unregister("_metatrawl_matrix_targets")
     return [str(row[0]) for row in rows]
 
 
@@ -1051,17 +1124,46 @@ def get_matrix_store_by_file(conn: duckdb.DuckDBPyConnection, matrix_file: Path)
 
 
 def add_matrix_store_samples(conn: duckdb.DuckDBPyConnection, *, matrix_id: str, sample_ids: list[str]) -> int:
-    """Record samples materialized into a matrix store."""
+    """Record samples materialized into a matrix store.
+
+    Registering a matrix with many samples is one bulk insert: row-at-a-time
+    inserts cost hundreds of microseconds each, which a 100k-sample matrix turns
+    into minutes.
+    """
+    normalized = _normalize_ids(sample_ids)
+    if not normalized:
+        return 0
     now = time.time()
-    inserted = 0
-    for sample_id in _normalize_ids(sample_ids):
-        row = conn.execute(
-            "INSERT OR IGNORE INTO matrix_store_samples VALUES (?, ?, ?) RETURNING sample_id",
-            [matrix_id, sample_id, now],
-        ).fetchone()
-        if row is not None:
-            inserted += 1
-    return inserted
+    before = int(
+        conn.execute(
+            "SELECT count(*) FROM matrix_store_samples WHERE matrix_id = ?",
+            [matrix_id],
+        ).fetchone()[0]
+    )
+    frame = pl.DataFrame(
+        {
+            "matrix_id": [matrix_id] * len(normalized),
+            "sample_id": normalized,
+            "added_at": [now] * len(normalized),
+        }
+    )
+    conn.register("_metatrawl_matrix_store_samples", frame)
+    try:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO matrix_store_samples (matrix_id, sample_id, added_at)
+            SELECT matrix_id, sample_id, added_at FROM _metatrawl_matrix_store_samples
+            """
+        )
+    finally:
+        conn.unregister("_metatrawl_matrix_store_samples")
+    after = int(
+        conn.execute(
+            "SELECT count(*) FROM matrix_store_samples WHERE matrix_id = ?",
+            [matrix_id],
+        ).fetchone()[0]
+    )
+    return after - before
 
 
 def unmaterialized_sample_ids(conn: duckdb.DuckDBPyConnection, matrix_id: str) -> list[str]:

@@ -2508,8 +2508,40 @@ def test_matrix_sync_build_dispatches_one_job_per_genome_with_workflow_config(tm
         def run(self, stage, command, *, sample, stdout_file=None):
             commands.append((stage, command, sample))
 
-    monkeypatch.setattr(cli, "WorkflowRuntime", FakeRuntime)
-    monkeypatch.setattr(cli.registry, "connect", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dispatch must not open a write connection")))
+    # A read-write DuckDB connection locks out every other connection, read-only
+    # included, so no write connection may be open while a child job is running.
+    # Planning before dispatch and registering after it are both fine.
+    open_write_connections = {"count": 0}
+    real_connect = cli.registry.connect
+
+    class _TrackedConnection:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __enter__(self):
+            open_write_connections["count"] += 1
+            self._conn.__enter__()
+            return self._conn
+
+        def __exit__(self, *exc_info):
+            open_write_connections["count"] -= 1
+            return self._conn.__exit__(*exc_info)
+
+    monkeypatch.setattr(
+        cli.registry,
+        "connect",
+        lambda *args, **kwargs: _TrackedConnection(real_connect(*args, **kwargs)),
+    )
+
+    class FakeRuntimeCheckingLocks(FakeRuntime):
+        def run(self, stage, command, *, sample, stdout_file=None):
+            assert open_write_connections["count"] == 0, (
+                "a read-write connection was open while a child job ran; "
+                "children connect read-only and would be locked out"
+            )
+            commands.append((stage, command, sample))
+
+    monkeypatch.setattr(cli, "WorkflowRuntime", FakeRuntimeCheckingLocks)
 
     result = runner.invoke(
         cli.cli,
@@ -2537,14 +2569,14 @@ def test_matrix_sync_build_dispatches_one_job_per_genome_with_workflow_config(tm
     assert result.exit_code == 0, result.output
     assert [stage for stage, _, _ in commands] == ["matrix_build", "matrix_build"]
     first_command = commands[0][1]
-    assert first_command[first_command.index("--memory-limit-gb") + 1] == "64.0"
+    assert first_command[first_command.index("--memory-limit-gb") + 1] == "32.0"
     assert first_command[first_command.index("--export-batch-mb") + 1] == "512.0"
     assert first_command[first_command.index("--duckdb-export-threads") + 1] == "3"
     command_by_sample = {sample: command for _, command, sample in commands}
     assert sorted(command_by_sample) == ["genome_a", "genome_b"]
     assert "--workflow-config" not in command_by_sample["genome_a"]
     assert command_by_sample["genome_a"][:3] == ["metatrawl", "matrix", "sync-build"]
-    assert command_by_sample["genome_a"][command_by_sample["genome_a"].index("--memory-limit-gb") + 1] == "64.0"
+    assert command_by_sample["genome_a"][command_by_sample["genome_a"].index("--memory-limit-gb") + 1] == "32.0"
     assert "--no-register" in command_by_sample["genome_a"]
     assert "--sparse" in command_by_sample["genome_b"]
     assert "built=2" in result.output
@@ -2652,8 +2684,40 @@ def test_matrix_sync_compare_dispatches_one_job_per_matrix_with_workflow_config(
         def run(self, stage, command, *, sample, stdout_file=None):
             commands.append((stage, command, sample))
 
-    monkeypatch.setattr(cli, "WorkflowRuntime", FakeRuntime)
-    monkeypatch.setattr(cli.registry, "connect", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dispatch must not open a write connection")))
+    # A read-write DuckDB connection locks out every other connection, read-only
+    # included, so no write connection may be open while a child job is running.
+    # Planning before dispatch and registering after it are both fine.
+    open_write_connections = {"count": 0}
+    real_connect = cli.registry.connect
+
+    class _TrackedConnection:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __enter__(self):
+            open_write_connections["count"] += 1
+            self._conn.__enter__()
+            return self._conn
+
+        def __exit__(self, *exc_info):
+            open_write_connections["count"] -= 1
+            return self._conn.__exit__(*exc_info)
+
+    monkeypatch.setattr(
+        cli.registry,
+        "connect",
+        lambda *args, **kwargs: _TrackedConnection(real_connect(*args, **kwargs)),
+    )
+
+    class FakeRuntimeCheckingLocks(FakeRuntime):
+        def run(self, stage, command, *, sample, stdout_file=None):
+            assert open_write_connections["count"] == 0, (
+                "a read-write connection was open while a child job ran; "
+                "children connect read-only and would be locked out"
+            )
+            commands.append((stage, command, sample))
+
+    monkeypatch.setattr(cli, "WorkflowRuntime", FakeRuntimeCheckingLocks)
     monkeypatch.setattr(cli.registry, "connect_read_only", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("compare dispatch should not open the project database")))
 
     result = runner.invoke(

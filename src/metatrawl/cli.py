@@ -692,27 +692,57 @@ def matrix_sync_build(
         ):
             resolved_matrix_min_cov = int(profile_storage.min_cov)
         if workflow_config is not None and _should_dispatch_stage(execution_config, "matrix_build") and not no_register:
-            summary = _dispatch_matrix_sync_build_jobs(
-                db_file=db_file,
-                matrix_dir=matrix_dir,
-                genomes=selected_genomes,
-                bed_file=bed_file,
-                stb_file=stb_file,
-                bed_dir=bed_dir,
-                stb_dir=stb_dir,
-                gene_range_table=gene_range_table,
-                gene_range_dir=gene_range_dir,
-                filters=filters,
-                sparse=sparse,
-                storage_mode=resolved_storage_mode,
-                count_dtype=resolved_count_dtype,
-                min_cov=resolved_matrix_min_cov,
-                memory_limit_gb=resolved_memory_limit_gb,
-                export_batch_mb=resolved_export_batch_mb,
-                duckdb_export_threads=resolved_duckdb_export_threads,
-                execution_config=execution_config,
-                logger=WorkflowLogger(),
-            )
+            logger = WorkflowLogger()
+            # Plan under a read-write connection, then close it: DuckDB refuses
+            # every other connection, read-only included, while one is open.
+            matrix_dir.mkdir(parents=True, exist_ok=True)
+            with registry.connect(db_file) as conn:
+                workflows.reconcile_matrix_registry(conn, matrix_dir=matrix_dir, logger=logger)
+                pending_genomes, up_to_date_genomes = workflows.plan_matrix_sync_build(
+                    conn,
+                    matrix_dir=matrix_dir,
+                    genomes=selected_genomes,
+                    filters=filters,
+                    logger=logger,
+                )
+            existing_before = {
+                genome
+                for genome in pending_genomes
+                if workflows.matrix_file_for_genome(matrix_dir, genome).exists()
+            }
+            if not pending_genomes:
+                summary = workflows.MatrixSyncBuildSummary(
+                    genomes=len(selected_genomes),
+                    built=0,
+                    appended=0,
+                    up_to_date=len(up_to_date_genomes),
+                    skipped=0,
+                    failed=0,
+                )
+            else:
+                summary = _dispatch_matrix_sync_build_jobs(
+                    db_file=db_file,
+                    matrix_dir=matrix_dir,
+                    genomes=pending_genomes,
+                    up_to_date=len(up_to_date_genomes),
+                    existing_before=existing_before,
+                    bed_file=bed_file,
+                    stb_file=stb_file,
+                    bed_dir=bed_dir,
+                    stb_dir=stb_dir,
+                    gene_range_table=gene_range_table,
+                    gene_range_dir=gene_range_dir,
+                    filters=filters,
+                    sparse=sparse,
+                    storage_mode=resolved_storage_mode,
+                    count_dtype=resolved_count_dtype,
+                    min_cov=resolved_matrix_min_cov,
+                    memory_limit_gb=resolved_memory_limit_gb,
+                    export_batch_mb=resolved_export_batch_mb,
+                    duckdb_export_threads=resolved_duckdb_export_threads,
+                    execution_config=execution_config,
+                    logger=logger,
+                )
         else:
             connect = registry.connect_read_only if no_register else registry.connect
             with connect(db_file) as conn:
@@ -987,6 +1017,8 @@ def _dispatch_matrix_sync_build_jobs(
     db_file: Path,
     matrix_dir: Path,
     genomes: list[str],
+    up_to_date: int,
+    existing_before: set[str],
     bed_file: Path | None,
     stb_file: Path | None,
     bed_dir: Path | None,
@@ -1006,15 +1038,22 @@ def _dispatch_matrix_sync_build_jobs(
 ) -> workflows.MatrixSyncBuildSummary:
     runtime = WorkflowRuntime(execution_config, state_dir=matrix_dir, logger=logger)
     stage = execution_config.stage("matrix_build")
+    # Each child is its own process with its own DuckDB memory limit, so the
+    # configured limit is a per-worker budget, not a total for the node.
+    worker_count = max(1, min(len(genomes) or 1, stage.workers))
+    child_memory_limit_gb = memory_limit_gb / worker_count
     logger.emit(
         step="matrix-sync-build",
         status="dispatch-start",
         genomes=len(genomes),
         execution=stage.execution,
         workers=stage.workers,
+        memory_limit_gb_total=f"{memory_limit_gb:.1f}",
+        memory_limit_gb_per_worker=f"{child_memory_limit_gb:.1f}",
     )
     completed = failed = 0
-    with ThreadPoolExecutor(max_workers=max(1, min(len(genomes) or 1, stage.workers))) as executor:
+    succeeded: list[str] = []
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = {}
         for genome in genomes:
             command = _matrix_sync_build_child_command(
@@ -1032,7 +1071,7 @@ def _dispatch_matrix_sync_build_jobs(
                 storage_mode=storage_mode,
                 count_dtype=count_dtype,
                 min_cov=min_cov,
-                memory_limit_gb=memory_limit_gb,
+                memory_limit_gb=child_memory_limit_gb,
                 export_batch_mb=export_batch_mb,
                 duckdb_export_threads=duckdb_export_threads,
             )
@@ -1046,13 +1085,32 @@ def _dispatch_matrix_sync_build_jobs(
                 logger.emit(step="matrix-sync-build", status="failed", genome=genome, error=exc)
             else:
                 completed += 1
+                succeeded.append(genome)
                 logger.emit(step="matrix-sync-build", status="completed", genome=genome)
     logger.emit(step="matrix-sync-build", status="dispatch-done", genomes=len(genomes), completed=completed, failed=failed)
+
+    # Children run read-only and cannot register themselves, and DuckDB refuses
+    # every other connection while a read-write one is open -- so registration
+    # happens here, only once every child has exited.
+    registered = 0
+    with registry.connect(db_file) as conn:
+        for genome in succeeded:
+            matrix_file = workflows.matrix_file_for_genome(matrix_dir, genome)
+            if not matrix_file.exists():
+                continue
+            try:
+                if workflows.register_matrix_file(conn, matrix_file=matrix_file, logger=logger):
+                    registered += 1
+            except (OSError, ValueError) as exc:
+                logger.emit(step="matrix-registry", status="failed", genome=genome, error=exc)
+    logger.emit(step="matrix-sync-build", status="registered", matrices=registered)
+
+    built = sum(1 for genome in succeeded if genome not in existing_before)
     return workflows.MatrixSyncBuildSummary(
-        genomes=len(genomes),
-        built=completed,
-        appended=0,
-        up_to_date=0,
+        genomes=len(genomes) + up_to_date,
+        built=built,
+        appended=completed - built,
+        up_to_date=up_to_date,
         skipped=0,
         failed=failed,
     )
