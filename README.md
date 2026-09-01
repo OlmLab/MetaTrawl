@@ -546,15 +546,28 @@ sample (or just the genomes named with `--genome`).
 **Per-genome decision.** For each genome, MetaTrawl looks at `matrices/<genome>.h5`:
 
 - **absent** → build a new ZipStrain matrix from all eligible samples;
-- **present** → append only the eligible samples that are *not already in the
-  HDF5 file* (it reads the sample list stored inside the file to diff);
+- **present** → compare the filtered genome-stat sample set with the compact
+  required-sample checkpoint stored in HDF5, then append only missing samples;
 - **present, nothing new** → report the genome as up to date.
+
+The matrix keeps committed row order separate from a sorted required-sample
+catalog. Count and digest attributes make repeat status checks constant-size;
+older matrices are upgraded from their existing sample catalog the first time
+they are checked. Under Slurm, MetaTrawl summarizes and checks only one
+worker-sized window of genomes at a time, submits the genomes needing work, and
+continues checking while those jobs run. It does not materialize every
+genome/sample pair or queue every genome before useful work starts.
 
 While an absent matrix is being built, complete sample batches are flushed to a
 durable `.h5.tmp` checkpoint. Repeating the same command after cancellation
 resumes from the committed sample count; only a batch interrupted during its
 write is repeated. The checkpoint becomes the final `.h5` through an atomic
 rename when the build completes.
+
+`export_batch_mb` is the approximate RAM target for one matrix batch. MetaTrawl
+uses the genome length and matrix dtype to estimate how many complete samples fit,
+fetches those samples together from DuckDB, converts them in memory, and appends
+the ordered batch to HDF5 with one commit.
 
 **Eligibility.** A sample is eligible for a genome's matrix when it is `complete`
 and clears the stat thresholds: `--min-coverage`, `--min-breadth`, and
@@ -725,7 +738,7 @@ metatrawl sync-profile \
   --workflow-config examples/workflow.toml
 ```
 
-Each stage supports `workers`, `threads`, `execution = "local" | "slurm"`, `retries`, `retry_delay_seconds`, and an optional `environment` table. Slurm stages also accept `time`, `memory_gb`, `partition`, `account`, and arbitrary `extra` `sbatch` options. MetaTrawl submits Slurm jobs with `sbatch --wait`; checkpointing, output publication, and scratch cleanup therefore happen only after the job completes. If a stage fails, MetaTrawl retries that stage command or Slurm job according to the stage retry settings before marking the sample failed.
+Each stage supports `workers`, `threads`, `execution = "local" | "slurm"`, `retries`, `retry_delay_seconds`, and an optional `environment` table. Slurm stages also accept `time`, `memory_gb`, `memory_retry_coefficient`, `time_retry_coefficient`, `partition`, `account`, and arbitrary `extra` `sbatch` options. Both retry coefficients default to `1.0`. MetaTrawl increases memory only after an out-of-memory failure and increases time only after a timeout; preempted jobs retry with unchanged resources. MetaTrawl submits Slurm jobs with `sbatch --wait`; checkpointing, output publication, and scratch cleanup therefore happen only after the job completes. If a stage fails, MetaTrawl retries that stage command or Slurm job according to the stage retry settings before marking the sample failed.
 
 `sync-profile` publishes each completed sample atomically and sends it to one
 dedicated DuckDB writer. Profiling continues while that writer imports bounded
@@ -802,6 +815,8 @@ retry_delay_seconds = 120
 [stages.alignment.slurm]
 time = "04:00:00"
 memory_gb = 64
+memory_retry_coefficient = 1.5
+time_retry_coefficient = 1.25
 partition = "compute"
 account = "project-name"
 

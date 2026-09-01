@@ -22,6 +22,8 @@ environment = { OMP_NUM_THREADS = "12" }
 [stages.bowtie_build.slurm]
 time = "03:00:00"
 memory_gb = 48
+memory_retry_coefficient = 1.5
+time_retry_coefficient = 1.25
 partition = "compute"
 [matrix_build]
 memory_limit_gb = 20
@@ -68,6 +70,8 @@ batch_wait_seconds = 0.25
     assert config.stage("bowtie_build").retries == 2
     assert config.stage("bowtie_build").retry_delay_seconds == 0.5
     assert config.stage("bowtie_build").slurm.memory_gb == 48
+    assert config.stage("bowtie_build").slurm.memory_retry_coefficient == 1.5
+    assert config.stage("bowtie_build").slurm.time_retry_coefficient == 1.25
     assert config.matrix_build.memory_limit_gb == 20.0
     assert config.matrix_build.export_batch_mb == 32.0
     assert config.matrix_build.duckdb_export_threads == 4
@@ -144,6 +148,13 @@ def test_config_rejects_negative_stage_retries(tmp_path: Path) -> None:
         load_workflow_config(path, threads=2, sample_count=2)
 
 
+def test_config_rejects_slurm_retry_coefficient_below_one(tmp_path: Path) -> None:
+    path = tmp_path / "workflow.toml"
+    path.write_text("[stages.alignment.slurm]\nmemory_retry_coefficient = 0.5\n")
+    with pytest.raises(ValueError, match="memory_retry_coefficient must be a number greater than or equal to 1"):
+        load_workflow_config(path, threads=2, sample_count=2)
+
+
 def test_config_rejects_invalid_profile_read_ani(tmp_path: Path) -> None:
     path = tmp_path / "workflow.toml"
     path.write_text("[profile]\nmin_read_ani = 1.5\n")
@@ -215,6 +226,8 @@ retry_delay_seconds = 0
 [stages.alignment.slurm]
 time = "01:00:00"
 memory_gb = 16
+memory_retry_coefficient = 2
+time_retry_coefficient = 2
 ''')
     config = load_workflow_config(path, threads=1, sample_count=1)
     calls = []
@@ -230,3 +243,77 @@ memory_gb = 16
 
     assert len(calls) == 3
     assert all(call[0][0] == "sbatch" for call in calls)
+    assert all(call[0][call[0].index("--mem") + 1] == "16G" for call in calls)
+    assert all(call[0][call[0].index("--time") + 1] == "01:00:00" for call in calls)
+
+
+def test_slurm_runtime_increases_memory_only_after_oom(tmp_path: Path) -> None:
+    path = tmp_path / "workflow.toml"
+    path.write_text('''
+[stages.matrix_build]
+execution = "slurm"
+workers = 1
+threads = 8
+retries = 2
+[stages.matrix_build.slurm]
+time = "04:00:00"
+memory_gb = 20
+memory_retry_coefficient = 1.5
+time_retry_coefficient = 2
+''')
+    config = load_workflow_config(path, threads=1, sample_count=1)
+    calls = []
+
+    def runner(command, **kwargs):
+        calls.append((command, kwargs))
+        if len(calls) == 1:
+            Path(command[command.index("--error") + 1]).write_text(
+                "slurmstepd: error: Detected 1 oom_kill event\n"
+            )
+            raise subprocess.CalledProcessError(1, command, stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout="123", stderr="")
+
+    runtime = WorkflowRuntime(config, state_dir=tmp_path, logger=WorkflowLogger(), runner=runner)
+    runtime.run_shell("matrix_build", "metatrawl matrix sync-build", sample="GCF_1")
+
+    assert [call[0][call[0].index("--mem") + 1] for call in calls] == ["20G", "30G"]
+    assert [call[0][call[0].index("--time") + 1] for call in calls] == [
+        "04:00:00",
+        "04:00:00",
+    ]
+
+
+def test_slurm_runtime_increases_time_only_after_timeout(tmp_path: Path) -> None:
+    path = tmp_path / "workflow.toml"
+    path.write_text('''
+[stages.matrix_compare]
+execution = "slurm"
+workers = 1
+threads = 8
+retries = 1
+[stages.matrix_compare.slurm]
+time = "04:00:00"
+memory_gb = 20
+memory_retry_coefficient = 2
+time_retry_coefficient = 1.5
+''')
+    config = load_workflow_config(path, threads=1, sample_count=1)
+    calls = []
+
+    def runner(command, **kwargs):
+        calls.append((command, kwargs))
+        if len(calls) == 1:
+            Path(command[command.index("--error") + 1]).write_text(
+                "slurmstepd: error: JOB CANCELLED DUE TO TIME LIMIT\n"
+            )
+            raise subprocess.CalledProcessError(1, command, stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout="123", stderr="")
+
+    runtime = WorkflowRuntime(config, state_dir=tmp_path, logger=WorkflowLogger(), runner=runner)
+    runtime.run_shell("matrix_compare", "metatrawl matrix sync-compare", sample="GCF_1")
+
+    assert [call[0][call[0].index("--mem") + 1] for call in calls] == ["20G", "20G"]
+    assert [call[0][call[0].index("--time") + 1] for call in calls] == [
+        "04:00:00",
+        "06:00:00",
+    ]

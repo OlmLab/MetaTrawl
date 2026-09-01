@@ -10,9 +10,11 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 import signal
 import threading
+import time
 from typing import Callable
 
 import duckdb
@@ -49,12 +51,15 @@ MATRIX_HDF5_CONTRACT_GENOMES_GROUP = "contract_genomes"
 MATRIX_HDF5_CONTRACT_SCAFFOLDS_GROUP = "contract_genome_scaffolds"
 MATRIX_BUILD_STATE_ATTR = "metatrawl_build_state"
 MATRIX_COMMITTED_SAMPLE_COUNT_ATTR = "metatrawl_committed_sample_count"
-# Samples read per bulk block query. One query per (sample, genome) spent ~3.2 ms
-# in dispatch alone; a window amortizes that to ~0.15 ms per sample.
-MATRIX_READ_WINDOW_SAMPLES = 64
+MATRIX_REQUIRED_SAMPLE_COUNT_ATTR = "metatrawl_required_sample_count"
+MATRIX_REQUIRED_SAMPLE_DIGEST_ATTR = "metatrawl_required_sample_digest"
+MATRIX_REQUIRED_SAMPLE_DATASET = "required_sample_name"
 MATRIX_BUILD_STATE_BUILDING = "building"
 MATRIX_BUILD_STATE_APPENDING = "appending"
 MATRIX_BUILD_STATE_COMPLETE = "complete"
+_SAMPLE_DIGEST_SEPARATOR = "\x1f"
+SPARSE_STREAM_MAX_SAMPLES = 64
+SPARSE_STREAM_TARGET_BYTES = 64 * 1024**2
 
 _RESUME_METADATA_KEYS = (
     "profile_format",
@@ -132,6 +137,21 @@ class DirectMatrixAppendSummary:
     stored_rows: int
 
 
+def normalize_required_sample_ids(sample_ids: list[str] | tuple[str, ...]) -> list[str]:
+    """Return the canonical sorted, unique sample set used by build checkpoints."""
+    normalized = sorted({str(sample_id) for sample_id in sample_ids})
+    invalid = [sample_id for sample_id in normalized if _SAMPLE_DIGEST_SEPARATOR in sample_id]
+    if invalid:
+        raise ValueError("Sample IDs cannot contain the matrix checkpoint separator character.")
+    return normalized
+
+
+def sample_id_set_digest(sample_ids: list[str] | tuple[str, ...]) -> str:
+    """Return the stable digest shared by DuckDB planning and HDF5 checkpoints."""
+    normalized = normalize_required_sample_ids(sample_ids)
+    return sha256(_SAMPLE_DIGEST_SEPARATOR.join(normalized).encode("utf-8")).hexdigest()
+
+
 def build_matrix_hdf5_from_duckdb(
     conn: duckdb.DuckDBPyConnection,
     *,
@@ -151,6 +171,9 @@ def build_matrix_hdf5_from_duckdb(
     progress_callback: BuildProgressCallback | None = None,
 ) -> DirectMatrixBuildSummary:
     """Build a ZipStrain-compatible HDF5 matrix directly from MetaTrawl DuckDB rows."""
+    if len(set(sample_ids)) != len(sample_ids):
+        raise ValueError("Matrix sample IDs must be unique.")
+    sample_ids = normalize_required_sample_ids(sample_ids)
     storage_mode = _resolve_storage_mode(storage_mode=storage_mode, count_dtype=count_dtype)
     profile_storage = _validate_profile_storage_for_matrix(
         conn,
@@ -203,9 +226,6 @@ def build_matrix_hdf5_from_duckdb(
     if output_file.exists():
         raise FileExistsError(f"Output file already exists: {output_file}")
 
-    if len(set(sample_ids)) != len(sample_ids):
-        raise ValueError("Matrix sample IDs must be unique.")
-
     memory_limit_bytes = _memory_limit_bytes(memory_limit_gb)
     h5py = _import_h5py()
     tmp_output = output_file.with_suffix(output_file.suffix + ".tmp")
@@ -225,7 +245,6 @@ def build_matrix_hdf5_from_duckdb(
     )
     scaffolds_by_genome_idx = _group_scaffolds_by_genome(genome_scaffolds)
     allele_mask_reference_cache: dict[str, dict[int, allele_mask.ReferenceSegment]] = {}
-    allele_mask_block_window = _AlleleMaskBlockWindow(conn, sample_ids=sample_ids)
 
     open_mode = "r+" if tmp_output.exists() else "w"
     try:
@@ -244,6 +263,7 @@ def build_matrix_hdf5_from_duckdb(
                 h5py_module=h5py,
                 metadata_rows=metadata_rows,
                 sample_rows=[],
+                required_sample_ids=sample_ids,
                 expected_sample_count=len(sample_ids),
                 genomes=genomes,
                 genome_scaffolds=genome_scaffolds,
@@ -278,10 +298,12 @@ def build_matrix_hdf5_from_duckdb(
                 + (" ..." if len(missing_from_request) > 20 else "")
                 + f". Remove {tmp_output} to rebuild with the changed selection."
             )
+        required_changed = set_required_sample_catalog(handle, sample_ids, h5py_module=h5py)
         committed_name_set = set(committed_names)
         pending_sample_ids = [sample_id for sample_id in sample_ids if sample_id not in committed_name_set]
         if pending_sample_ids:
             handle.attrs[MATRIX_BUILD_STATE_ATTR] = MATRIX_BUILD_STATE_BUILDING
+        if required_changed:
             handle.flush()
         final_sample_count = len(committed_samples) + len(pending_sample_ids)
         total_work = final_sample_count * len(genomes)
@@ -307,106 +329,40 @@ def build_matrix_hdf5_from_duckdb(
             stored_rows,
         )
 
-        checkpoint_sample_count = _matrix_checkpoint_sample_count(
+        batch_sample_count = _matrix_batch_sample_count(
             genomes=genomes,
             storage_mode=storage_mode,
             count_dtype=count_dtype,
             target_batch_mb=export_batch_mb,
         )
-        for batch_start in range(0, len(pending_sample_ids), checkpoint_sample_count):
-            batch_ids = pending_sample_ids[batch_start : batch_start + checkpoint_sample_count]
-            matrix_start = len(committed_samples)
-            matrix_stop = matrix_start + len(batch_ids)
-            sparse_states = _prepare_hdf5_matrix_rows(
-                handle,
-                genomes=genomes,
-                start_sample_count=matrix_start,
-                target_sample_count=matrix_stop,
-                sparse=sparse,
-            )
-            batch_sample_rows = [
-                (matrix_start + offset, sample_id)
-                for offset, sample_id in enumerate(batch_ids)
-            ]
-            for sample_row, sample_id in batch_sample_rows:
-                for spec in genomes:
-                    _check_matrix_memory(
-                        spec,
-                        storage_mode=storage_mode,
-                        count_dtype=count_dtype,
-                        memory_limit_bytes=memory_limit_bytes,
-                    )
-                    _emit_progress(
-                        progress_callback,
-                        "processing",
-                        completed_work,
-                        total_work,
-                        sample_id,
-                        spec.genome,
-                        stored_rows,
-                    )
-                    matrix = _load_duckdb_sample_genome_matrix(
-                        conn,
-                        sample_id=sample_id,
-                        genome_spec=spec,
-                        genome_offsets=scaffolds_by_genome_idx[spec.genome_idx],
-                        count_dtype=count_dtype,
-                        storage_mode=storage_mode,
-                        min_cov=min_cov,
-                        profile_storage=profile_storage,
-                        allele_mask_reference_cache=allele_mask_reference_cache,
-                        allele_mask_block_window=allele_mask_block_window,
-                    )
-                    if sparse:
-                        indptr_ds, indices_ds, values_ds, current_nnz = sparse_states[spec.genome_idx]
-                        flat_indices, values = _dense_matrix_to_sparse(matrix)
-                        current_nnz = _append_sparse_hdf5_matrix_row(
-                            indptr_dataset=indptr_ds,
-                            indices_dataset=indices_ds,
-                            values_dataset=values_ds,
-                            sample_row=sample_row,
-                            flat_indices=flat_indices,
-                            values=values,
-                            current_nnz=current_nnz,
-                        )
-                        sparse_states[spec.genome_idx] = (
-                            indptr_ds,
-                            indices_ds,
-                            values_ds,
-                            current_nnz,
-                        )
-                    else:
-                        handle[_hdf5_matrix_dataset_path(spec.genome_idx)][sample_row, ...] = matrix
-                    stored_rows += 1
-                    completed_work += 1
-                    _emit_progress(
-                        progress_callback,
-                        "advance",
-                        completed_work,
-                        total_work,
-                        sample_id,
-                        spec.genome,
-                        stored_rows,
-                    )
-
-            _resize_sample_datasets(
-                handle["samples"],
+        for batch_start in range(0, len(pending_sample_ids), batch_sample_count):
+            batch_ids = pending_sample_ids[batch_start : batch_start + batch_sample_count]
+            committed_samples, completed_work, stored_rows = _load_write_and_commit_matrix_batch(
+                conn,
+                handle=handle,
+                batch_ids=batch_ids,
                 existing_samples=committed_samples,
-                sample_rows=batch_sample_rows,
-            )
-            committed_samples.extend(batch_sample_rows)
-            handle.attrs[MATRIX_COMMITTED_SAMPLE_COUNT_ATTR] = len(committed_samples)
-            handle.flush()
-            _emit_progress(
-                progress_callback,
-                "checkpoint",
-                completed_work,
-                total_work,
-                "",
-                genome_scope or "all",
-                stored_rows,
+                genomes=genomes,
+                scaffolds_by_genome_idx=scaffolds_by_genome_idx,
+                count_dtype=count_dtype,
+                storage_mode=storage_mode,
+                min_cov=min_cov,
+                profile_storage=profile_storage,
+                allele_mask_reference_cache=allele_mask_reference_cache,
+                memory_limit_bytes=memory_limit_bytes,
+                sparse=sparse,
+                build_state=MATRIX_BUILD_STATE_BUILDING,
+                completed_work=completed_work,
+                total_work=total_work,
+                stored_rows=stored_rows,
+                progress_callback=progress_callback,
             )
 
+        committed_names = [sample_name for _sample_idx, sample_name in committed_samples]
+        if set(committed_names) != set(sample_ids):
+            raise ValueError(
+                f"Matrix checkpoint {tmp_output} cannot be completed because committed and required samples differ."
+            )
         handle.attrs[MATRIX_BUILD_STATE_ATTR] = MATRIX_BUILD_STATE_COMPLETE
         handle.flush()
 
@@ -426,6 +382,7 @@ def append_matrix_hdf5_from_duckdb(
     conn: duckdb.DuckDBPyConnection,
     *,
     sample_ids: list[str],
+    required_sample_ids: list[str] | None = None,
     matrix_hdf5_file: Path,
     memory_limit_gb: float = 16.0,
     export_batch_mb: float = 128.0,
@@ -433,10 +390,11 @@ def append_matrix_hdf5_from_duckdb(
     progress_callback: BuildProgressCallback | None = None,
 ) -> DirectMatrixAppendSummary:
     """Append samples directly from MetaTrawl DuckDB rows into an existing HDF5 matrix."""
-    if not sample_ids:
+    if not sample_ids and required_sample_ids is None:
         raise ValueError("No samples were provided for matrix append.")
     if len(set(sample_ids)) != len(sample_ids):
         raise ValueError("Matrix append sample IDs must be unique.")
+    sample_ids = normalize_required_sample_ids(sample_ids)
     if export_batch_mb <= 0:
         raise ValueError("export_batch_mb must be > 0")
     _configure_duckdb_for_matrix(conn, memory_limit_gb=memory_limit_gb, threads=duckdb_threads)
@@ -469,13 +427,32 @@ def append_matrix_hdf5_from_duckdb(
             sparse=sparse,
         )
         existing_names = {name for _idx, name in existing_samples}
+        required_ids = normalize_required_sample_ids(
+            required_sample_ids
+            if required_sample_ids is not None
+            else [*existing_names, *sample_ids]
+        )
+        removed_samples = sorted(existing_names - set(required_ids))
+        if removed_samples:
+            raise ValueError(
+                "Existing matrix samples no longer pass the current selection; rebuild the matrix: "
+                + ", ".join(removed_samples[:20])
+                + (" ..." if len(removed_samples) > 20 else "")
+            )
+        unexpected = sorted(set(sample_ids) - set(required_ids))
+        if unexpected:
+            raise ValueError("Append samples are missing from the required sample set: " + ", ".join(unexpected))
         duplicates = sorted(set(sample_ids) & existing_names)
         if duplicates:
             raise ValueError("Cannot append samples already present in matrix store: " + ", ".join(duplicates))
-        observed = _observed_genomes_for_samples(
-            conn,
-            sample_ids=sample_ids,
-            genome=None if genome_scope == "all" else genome_scope,
+        observed = (
+            _observed_genomes_for_samples(
+                conn,
+                sample_ids=sample_ids,
+                genome=None if genome_scope == "all" else genome_scope,
+            )
+            if sample_ids
+            else set()
         )
         allowed = {spec.genome for spec in genomes}
         missing = observed - allowed
@@ -487,7 +464,6 @@ def append_matrix_hdf5_from_duckdb(
         _emit_progress(progress_callback, "start", completed_work, total_work, "", genome_scope, stored_rows)
         scaffolds_by_genome_idx = _group_scaffolds_by_genome(genome_scaffolds)
         allele_mask_reference_cache: dict[str, dict[int, allele_mask.ReferenceSegment]] = {}
-        allele_mask_block_window = _AlleleMaskBlockWindow(conn, sample_ids=sample_ids)
         for spec in genomes:
             _check_matrix_memory(
                 spec,
@@ -497,80 +473,43 @@ def append_matrix_hdf5_from_duckdb(
             )
 
         handle.attrs[MATRIX_BUILD_STATE_ATTR] = MATRIX_BUILD_STATE_APPENDING
+        set_required_sample_catalog(handle, required_ids, h5py_module=h5py)
         handle.flush()
-        checkpoint_sample_count = _matrix_checkpoint_sample_count(
+        batch_sample_count = _matrix_batch_sample_count(
             genomes=genomes,
             storage_mode=storage_mode,
             count_dtype=count_dtype,
             target_batch_mb=export_batch_mb,
         )
-        for batch_start in range(0, len(sample_ids), checkpoint_sample_count):
-            batch_ids = sample_ids[batch_start : batch_start + checkpoint_sample_count]
-            matrix_start = len(existing_samples)
-            matrix_stop = matrix_start + len(batch_ids)
-            sparse_states = _prepare_hdf5_matrix_rows(
-                handle,
-                genomes=genomes,
-                start_sample_count=matrix_start,
-                target_sample_count=matrix_stop,
-                sparse=sparse,
-            )
-            batch_sample_rows = [
-                (matrix_start + offset, sample_id)
-                for offset, sample_id in enumerate(batch_ids)
-            ]
-            for sample_row, sample_id in batch_sample_rows:
-                for spec in genomes:
-                    _emit_progress(progress_callback, "processing", completed_work, total_work, sample_id, spec.genome, stored_rows)
-                    matrix = _load_duckdb_sample_genome_matrix(
-                        conn,
-                        sample_id=sample_id,
-                        genome_spec=spec,
-                        genome_offsets=scaffolds_by_genome_idx[spec.genome_idx],
-                        count_dtype=count_dtype,
-                        storage_mode=storage_mode,
-                        min_cov=min_cov,
-                        profile_storage=profile_storage,
-                        allele_mask_reference_cache=allele_mask_reference_cache,
-                        allele_mask_block_window=allele_mask_block_window,
-                    )
-                    if sparse:
-                        indptr_ds, indices_ds, values_ds, current_nnz = sparse_states[spec.genome_idx]
-                        flat_indices, values = _dense_matrix_to_sparse(matrix)
-                        current_nnz = _append_sparse_hdf5_matrix_row(
-                            indptr_dataset=indptr_ds,
-                            indices_dataset=indices_ds,
-                            values_dataset=values_ds,
-                            sample_row=sample_row,
-                            flat_indices=flat_indices,
-                            values=values,
-                            current_nnz=current_nnz,
-                        )
-                        sparse_states[spec.genome_idx] = (indptr_ds, indices_ds, values_ds, current_nnz)
-                    else:
-                        handle[_hdf5_matrix_dataset_path(spec.genome_idx)][sample_row, ...] = matrix
-                    stored_rows += 1
-                    completed_work += 1
-                    _emit_progress(progress_callback, "advance", completed_work, total_work, sample_id, spec.genome, stored_rows)
-
-            _resize_sample_datasets(
-                handle["samples"],
+        for batch_start in range(0, len(sample_ids), batch_sample_count):
+            batch_ids = sample_ids[batch_start : batch_start + batch_sample_count]
+            existing_samples, completed_work, stored_rows = _load_write_and_commit_matrix_batch(
+                conn,
+                handle=handle,
+                batch_ids=batch_ids,
                 existing_samples=existing_samples,
-                sample_rows=batch_sample_rows,
-            )
-            existing_samples.extend(batch_sample_rows)
-            handle.attrs[MATRIX_COMMITTED_SAMPLE_COUNT_ATTR] = len(existing_samples)
-            handle.flush()
-            _emit_progress(
-                progress_callback,
-                "checkpoint",
-                completed_work,
-                total_work,
-                "",
-                genome_scope,
-                stored_rows,
+                genomes=genomes,
+                scaffolds_by_genome_idx=scaffolds_by_genome_idx,
+                count_dtype=count_dtype,
+                storage_mode=storage_mode,
+                min_cov=min_cov,
+                profile_storage=profile_storage,
+                allele_mask_reference_cache=allele_mask_reference_cache,
+                memory_limit_bytes=memory_limit_bytes,
+                sparse=sparse,
+                build_state=MATRIX_BUILD_STATE_APPENDING,
+                completed_work=completed_work,
+                total_work=total_work,
+                stored_rows=stored_rows,
+                progress_callback=progress_callback,
             )
 
+        committed_names = {name for _idx, name in existing_samples}
+        if committed_names != set(required_ids):
+            raise ValueError(
+                f"Matrix {matrix_hdf5_file} remains incomplete: "
+                f"committed={len(committed_names)} required={len(required_ids)}."
+            )
         handle.attrs[MATRIX_BUILD_STATE_ATTR] = MATRIX_BUILD_STATE_COMPLETE
         handle.flush()
         _emit_progress(progress_callback, "done", completed_work, total_work, "", genome_scope, stored_rows)
@@ -582,82 +521,473 @@ def append_matrix_hdf5_from_duckdb(
     )
 
 
-class _AlleleMaskBlockWindow:
-    """Serve per-sample allele-mask blocks from windowed bulk reads.
-
-    Samples are visited in a known order, so blocks for a whole window can be
-    fetched with one query per genome and served row by row. Only one window is
-    held at a time, and rows stay compressed until each sample is decoded.
-    """
-
-    def __init__(self, conn, *, sample_ids: list[str], window: int = MATRIX_READ_WINDOW_SAMPLES) -> None:
-        self._conn = conn
-        self._order = list(sample_ids)
-        self._position = {sample_id: index for index, sample_id in enumerate(self._order)}
-        self._window = max(1, int(window))
-        self._start: int | None = None
-        self._by_genome: dict[str, dict[str, list[tuple]]] = {}
-
-    def rows_for(self, *, sample_id: str, genome: str, segment_ids: list[int]) -> list[tuple] | None:
-        """Return this sample's raw block rows, or None if it is outside the plan."""
-        position = self._position.get(sample_id)
-        if position is None:
-            return None
-        start = (position // self._window) * self._window
-        if start != self._start:
-            self._start = start
-            self._by_genome = {}
-        cached = self._by_genome.get(genome)
-        if cached is None:
-            cached = allele_mask.fetch_profile_block_rows(
-                self._conn,
-                sample_ids=self._order[start : start + self._window],
-                segment_ids=segment_ids,
-            )
-            self._by_genome[genome] = cached
-        return cached.get(sample_id, [])
-
-
-def _load_duckdb_sample_genome_matrix(
+def _load_write_and_commit_matrix_batch(
     conn: duckdb.DuckDBPyConnection,
+    *,
+    handle,
+    batch_ids: list[str],
+    existing_samples: list[tuple[int, str]],
+    genomes: list[GenomeSpec],
+    scaffolds_by_genome_idx: dict[int, list[GenomeScaffoldOffset]],
+    count_dtype: str,
+    storage_mode: str,
+    min_cov: int,
+    profile_storage: db.ProfileStorageConfig,
+    allele_mask_reference_cache: dict[str, dict[int, allele_mask.ReferenceSegment]],
+    memory_limit_bytes: int,
+    sparse: bool,
+    build_state: str,
+    completed_work: int,
+    total_work: int,
+    stored_rows: int,
+    progress_callback: BuildProgressCallback | None,
+) -> tuple[list[tuple[int, str]], int, int]:
+    """Load, convert, write, and durably commit one ordered sample batch."""
+    if (
+        sparse
+        and storage_mode == MATRIX_STORAGE_BITMASK
+        and profile_storage.mode == allele_mask.PROFILE_STORAGE_ALLELE_MASK
+        and len(genomes) == 1
+    ):
+        _check_matrix_memory(
+            genomes[0],
+            storage_mode=storage_mode,
+            count_dtype=count_dtype,
+            memory_limit_bytes=memory_limit_bytes,
+        )
+        return _stream_allele_mask_sparse_matrix_batch(
+            conn,
+            handle=handle,
+            batch_ids=batch_ids,
+            existing_samples=existing_samples,
+            genome_spec=genomes[0],
+            genome_offsets=scaffolds_by_genome_idx[genomes[0].genome_idx],
+            allele_mask_reference_cache=allele_mask_reference_cache,
+            build_state=build_state,
+            completed_work=completed_work,
+            total_work=total_work,
+            stored_rows=stored_rows,
+            progress_callback=progress_callback,
+        )
+
+    batch_matrices: dict[int, np.ndarray] = {}
+    for spec in genomes:
+        _check_matrix_memory(
+            spec,
+            storage_mode=storage_mode,
+            count_dtype=count_dtype,
+            memory_limit_bytes=memory_limit_bytes,
+        )
+        _emit_progress(
+            progress_callback,
+            "processing",
+            completed_work,
+            total_work,
+            batch_ids[0],
+            spec.genome,
+            stored_rows,
+            detail=f"fetching batch_samples={len(batch_ids)} first_sample={batch_ids[0]}",
+        )
+
+        def report_load_stage(detail: str, active_spec: GenomeSpec = spec) -> None:
+            _emit_progress(
+                progress_callback,
+                "processing",
+                completed_work,
+                total_work,
+                batch_ids[0],
+                active_spec.genome,
+                stored_rows,
+                detail=detail,
+            )
+
+        batch_matrices[spec.genome_idx] = _load_duckdb_sample_batch_genome_matrices(
+            conn,
+            sample_ids=batch_ids,
+            genome_spec=spec,
+            genome_offsets=scaffolds_by_genome_idx[spec.genome_idx],
+            count_dtype=count_dtype,
+            storage_mode=storage_mode,
+            min_cov=min_cov,
+            profile_storage=profile_storage,
+            allele_mask_reference_cache=allele_mask_reference_cache,
+            stage_callback=report_load_stage,
+        )
+        _emit_progress(
+            progress_callback,
+            "processing",
+            completed_work,
+            total_work,
+            batch_ids[0],
+            spec.genome,
+            stored_rows,
+            detail=f"writing batch_samples={len(batch_ids)} first_sample={batch_ids[0]}",
+        )
+
+    matrix_start = len(existing_samples)
+    matrix_stop = matrix_start + len(batch_ids)
+    sparse_states = _prepare_hdf5_matrix_rows(
+        handle,
+        genomes=genomes,
+        start_sample_count=matrix_start,
+        target_sample_count=matrix_stop,
+        sparse=sparse,
+    )
+    for spec in genomes:
+        matrices = batch_matrices.pop(spec.genome_idx)
+        if sparse:
+            indptr, indices, values, current_nnz = sparse_states[spec.genome_idx]
+            _append_sparse_hdf5_matrix_batch(
+                indptr_dataset=indptr,
+                indices_dataset=indices,
+                values_dataset=values,
+                sample_start=matrix_start,
+                matrices=matrices,
+                current_nnz=current_nnz,
+            )
+        else:
+            handle[_hdf5_matrix_dataset_path(spec.genome_idx)][matrix_start:matrix_stop, ...] = matrices
+
+    batch_sample_rows = [
+        (matrix_start + offset, sample_id)
+        for offset, sample_id in enumerate(batch_ids)
+    ]
+    for sample_id in batch_ids:
+        for spec in genomes:
+            completed_work += 1
+            stored_rows += 1
+            _emit_progress(
+                progress_callback,
+                "advance",
+                completed_work,
+                total_work,
+                sample_id,
+                spec.genome,
+                stored_rows,
+            )
+
+    _resize_sample_datasets(
+        handle["samples"],
+        existing_samples=existing_samples,
+        sample_rows=batch_sample_rows,
+    )
+    committed_samples = [*existing_samples, *batch_sample_rows]
+    handle.attrs[MATRIX_BUILD_STATE_ATTR] = build_state
+    handle.attrs[MATRIX_COMMITTED_SAMPLE_COUNT_ATTR] = len(committed_samples)
+    handle.flush()
+    _emit_progress(
+        progress_callback,
+        "checkpoint",
+        completed_work,
+        total_work,
+        "",
+        genomes[0].genome if len(genomes) == 1 else "all",
+        stored_rows,
+    )
+    return committed_samples, completed_work, stored_rows
+
+
+def _stream_allele_mask_sparse_matrix_batch(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    handle,
+    batch_ids: list[str],
+    existing_samples: list[tuple[int, str]],
+    genome_spec: GenomeSpec,
+    genome_offsets: list[GenomeScaffoldOffset],
+    allele_mask_reference_cache: dict[str, dict[int, allele_mask.ReferenceSegment]],
+    build_state: str,
+    completed_work: int,
+    total_work: int,
+    stored_rows: int,
+    progress_callback: BuildProgressCallback | None,
+) -> tuple[list[tuple[int, str]], int, int]:
+    """Stream compact masks directly into sparse HDF5 rows and checkpoints."""
+    timings: dict[str, float | int] = {
+        "reference_seconds": 0.0,
+        "query_seconds": 0.0,
+        "fetch_seconds": 0.0,
+        "decode_seconds": 0.0,
+        "sparse_pack_seconds": 0.0,
+        "hdf_write_seconds": 0.0,
+        "flush_seconds": 0.0,
+        "fetched_rows": 0,
+    }
+    reference_started = time.perf_counter()
+    references = allele_mask_reference_cache.get(genome_spec.genome)
+    if references is None:
+        references = allele_mask._load_reference_segments(conn, genome=genome_spec.genome)
+        allele_mask_reference_cache[genome_spec.genome] = references
+    timings["reference_seconds"] = time.perf_counter() - reference_started
+
+    _emit_progress(
+        progress_callback,
+        "processing",
+        completed_work,
+        total_work,
+        batch_ids[0],
+        genome_spec.genome,
+        stored_rows,
+        detail=f"fetching-stream batch_samples={len(batch_ids)} first_sample={batch_ids[0]}",
+    )
+    row_stream = allele_mask.iter_profile_block_rows(
+        conn,
+        sample_ids=batch_ids,
+        segment_ids=list(references),
+        metrics=timings,
+    )
+    window_sample_ids: list[str] = []
+    window_indices: list[np.ndarray] = []
+    window_values: list[np.ndarray] = []
+    window_bytes = 0
+    streamed_samples = 0
+
+    for expected_sample_id, (sample_id, block_rows) in zip(batch_ids, row_stream):
+        if sample_id != expected_sample_id:
+            raise ValueError(
+                f"Profile block stream returned sample {sample_id!r}; expected {expected_sample_id!r}."
+            )
+        decode_started = time.perf_counter()
+        indices, values = _load_allele_mask_sample_genome_sparse(
+            conn,
+            sample_id=sample_id,
+            genome_spec=genome_spec,
+            genome_offsets=genome_offsets,
+            reference_cache=allele_mask_reference_cache,
+            block_rows=block_rows,
+        )
+        timings["decode_seconds"] = float(timings["decode_seconds"]) + (
+            time.perf_counter() - decode_started
+        )
+        window_sample_ids.append(sample_id)
+        window_indices.append(indices)
+        window_values.append(values)
+        window_bytes += indices.nbytes + values.nbytes
+        streamed_samples += 1
+
+        if (
+            len(window_sample_ids) >= SPARSE_STREAM_MAX_SAMPLES
+            or window_bytes >= SPARSE_STREAM_TARGET_BYTES
+            or streamed_samples == len(batch_ids)
+        ):
+            existing_samples, completed_work, stored_rows = _commit_sparse_stream_window(
+                handle,
+                sample_ids=window_sample_ids,
+                index_parts=window_indices,
+                value_parts=window_values,
+                existing_samples=existing_samples,
+                genome_spec=genome_spec,
+                build_state=build_state,
+                completed_work=completed_work,
+                total_work=total_work,
+                stored_rows=stored_rows,
+                timings=timings,
+                progress_callback=progress_callback,
+            )
+            window_sample_ids = []
+            window_indices = []
+            window_values = []
+            window_bytes = 0
+
+    if streamed_samples != len(batch_ids):
+        raise ValueError(
+            f"Profile block stream ended after {streamed_samples} samples; expected {len(batch_ids)}."
+        )
+    return existing_samples, completed_work, stored_rows
+
+
+def _load_allele_mask_sample_genome_sparse(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    sample_id: str,
+    genome_spec: GenomeSpec,
+    genome_offsets: list[GenomeScaffoldOffset],
+    reference_cache: dict[str, dict[int, allele_mask.ReferenceSegment]],
+    block_rows: list[tuple],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map compact covered coordinates directly onto the concatenated genome axis."""
+    offsets_by_chrom = {offset.chrom: offset for offset in genome_offsets}
+    index_parts: list[np.ndarray] = []
+    value_parts: list[np.ndarray] = []
+    for block in allele_mask.iter_decoded_sparse_profile_blocks(
+        conn,
+        sample_id=sample_id,
+        genome=genome_spec.genome,
+        reference_cache=reference_cache,
+        block_rows=block_rows,
+    ):
+        offset = offsets_by_chrom.get(block.chrom)
+        absolute_positions = block.start_pos + block.positions
+        if offset is None:
+            if absolute_positions.size:
+                raise ValueError(
+                    f"Allele-mask sample {sample_id} has scaffold {block.chrom} "
+                    f"outside matrix contract for {genome_spec.genome}."
+                )
+            continue
+        inside = (absolute_positions >= offset.min_pos) & (absolute_positions <= offset.max_pos)
+        if not np.all(inside):
+            invalid_position = int(absolute_positions[np.flatnonzero(~inside)[0]])
+            raise ValueError(
+                f"Allele-mask sample {sample_id} has position {invalid_position} outside the matrix "
+                f"range for {genome_spec.genome}/{block.chrom}."
+            )
+        if not absolute_positions.size:
+            continue
+        axis_positions = (
+            absolute_positions - offset.index_base + offset.axis_start
+        ).astype(np.int64, copy=False)
+        index_parts.append(axis_positions)
+        value_parts.append(block.masks)
+
+    if not index_parts:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.uint8)
+    indices = np.concatenate(index_parts) if len(index_parts) > 1 else index_parts[0]
+    values = np.concatenate(value_parts) if len(value_parts) > 1 else value_parts[0]
+    if indices.size > 1 and np.any(indices[1:] < indices[:-1]):
+        order = np.argsort(indices, kind="stable")
+        indices = indices[order]
+        values = values[order]
+    return indices.astype(np.int64, copy=False), values.astype(np.uint8, copy=False)
+
+
+def _commit_sparse_stream_window(
+    handle,
+    *,
+    sample_ids: list[str],
+    index_parts: list[np.ndarray],
+    value_parts: list[np.ndarray],
+    existing_samples: list[tuple[int, str]],
+    genome_spec: GenomeSpec,
+    build_state: str,
+    completed_work: int,
+    total_work: int,
+    stored_rows: int,
+    timings: dict[str, float | int],
+    progress_callback: BuildProgressCallback | None,
+) -> tuple[list[tuple[int, str]], int, int]:
+    """Write one bounded sparse window and make it durably resumable."""
+    sample_start = len(existing_samples)
+    sample_stop = sample_start + len(sample_ids)
+    sparse_state = _prepare_hdf5_matrix_rows(
+        handle,
+        genomes=[genome_spec],
+        start_sample_count=sample_start,
+        target_sample_count=sample_stop,
+        sparse=True,
+    )[genome_spec.genome_idx]
+    indptr, indices_dataset, values_dataset, current_nnz = sparse_state
+
+    pack_started = time.perf_counter()
+    lengths = np.asarray([indices.size for indices in index_parts], dtype=np.int64)
+    flat_indices = (
+        np.concatenate(index_parts)
+        if sum(indices.size for indices in index_parts)
+        else np.empty(0, dtype=np.int64)
+    )
+    flat_values = (
+        np.concatenate(value_parts)
+        if sum(values.size for values in value_parts)
+        else np.empty(0, dtype=np.uint8)
+    )
+    timings["sparse_pack_seconds"] = float(timings["sparse_pack_seconds"]) + (
+        time.perf_counter() - pack_started
+    )
+
+    _emit_progress(
+        progress_callback,
+        "processing",
+        completed_work,
+        total_work,
+        sample_ids[0],
+        genome_spec.genome,
+        stored_rows,
+        detail=f"writing-stream samples={len(sample_ids)} nnz={flat_indices.size}",
+    )
+    write_started = time.perf_counter()
+    _append_sparse_hdf5_payload_batch(
+        indptr_dataset=indptr,
+        indices_dataset=indices_dataset,
+        values_dataset=values_dataset,
+        sample_start=sample_start,
+        lengths=lengths,
+        flat_indices=flat_indices,
+        values=flat_values,
+        current_nnz=current_nnz,
+    )
+    sample_rows = [
+        (sample_start + offset, sample_id)
+        for offset, sample_id in enumerate(sample_ids)
+    ]
+    _resize_sample_datasets(
+        handle["samples"],
+        existing_samples=existing_samples,
+        sample_rows=sample_rows,
+    )
+    committed_samples = [*existing_samples, *sample_rows]
+    handle.attrs[MATRIX_BUILD_STATE_ATTR] = build_state
+    handle.attrs[MATRIX_COMMITTED_SAMPLE_COUNT_ATTR] = len(committed_samples)
+    timings["hdf_write_seconds"] = float(timings["hdf_write_seconds"]) + (
+        time.perf_counter() - write_started
+    )
+
+    for sample_id in sample_ids:
+        completed_work += 1
+        stored_rows += 1
+        _emit_progress(
+            progress_callback,
+            "advance",
+            completed_work,
+            total_work,
+            sample_id,
+            genome_spec.genome,
+            stored_rows,
+        )
+    flush_started = time.perf_counter()
+    handle.flush()
+    timings["flush_seconds"] = float(timings["flush_seconds"]) + (
+        time.perf_counter() - flush_started
+    )
+    detail = (
+        f"rows={int(timings['fetched_rows'])} "
+        f"reference={float(timings['reference_seconds']):.2f}s "
+        f"query={float(timings['query_seconds']):.2f}s "
+        f"fetch={float(timings['fetch_seconds']):.2f}s "
+        f"decode={float(timings['decode_seconds']):.2f}s "
+        f"pack={float(timings['sparse_pack_seconds']):.2f}s "
+        f"write={float(timings['hdf_write_seconds']):.2f}s "
+        f"flush={float(timings['flush_seconds']):.2f}s"
+    )
+    _emit_progress(
+        progress_callback,
+        "checkpoint",
+        completed_work,
+        total_work,
+        "",
+        genome_spec.genome,
+        stored_rows,
+        detail=detail,
+    )
+    return committed_samples, completed_work, stored_rows
+
+
+def _profile_frame_to_matrix(
+    frame: pl.DataFrame,
     *,
     sample_id: str,
     genome_spec: GenomeSpec,
     genome_offsets: list[GenomeScaffoldOffset],
     count_dtype: str,
     storage_mode: str,
-    min_cov: int,
-    profile_storage: db.ProfileStorageConfig | None = None,
-    allele_mask_reference_cache: dict[str, dict[int, allele_mask.ReferenceSegment]] | None = None,
-    allele_mask_block_window: "_AlleleMaskBlockWindow | None" = None,
 ) -> np.ndarray:
-    profile_storage = profile_storage or db.profile_storage_config(conn)
-    if profile_storage.mode == allele_mask.PROFILE_STORAGE_ALLELE_MASK:
-        if storage_mode != MATRIX_STORAGE_BITMASK:
-            raise ValueError(
-                "Allele-mask profile storage can only build bitmask matrices."
-            )
-        return _load_allele_mask_sample_genome_matrix(
-            conn,
-            sample_id=sample_id,
-            genome_spec=genome_spec,
-            genome_offsets=genome_offsets,
-            reference_cache=allele_mask_reference_cache,
-            block_window=allele_mask_block_window,
-        )
-    if storage_mode == MATRIX_STORAGE_BITMASK:
-        matrix = np.zeros((genome_spec.matrix_length,), dtype=np.uint8)
-    else:
-        matrix = np.zeros((genome_spec.matrix_length, 4), dtype=COUNT_DTYPES[count_dtype])
-    frame = conn.execute(
-        """
-        SELECT chrom, pos, A, T, C, G
-        FROM profile_positions
-        WHERE sample_id = ? AND genome = ?
-          AND CAST(A AS BIGINT) + CAST(T AS BIGINT) + CAST(C AS BIGINT) + CAST(G AS BIGINT) >= ?
-        """,
-        [sample_id, genome_spec.genome, min_cov],
-    ).pl()
+    """Convert one already-filtered sample/genome frame to its matrix row."""
+    shape = (
+        (genome_spec.matrix_length,)
+        if storage_mode == MATRIX_STORAGE_BITMASK
+        else (genome_spec.matrix_length, 4)
+    )
+    dtype = np.uint8 if storage_mode == MATRIX_STORAGE_BITMASK else COUNT_DTYPES[count_dtype]
+    matrix = np.zeros(shape, dtype=dtype)
     if frame.height == 0:
         return matrix
 
@@ -673,9 +1003,13 @@ def _load_duckdb_sample_genome_matrix(
     np_dtype = np.dtype(
         np.uint8 if storage_mode == MATRIX_STORAGE_BITMASK else COUNT_DTYPES[count_dtype]
     )
+    scaffold_frames = {
+        str(scaffold_frame.get_column("chrom")[0]): scaffold_frame
+        for scaffold_frame in frame.partition_by("chrom", maintain_order=True)
+    }
     for offset in genome_offsets:
-        scaffold_frame = frame.filter(pl.col("chrom") == offset.chrom)
-        if scaffold_frame.height == 0:
+        scaffold_frame = scaffold_frames.get(offset.chrom)
+        if scaffold_frame is None:
             continue
         positions = scaffold_frame.get_column("pos").to_numpy().astype(np.int64, copy=False)
         min_pos = int(positions.min())
@@ -705,6 +1039,222 @@ def _load_duckdb_sample_genome_matrix(
     return matrix
 
 
+def _load_duckdb_sample_batch_genome_matrices(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    sample_ids: list[str],
+    genome_spec: GenomeSpec,
+    genome_offsets: list[GenomeScaffoldOffset],
+    count_dtype: str,
+    storage_mode: str,
+    min_cov: int,
+    profile_storage: db.ProfileStorageConfig | None = None,
+    allele_mask_reference_cache: dict[str, dict[int, allele_mask.ReferenceSegment]] | None = None,
+    stage_callback: Callable[[str], None] | None = None,
+) -> np.ndarray:
+    """Fetch and convert one ordered sample batch with one DuckDB query."""
+    profile_storage = profile_storage or db.profile_storage_config(conn)
+    dtype = np.uint8 if storage_mode == MATRIX_STORAGE_BITMASK else COUNT_DTYPES[count_dtype]
+    row_shape = (
+        (genome_spec.matrix_length,)
+        if storage_mode == MATRIX_STORAGE_BITMASK
+        else (genome_spec.matrix_length, 4)
+    )
+    stage_started = time.perf_counter()
+    matrices = np.zeros((len(sample_ids), *row_shape), dtype=dtype)
+    if profile_storage.mode != allele_mask.PROFILE_STORAGE_ALLELE_MASK:
+        _report_matrix_load_stage(
+            stage_callback,
+            stage="allocate",
+            seconds=time.perf_counter() - stage_started,
+            rows=0,
+            samples=len(sample_ids),
+        )
+    if not sample_ids:
+        return matrices
+
+    if profile_storage.mode == allele_mask.PROFILE_STORAGE_ALLELE_MASK:
+        if storage_mode != MATRIX_STORAGE_BITMASK:
+            raise ValueError("Allele-mask profile storage can only build bitmask matrices.")
+        reference_cache = allele_mask_reference_cache if allele_mask_reference_cache is not None else {}
+        references = reference_cache.get(genome_spec.genome)
+        if references is None:
+            references = allele_mask._load_reference_segments(conn, genome=genome_spec.genome)
+            reference_cache[genome_spec.genome] = references
+        rows_by_sample = allele_mask.fetch_profile_block_rows(
+            conn,
+            sample_ids=sample_ids,
+            segment_ids=list(references),
+        )
+        for row_index, sample_id in enumerate(sample_ids):
+            matrices[row_index] = _load_allele_mask_sample_genome_matrix(
+                conn,
+                sample_id=sample_id,
+                genome_spec=genome_spec,
+                genome_offsets=genome_offsets,
+                reference_cache=reference_cache,
+                block_rows=rows_by_sample.get(sample_id, []),
+            )
+        return matrices
+
+    query_started = time.perf_counter()
+    result = conn.execute(
+        """
+        SELECT sample_id, chrom, pos, A, T, C, G
+        FROM profile_positions
+        WHERE sample_id BETWEEN ? AND ?
+          AND sample_id IN (SELECT unnest(?)) AND genome = ?
+          AND CAST(A AS BIGINT) + CAST(T AS BIGINT) + CAST(C AS BIGINT) + CAST(G AS BIGINT) >= ?
+        """,
+        [min(sample_ids), max(sample_ids), sample_ids, genome_spec.genome, min_cov],
+    )
+    _report_matrix_load_stage(
+        stage_callback,
+        stage="query",
+        seconds=time.perf_counter() - query_started,
+        rows=0,
+        samples=len(sample_ids),
+    )
+    stream_started = time.perf_counter()
+    last_active_log = stream_started
+    streamed_rows = 0
+    sample_rows = {sample_id: row_index for row_index, sample_id in enumerate(sample_ids)}
+    offsets_by_chrom = {offset.chrom: offset for offset in genome_offsets}
+    for record_batch in result.fetch_record_batch(rows_per_batch=65_536):
+        _fill_matrix_batch_from_arrow_record_batch(
+            record_batch,
+            matrices=matrices,
+            sample_rows=sample_rows,
+            offsets_by_chrom=offsets_by_chrom,
+            genome_spec=genome_spec,
+            count_dtype=count_dtype,
+            storage_mode=storage_mode,
+        )
+        streamed_rows += int(record_batch.num_rows)
+        now = time.perf_counter()
+        if stage_callback is not None and now - last_active_log >= 60:
+            stage_callback(
+                f"full-profile stage=stream status=active "
+                f"seconds={now - stream_started:.2f} rows={streamed_rows} "
+                f"samples={len(sample_ids)}"
+            )
+            last_active_log = now
+    _report_matrix_load_stage(
+        stage_callback,
+        stage="stream",
+        seconds=time.perf_counter() - stream_started,
+        rows=streamed_rows,
+        samples=len(sample_ids),
+    )
+    return matrices
+
+
+def _fill_matrix_batch_from_arrow_record_batch(
+    record_batch,
+    *,
+    matrices: np.ndarray,
+    sample_rows: dict[str, int],
+    offsets_by_chrom: dict[str, GenomeScaffoldOffset],
+    genome_spec: GenomeSpec,
+    count_dtype: str,
+    storage_mode: str,
+) -> None:
+    """Apply one bounded DuckDB Arrow batch directly to matrix row buffers."""
+    if record_batch.num_rows == 0:
+        return
+
+    sample_encoded = record_batch.column(0).dictionary_encode()
+    chrom_encoded = record_batch.column(1).dictionary_encode()
+    sample_codes = sample_encoded.indices.to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
+    chrom_codes = chrom_encoded.indices.to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
+    sample_names = [str(value) for value in sample_encoded.dictionary.to_pylist()]
+    chrom_names = [str(value) for value in chrom_encoded.dictionary.to_pylist()]
+    positions = record_batch.column(2).to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
+    a_counts = record_batch.column(3).to_numpy(zero_copy_only=False)
+    t_counts = record_batch.column(4).to_numpy(zero_copy_only=False)
+    c_counts = record_batch.column(5).to_numpy(zero_copy_only=False)
+    g_counts = record_batch.column(6).to_numpy(zero_copy_only=False)
+
+    pair_width = len(chrom_names)
+    pair_codes = sample_codes * pair_width + chrom_codes
+    for pair_code in np.unique(pair_codes):
+        row_positions = np.flatnonzero(pair_codes == pair_code)
+        sample_code, chrom_code = divmod(int(pair_code), pair_width)
+        sample_id = sample_names[sample_code]
+        matrix_row = sample_rows.get(sample_id)
+        if matrix_row is None:
+            raise ValueError(
+                f"DuckDB returned unrequested profile sample {sample_id!r} for {genome_spec.genome}."
+            )
+        chrom = chrom_names[chrom_code]
+        offset = offsets_by_chrom.get(chrom)
+        if offset is None:
+            raise ValueError(
+                f"Profile sample {sample_id} has scaffold {chrom} outside the matrix "
+                f"contract for {genome_spec.genome}."
+            )
+
+        selected_positions = positions[row_positions]
+        min_pos = int(selected_positions.min())
+        max_pos = int(selected_positions.max())
+        if min_pos < offset.min_pos or max_pos > offset.max_pos:
+            raise ValueError(
+                f"Profile sample {sample_id} has out-of-range positions "
+                f"{genome_spec.genome}:{chrom}:{min_pos}-{max_pos}; "
+                f"matrix range is {offset.min_pos}-{offset.max_pos}."
+            )
+        axis_positions = selected_positions - offset.index_base + offset.axis_start
+        selected_counts = (
+            a_counts[row_positions],
+            t_counts[row_positions],
+            c_counts[row_positions],
+            g_counts[row_positions],
+        )
+        if storage_mode == MATRIX_STORAGE_BITMASK:
+            values = (
+                (selected_counts[0] > 0).astype(np.uint8)
+                | ((selected_counts[1] > 0).astype(np.uint8) << 1)
+                | ((selected_counts[2] > 0).astype(np.uint8) << 2)
+                | ((selected_counts[3] > 0).astype(np.uint8) << 3)
+            )
+            matrices[matrix_row, axis_positions] = values
+            continue
+
+        counts = np.column_stack(selected_counts)
+        if storage_mode == MATRIX_STORAGE_LEGACY_PRESENCE:
+            matrices[matrix_row, axis_positions, :] = (counts > 0).astype(
+                matrices.dtype,
+                copy=False,
+            )
+            continue
+
+        max_value = np.iinfo(COUNT_DTYPES[count_dtype]).max
+        min_count = int(counts.min(initial=0))
+        max_count = int(counts.max(initial=0))
+        if min_count < 0 or max_count > max_value:
+            raise OverflowError(
+                f"Profile counts for {sample_id} at {genome_spec.genome}:{chrom} "
+                f"do not fit {count_dtype}; observed range={min_count}-{max_count}."
+            )
+        matrices[matrix_row, axis_positions, :] = counts.astype(matrices.dtype, copy=False)
+
+
+def _report_matrix_load_stage(
+    callback: Callable[[str], None] | None,
+    *,
+    stage: str,
+    seconds: float,
+    rows: int,
+    samples: int,
+) -> None:
+    if callback is None:
+        return
+    callback(
+        f"full-profile stage={stage} status=done seconds={seconds:.2f} "
+        f"rows={rows} samples={samples}"
+    )
+
+
 def _load_allele_mask_sample_genome_matrix(
     conn: duckdb.DuckDBPyConnection,
     *,
@@ -712,26 +1262,11 @@ def _load_allele_mask_sample_genome_matrix(
     genome_spec: GenomeSpec,
     genome_offsets: list[GenomeScaffoldOffset],
     reference_cache: dict[str, dict[int, allele_mask.ReferenceSegment]] | None = None,
-    block_window: "_AlleleMaskBlockWindow | None" = None,
+    block_rows: list[tuple] | None = None,
 ) -> np.ndarray:
     """Decode compact blocks directly into ZipStrain's bitmask matrix axis."""
     matrix = np.zeros((genome_spec.matrix_length,), dtype=np.uint8)
     offsets_by_chrom = {offset.chrom: offset for offset in genome_offsets}
-    block_rows = None
-    if block_window is not None:
-        references = (
-            reference_cache.get(genome_spec.genome) if reference_cache is not None else None
-        )
-        if references is None:
-            references = allele_mask._load_reference_segments(conn, genome=genome_spec.genome)
-            if reference_cache is not None:
-                reference_cache[genome_spec.genome] = references
-        if references:
-            block_rows = block_window.rows_for(
-                sample_id=sample_id,
-                genome=genome_spec.genome,
-                segment_ids=list(references),
-            )
     for block in allele_mask.iter_decoded_profile_blocks(
         conn,
         sample_id=sample_id,
@@ -778,6 +1313,7 @@ def _initialize_hdf5_store(
     h5py_module,
     metadata_rows: dict[str, str],
     sample_rows: list[tuple[int, str]],
+    required_sample_ids: list[str] | None = None,
     expected_sample_count: int | None = None,
     genomes: list[GenomeSpec],
     genome_scaffolds: list[GenomeScaffoldOffset],
@@ -809,6 +1345,13 @@ def _initialize_hdf5_store(
         h5py_module=h5py_module,
         chunks=(sample_chunk_len,),
         maxshape=(None,),
+    )
+    set_required_sample_catalog(
+        handle,
+        required_sample_ids
+        if required_sample_ids is not None
+        else [sample_name for _sample_idx, sample_name in sample_rows],
+        h5py_module=h5py_module,
     )
     _write_hdf5_genomes_group(handle, "genomes", genomes, h5py_module=h5py_module)
     _write_hdf5_genome_scaffolds_group(handle, "genome_scaffolds", genome_scaffolds, h5py_module=h5py_module)
@@ -1032,25 +1575,16 @@ def _collect_gene_range_specs(*, gene_range_table: Path, genome_scaffolds: list[
 def _observed_genomes_for_samples(conn: duckdb.DuckDBPyConnection, *, sample_ids: list[str], genome: str | None) -> set[str]:
     if not sample_ids:
         return set()
-    storage = db.profile_storage_config(conn)
-    if storage.mode == allele_mask.PROFILE_STORAGE_ALLELE_MASK:
-        if genome is not None:
-            return {genome}
-        rows = conn.execute(
-            """
-            SELECT DISTINCT genome
-            FROM genome_stats
-            WHERE sample_id IN (SELECT unnest(?))
-            """,
-            [sample_ids],
-        ).fetchall()
-        return {str(row[0]) for row in rows}
-    conditions = ["sample_id IN (SELECT unnest(?))"]
-    params: list[object] = [sample_ids]
     if genome is not None:
-        conditions.append("genome = ?")
-        params.append(genome)
-    rows = conn.execute(f"SELECT DISTINCT genome FROM profile_positions WHERE {' AND '.join(conditions)}", params).fetchall()
+        return {genome}
+    rows = conn.execute(
+        """
+        SELECT DISTINCT genome
+        FROM genome_stats
+        WHERE sample_id IN (SELECT unnest(?))
+        """,
+        [sample_ids],
+    ).fetchall()
     return {str(row[0]) for row in rows}
 
 
@@ -1096,6 +1630,43 @@ def _write_hdf5_string_dataset(group, name: str, values: list[str], *, h5py_modu
     if chunks is not None:
         kwargs["chunks"] = chunks
     group.create_dataset(name, **kwargs)
+
+
+def set_required_sample_catalog(handle, sample_ids: list[str] | tuple[str, ...], *, h5py_module=None) -> bool:
+    """Persist the sorted required sample set without changing matrix row order."""
+    required = normalize_required_sample_ids(sample_ids)
+    digest = sample_id_set_digest(required)
+    samples_group = handle["samples"]
+    existing_count = int(handle.attrs.get(MATRIX_REQUIRED_SAMPLE_COUNT_ATTR, -1))
+    existing_digest = str(handle.attrs.get(MATRIX_REQUIRED_SAMPLE_DIGEST_ATTR, ""))
+    dataset = samples_group.get(MATRIX_REQUIRED_SAMPLE_DATASET)
+    unchanged = (
+        dataset is not None
+        and int(dataset.shape[0]) == len(required)
+        and existing_count == len(required)
+        and existing_digest == digest
+    )
+    if unchanged:
+        return False
+    if dataset is None:
+        if h5py_module is None:
+            h5py_module = _import_h5py()
+        chunk_len = _matrix_hdf5_sample_axis_chunk_length(max(1, len(required)))
+        _write_hdf5_string_dataset(
+            samples_group,
+            MATRIX_REQUIRED_SAMPLE_DATASET,
+            required,
+            h5py_module=h5py_module,
+            chunks=(chunk_len,),
+            maxshape=(None,),
+        )
+    else:
+        dataset.resize((len(required),))
+        if required:
+            dataset[...] = np.asarray(required, dtype=object)
+    handle.attrs[MATRIX_REQUIRED_SAMPLE_COUNT_ATTR] = len(required)
+    handle.attrs[MATRIX_REQUIRED_SAMPLE_DIGEST_ATTR] = digest
+    return True
 
 
 def _read_hdf5_string_dataset(dataset) -> list[str]:
@@ -1391,7 +1962,7 @@ def _prepare_hdf5_matrix_rows(
     return sparse_states
 
 
-def _matrix_checkpoint_sample_count(
+def _matrix_batch_sample_count(
     *,
     genomes: list[GenomeSpec],
     storage_mode: str,
@@ -1467,31 +2038,66 @@ def _initial_sparse_states(handle, genomes: list[GenomeSpec]) -> dict[int, tuple
     return states
 
 
-def _dense_matrix_to_sparse(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    flattened = matrix.reshape(-1)
-    indices = np.flatnonzero(flattened).astype(np.int64, copy=False)
-    return indices, flattened[indices]
-
-
-def _append_sparse_hdf5_matrix_row(
+def _append_sparse_hdf5_matrix_batch(
     *,
     indptr_dataset,
     indices_dataset,
     values_dataset,
-    sample_row: int,
+    sample_start: int,
+    matrices: np.ndarray,
+    current_nnz: int,
+) -> int:
+    """Append all sparse rows in a batch with one resize per payload dataset."""
+    flat_matrices = matrices.reshape((matrices.shape[0], -1))
+    index_parts: list[np.ndarray] = []
+    value_parts: list[np.ndarray] = []
+    lengths = np.zeros(matrices.shape[0], dtype=np.int64)
+    for row_index, flattened in enumerate(flat_matrices):
+        flat_indices = np.flatnonzero(flattened).astype(np.int64, copy=False)
+        lengths[row_index] = flat_indices.size
+        if flat_indices.size:
+            index_parts.append(flat_indices)
+            value_parts.append(flattened[flat_indices])
+    added_nnz = int(lengths.sum())
+    flat_indices = np.concatenate(index_parts) if added_nnz else np.empty(0, dtype=np.int64)
+    values = np.concatenate(value_parts) if added_nnz else np.empty(0, dtype=matrices.dtype)
+    return _append_sparse_hdf5_payload_batch(
+        indptr_dataset=indptr_dataset,
+        indices_dataset=indices_dataset,
+        values_dataset=values_dataset,
+        sample_start=sample_start,
+        lengths=lengths,
+        flat_indices=flat_indices,
+        values=values,
+        current_nnz=current_nnz,
+    )
+
+
+def _append_sparse_hdf5_payload_batch(
+    *,
+    indptr_dataset,
+    indices_dataset,
+    values_dataset,
+    sample_start: int,
+    lengths: np.ndarray,
     flat_indices: np.ndarray,
     values: np.ndarray,
     current_nnz: int,
 ) -> int:
-    flat_indices = np.asarray(flat_indices, dtype=np.int64)
-    next_nnz = current_nnz + int(flat_indices.size)
-    if flat_indices.size > 0:
+    """Append already-sparse rows using the established ZipStrain HDF5 layout."""
+    added_nnz = int(lengths.sum())
+    if flat_indices.size != added_nnz or values.size != added_nnz:
+        raise ValueError("Sparse payload lengths do not match the supplied indices and values.")
+    next_nnz = current_nnz + added_nnz
+    if added_nnz:
         indices_dataset.resize((next_nnz,))
         indices_dataset[current_nnz:next_nnz] = flat_indices
         if values_dataset is not None:
             values_dataset.resize((next_nnz,))
             values_dataset[current_nnz:next_nnz] = values
-    indptr_dataset[int(sample_row) + 1] = next_nnz
+    indptr_dataset[sample_start + 1 : sample_start + lengths.size + 1] = (
+        current_nnz + np.cumsum(lengths)
+    )
     return next_nnz
 
 
@@ -1585,10 +2191,31 @@ def _check_matrix_memory(
         raise MemoryError(f"Genome {spec.genome} matrix requires about {estimated} bytes, exceeding configured memory limit {memory_limit_bytes} bytes.")
 
 
-def _emit_progress(callback: BuildProgressCallback | None, phase: str, completed: int, total: int, sample_name: str, genome: str, stored_rows: int) -> None:
+def _emit_progress(
+    callback: BuildProgressCallback | None,
+    phase: str,
+    completed: int,
+    total: int,
+    sample_name: str,
+    genome: str,
+    stored_rows: int,
+    *,
+    detail: str | None = None,
+) -> None:
     if callback is None:
         return
-    callback({"phase": phase, "completed": completed, "total": total, "sample_name": sample_name, "genome": genome, "scaffold": "", "stored_rows": stored_rows})
+    callback(
+        {
+            "phase": phase,
+            "completed": completed,
+            "total": total,
+            "sample_name": sample_name,
+            "genome": genome,
+            "scaffold": "",
+            "stored_rows": stored_rows,
+            "detail": detail,
+        }
+    )
 
 
 def _import_h5py():

@@ -26,6 +26,8 @@ LINKAGE_METHOD_CHOICES = ("single", "complete", "average", "weighted")
 class SlurmConfig:
     time: str = "01:00:00"
     memory_gb: int = 8
+    memory_retry_coefficient: float = 1.0
+    time_retry_coefficient: float = 1.0
     partition: str | None = None
     account: str | None = None
     extra: dict[str, str] = field(default_factory=dict)
@@ -184,6 +186,14 @@ def _parse(raw: dict[str, Any], *, threads: int, sample_count: int) -> WorkflowC
             slurm=SlurmConfig(
                 time=str(slurm_value.get("time", "01:00:00")),
                 memory_gb=_positive(slurm_value.get("memory_gb", 8), f"stages.{name}.slurm.memory_gb"),
+                memory_retry_coefficient=_at_least_one_float(
+                    slurm_value.get("memory_retry_coefficient", 1.0),
+                    f"stages.{name}.slurm.memory_retry_coefficient",
+                ),
+                time_retry_coefficient=_at_least_one_float(
+                    slurm_value.get("time_retry_coefficient", 1.0),
+                    f"stages.{name}.slurm.time_retry_coefficient",
+                ),
                 partition=_optional_string(slurm_value.get("partition")),
                 account=_optional_string(slurm_value.get("account")),
                 extra=_mapping(slurm_value.get("extra", {}), f"stages.{name}.slurm.extra"),
@@ -347,6 +357,16 @@ def _positive_float(value: Any, key: str) -> float:
     result = _optional_positive_float(value, key)
     if result is None:
         raise ValueError(f"{key} must be a positive number.")
+    return result
+
+
+def _at_least_one_float(value: Any, key: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a number greater than or equal to 1.") from exc
+    if result < 1:
+        raise ValueError(f"{key} must be a number greater than or equal to 1.")
     return result
 
 

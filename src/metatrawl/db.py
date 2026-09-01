@@ -7,7 +7,7 @@ from pathlib import Path
 import os
 import re
 import time
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Iterator
 
 import duckdb
 import polars as pl
@@ -221,6 +221,15 @@ class MatrixFilters:
     min_breadth: float | None = None
     min_ber: float | None = None
     min_sylph_abundance: float | None = None
+
+
+@dataclass(frozen=True)
+class GenomeEligibilitySummary:
+    """Compact filtered sample-set identity for one genome."""
+
+    genome: str
+    sample_count: int
+    sample_digest: str
 
 
 @dataclass(frozen=True)
@@ -752,8 +761,171 @@ def list_profiles(conn: duckdb.DuckDBPyConnection) -> list[dict[str, object]]:
 
 def eligible_sample_ids(conn: duckdb.DuckDBPyConnection, *, genome: str, filters: MatrixFilters) -> list[str]:
     """Return samples eligible for a matrix build under genome/stat thresholds."""
-    conditions = ["s.status = 'complete'", "gs.genome = ?"]
-    params: list[object] = [genome]
+    return eligible_sample_ids_by_genome(
+        conn,
+        genomes=[genome],
+        filters=filters,
+    ).get(genome, [])
+
+
+def eligible_genomes(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    genomes: list[str] | None,
+    filters: MatrixFilters,
+) -> list[str]:
+    """Return filtered genome names without materializing any sample memberships."""
+    normalized_genomes = _normalize_ids(genomes) if genomes is not None else None
+    if normalized_genomes == []:
+        return []
+    conditions, params = _matrix_filter_conditions(filters)
+    if normalized_genomes is not None:
+        target_frame = pl.DataFrame({"genome": normalized_genomes})
+        conn.register("_metatrawl_eligible_genomes", target_frame)
+        target_join = "JOIN _metatrawl_eligible_genomes t ON gs.genome = t.genome"
+    else:
+        target_join = ""
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT gs.genome
+            FROM genome_stats gs
+            {target_join}
+            JOIN samples s ON s.sample_id = gs.sample_id
+            WHERE {' AND '.join(conditions)}
+            ORDER BY gs.genome
+            """,
+            params,
+        ).fetchall()
+    finally:
+        if normalized_genomes is not None:
+            conn.unregister("_metatrawl_eligible_genomes")
+    return [str(row[0]) for row in rows]
+
+
+def eligible_genome_summaries(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    genomes: list[str],
+    filters: MatrixFilters,
+) -> list[GenomeEligibilitySummary]:
+    """Return one count and sorted-sample digest per eligible genome."""
+    normalized_genomes = _normalize_ids(genomes)
+    if not normalized_genomes:
+        return []
+    conditions, params = _matrix_filter_conditions(filters)
+    target_frame = pl.DataFrame({"genome": normalized_genomes})
+    conn.register("_metatrawl_eligible_genomes", target_frame)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT
+                gs.genome,
+                count(DISTINCT s.sample_id) AS sample_count,
+                sha256(
+                    string_agg(DISTINCT s.sample_id, chr(31) ORDER BY s.sample_id)
+                ) AS sample_digest
+            FROM _metatrawl_eligible_genomes t
+            JOIN genome_stats gs ON gs.genome = t.genome
+            JOIN samples s ON s.sample_id = gs.sample_id
+            WHERE {' AND '.join(conditions)}
+            GROUP BY gs.genome
+            ORDER BY gs.genome
+            """,
+            params,
+        ).fetchall()
+    finally:
+        conn.unregister("_metatrawl_eligible_genomes")
+    return [
+        GenomeEligibilitySummary(
+            genome=str(genome),
+            sample_count=int(sample_count),
+            sample_digest=str(sample_digest),
+        )
+        for genome, sample_count, sample_digest in rows
+    ]
+
+
+def eligible_sample_ids_by_genome(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    genomes: list[str],
+    filters: MatrixFilters,
+) -> dict[str, list[str]]:
+    """Return eligible sample IDs for several genomes with one stats-table scan."""
+    return {
+        genome: sample_ids
+        for genome, sample_ids in iter_eligible_sample_ids_by_genome(
+            conn,
+            genomes=genomes,
+            filters=filters,
+        )
+    }
+
+
+def iter_eligible_sample_ids_by_genome(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    genomes: list[str],
+    filters: MatrixFilters,
+) -> Iterator[tuple[str, list[str]]]:
+    """Stream one genome's eligible samples at a time from one stats-table scan."""
+    normalized_genomes = _normalize_ids(genomes)
+    if not normalized_genomes:
+        return
+
+    conditions, params = _matrix_filter_conditions(filters)
+
+    target_frame = pl.DataFrame(
+        {
+            "genome_order": range(len(normalized_genomes)),
+            "genome": normalized_genomes,
+        }
+    )
+    conn.register("_metatrawl_eligible_genomes", target_frame)
+    try:
+        cursor = conn.execute(
+            f"""
+            SELECT DISTINCT t.genome_order, s.sample_id
+            FROM _metatrawl_eligible_genomes t
+            JOIN genome_stats gs ON gs.genome = t.genome
+            JOIN samples s ON s.sample_id = gs.sample_id
+            WHERE {' AND '.join(conditions)}
+            ORDER BY t.genome_order, s.sample_id
+            """,
+            params,
+        )
+        row_buffer = iter(())
+        pending_row: tuple[object, ...] | None = None
+
+        def next_row() -> tuple[object, ...] | None:
+            nonlocal row_buffer
+            try:
+                return next(row_buffer)
+            except StopIteration:
+                rows = cursor.fetchmany(65_536)
+                if not rows:
+                    return None
+                row_buffer = iter(rows)
+                return next(row_buffer)
+
+        for genome_order, genome in enumerate(normalized_genomes):
+            sample_ids: list[str] = []
+            while True:
+                if pending_row is None:
+                    pending_row = next_row()
+                if pending_row is None or int(pending_row[0]) != genome_order:
+                    break
+                sample_ids.append(str(pending_row[1]))
+                pending_row = None
+            yield genome, sample_ids
+    finally:
+        conn.unregister("_metatrawl_eligible_genomes")
+
+
+def _matrix_filter_conditions(filters: MatrixFilters) -> tuple[list[str], list[object]]:
+    conditions = ["s.status = 'complete'"]
+    params: list[object] = []
     if filters.min_coverage is not None:
         conditions.append("COALESCE(gs.coverage, 0) >= ?")
         params.append(filters.min_coverage)
@@ -770,23 +942,13 @@ def eligible_sample_ids(conn: duckdb.DuckDBPyConnection, *, genome: str, filters
               SELECT 1
               FROM sylph_abundance sa
               WHERE sa.sample_id = s.sample_id
-                AND (sa.genome = ? OR sa.accession = ?)
+                AND (sa.genome = gs.genome OR sa.accession = gs.genome)
                 AND COALESCE(sa.abundance, 0) >= ?
             )
             """
         )
-        params.extend([genome, genome, filters.min_sylph_abundance])
-    rows = conn.execute(
-        f"""
-        SELECT DISTINCT s.sample_id
-        FROM samples s
-        JOIN genome_stats gs USING (sample_id)
-        WHERE {' AND '.join(conditions)}
-        ORDER BY s.sample_id
-        """,
-        params,
-    ).fetchall()
-    return [str(row[0]) for row in rows]
+        params.append(filters.min_sylph_abundance)
+    return conditions, params
 
 
 def eligible_unmaterialized_sample_ids(

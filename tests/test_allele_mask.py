@@ -17,6 +17,7 @@ from metatrawl import matrix_hdf5
 from metatrawl import migration
 from metatrawl import workflows
 from metatrawl.api import ProfileCountsUnavailableError, open_database
+from metatrawl.logging import ThrottledMatrixLogger
 
 
 GENOME = "GCF_000001.1"
@@ -220,6 +221,14 @@ def test_nibble_and_presence_codecs_round_trip_odd_lengths() -> None:
         ),
         presence,
     )
+    positions = np.asarray([0, 3, 6], dtype=np.int64)
+    assert np.array_equal(
+        allele_mask.unpack_nibbles_at_positions(
+            allele_mask.pack_nibbles(masks),
+            positions,
+        ),
+        masks[positions],
+    )
 
 
 def test_allele_mask_import_keeps_stats_but_not_profile_rows(tmp_path: Path) -> None:
@@ -334,17 +343,17 @@ def test_matrix_build_resumes_after_a_committed_sample_batch(
     db_file = _make_database(tmp_path, name="resumable", mode="full", cache_dir=cache_dir)
     resumed_h5 = tmp_path / f"resumed-{sparse}.h5"
     checkpoint_h5 = resumed_h5.with_suffix(resumed_h5.suffix + ".tmp")
-    original_loader = matrix_hdf5._load_duckdb_sample_genome_matrix
+    original_loader = matrix_hdf5._load_duckdb_sample_batch_genome_matrices
 
-    def interrupt_second_sample(*args, **kwargs):
-        if kwargs["sample_id"] == "S2":
+    def interrupt_second_batch(*args, **kwargs):
+        if "S2" in kwargs["sample_ids"]:
             raise RuntimeError("simulated cancellation")
         return original_loader(*args, **kwargs)
 
     monkeypatch.setattr(
         matrix_hdf5,
-        "_load_duckdb_sample_genome_matrix",
-        interrupt_second_sample,
+        "_load_duckdb_sample_batch_genome_matrices",
+        interrupt_second_batch,
     )
     with db.connect(db_file) as conn:
         with pytest.raises(RuntimeError, match="simulated cancellation"):
@@ -370,7 +379,7 @@ def test_matrix_build_resumes_after_a_committed_sample_batch(
 
     monkeypatch.setattr(
         matrix_hdf5,
-        "_load_duckdb_sample_genome_matrix",
+        "_load_duckdb_sample_batch_genome_matrices",
         original_loader,
     )
     resume_events: list[dict[str, object]] = []
@@ -428,17 +437,17 @@ def test_matrix_build_discards_an_uncommitted_partial_batch_on_resume(
     db_file = _make_database(tmp_path, name="partial", mode="full", cache_dir=cache_dir)
     resumed_h5 = tmp_path / f"partial-{sparse}.h5"
     checkpoint_h5 = resumed_h5.with_suffix(resumed_h5.suffix + ".tmp")
-    original_loader = matrix_hdf5._load_duckdb_sample_genome_matrix
+    original_loader = matrix_hdf5._load_duckdb_sample_batch_genome_matrices
 
-    def interrupt_second_sample(*args, **kwargs):
-        if kwargs["sample_id"] == "S2":
+    def interrupt_batch(*args, **kwargs):
+        if "S2" in kwargs["sample_ids"]:
             raise RuntimeError("simulated cancellation")
         return original_loader(*args, **kwargs)
 
     monkeypatch.setattr(
         matrix_hdf5,
-        "_load_duckdb_sample_genome_matrix",
-        interrupt_second_sample,
+        "_load_duckdb_sample_batch_genome_matrices",
+        interrupt_batch,
     )
     with db.connect(db_file) as conn:
         with pytest.raises(RuntimeError, match="simulated cancellation"):
@@ -461,7 +470,7 @@ def test_matrix_build_discards_an_uncommitted_partial_batch_on_resume(
 
     monkeypatch.setattr(
         matrix_hdf5,
-        "_load_duckdb_sample_genome_matrix",
+        "_load_duckdb_sample_batch_genome_matrices",
         original_loader,
     )
     with db.connect(db_file) as conn:
@@ -654,18 +663,26 @@ def test_matrix_append_resumes_from_committed_batches(
             db.add_runs(conn, [sample])
             db.import_profile_bundle(conn, _write_bundle(tmp_path, sample), cache_dir=cache_dir)
 
-        original_loader = matrix_hdf5._load_duckdb_sample_genome_matrix
+        if sparse:
+            original_loader = matrix_hdf5._load_allele_mask_sample_genome_sparse
 
-        def interrupt_third_sample(*args, **kwargs):
-            if kwargs["sample_id"] == "S3":
-                raise RuntimeError("simulated append cancellation")
-            return original_loader(*args, **kwargs)
+            def interrupt_third_batch(*args, **kwargs):
+                if kwargs["sample_id"] == "S3":
+                    raise RuntimeError("simulated append cancellation")
+                return original_loader(*args, **kwargs)
 
-        monkeypatch.setattr(
-            matrix_hdf5,
-            "_load_duckdb_sample_genome_matrix",
-            interrupt_third_sample,
-        )
+            loader_name = "_load_allele_mask_sample_genome_sparse"
+        else:
+            original_loader = matrix_hdf5._load_duckdb_sample_batch_genome_matrices
+
+            def interrupt_third_batch(*args, **kwargs):
+                if "S3" in kwargs["sample_ids"]:
+                    raise RuntimeError("simulated append cancellation")
+                return original_loader(*args, **kwargs)
+
+            loader_name = "_load_duckdb_sample_batch_genome_matrices"
+
+        monkeypatch.setattr(matrix_hdf5, loader_name, interrupt_third_batch)
         with pytest.raises(RuntimeError, match="simulated append cancellation"):
             matrix_hdf5.append_matrix_hdf5_from_duckdb(
                 conn,
@@ -678,12 +695,14 @@ def test_matrix_append_resumes_from_committed_batches(
             assert handle.attrs[matrix_hdf5.MATRIX_BUILD_STATE_ATTR] == "appending"
             assert handle.attrs[matrix_hdf5.MATRIX_COMMITTED_SAMPLE_COUNT_ATTR] == 2
             assert handle["samples"]["sample_name"].asstr()[...].tolist() == ["S1", "S2"]
+            assert handle["samples"][matrix_hdf5.MATRIX_REQUIRED_SAMPLE_DATASET].asstr()[...].tolist() == [
+                "S1",
+                "S2",
+                "S3",
+            ]
+            assert handle.attrs[matrix_hdf5.MATRIX_REQUIRED_SAMPLE_COUNT_ATTR] == 3
 
-        monkeypatch.setattr(
-            matrix_hdf5,
-            "_load_duckdb_sample_genome_matrix",
-            original_loader,
-        )
+        monkeypatch.setattr(matrix_hdf5, loader_name, original_loader)
         matrix_hdf5.append_matrix_hdf5_from_duckdb(
             conn,
             sample_ids=["S3"],
@@ -705,6 +724,43 @@ def test_matrix_append_resumes_from_committed_batches(
     with h5py.File(matrix_file, "r") as handle:
         assert handle.attrs[matrix_hdf5.MATRIX_BUILD_STATE_ATTR] == "complete"
         assert handle.attrs[matrix_hdf5.MATRIX_COMMITTED_SAMPLE_COUNT_ATTR] == len(SAMPLES)
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+def test_matrix_append_keeps_an_eligible_sample_with_no_profile_rows_as_zero(
+    tmp_path: Path,
+    sparse: bool,
+) -> None:
+    """Stats eligibility is authoritative; an empty profile becomes an all-zero row."""
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name=f"empty-row-{sparse}", mode="full", cache_dir=cache_dir)
+    matrix_file = tmp_path / f"empty-row-{sparse}.h5"
+    with db.connect(db_file) as conn:
+        matrix_hdf5.build_matrix_hdf5_from_duckdb(
+            conn,
+            sample_ids=["S1", "S2"],
+            output_file=matrix_file,
+            genome=GENOME,
+            bed_file=bed_file,
+            stb_file=stb_file,
+            gene_range_table=gene_ranges,
+            min_cov=5,
+            sparse=sparse,
+        )
+        conn.execute("DELETE FROM profile_positions WHERE sample_id = 'S3'")
+        matrix_hdf5.append_matrix_hdf5_from_duckdb(
+            conn,
+            sample_ids=["S3"],
+            matrix_hdf5_file=matrix_file,
+        )
+
+    with h5py.File(matrix_file, "r") as handle:
+        assert handle["samples"]["sample_name"].asstr()[...].tolist() == list(SAMPLES)
+        matrix = handle["matrices"]["0"]
+        if isinstance(matrix, h5py.Group):
+            assert int(matrix["indptr"][-1]) == int(matrix["indptr"][-2])
+        else:
+            assert not np.any(matrix[-1])
 
 
 def test_allele_mask_profile_api_rejects_count_queries(tmp_path: Path) -> None:
@@ -940,45 +996,193 @@ def test_reference_cache_evicts_beyond_its_base_budget(tmp_path: Path) -> None:
         assert np.array_equal(first.masks, again.masks)
 
 
-def test_windowed_block_reads_match_per_sample_reads(tmp_path: Path, monkeypatch) -> None:
-    """Batched block fetches must build byte-identical matrices."""
-    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
-    db_file = _make_database(tmp_path, name="window", mode="allele-mask", cache_dir=cache_dir)
-
-    windowed = tmp_path / "windowed.h5"
-    _build_matrix(
-        db_file, windowed, bed_file=bed_file, stb_file=stb_file,
-        gene_ranges=gene_ranges, sparse=False,
-    )
-
-    # Disable the window so every sample takes the original one-query-per-sample path.
-    monkeypatch.setattr(matrix_hdf5, "_AlleleMaskBlockWindow", lambda *a, **k: None)
-    per_sample = tmp_path / "per_sample.h5"
-    _build_matrix(
-        db_file, per_sample, bed_file=bed_file, stb_file=stb_file,
-        gene_ranges=gene_ranges, sparse=False,
-    )
-    assert _hdf_matrix_payload(windowed) == _hdf_matrix_payload(per_sample)
-
-
-def test_windowed_reads_survive_a_window_smaller_than_the_sample_set(
+def test_allele_mask_build_fetches_one_duckdb_block_per_matrix_batch(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """A window narrower than the build must still return every sample's blocks."""
+    """A matrix batch must be backed by one bulk DuckDB block fetch."""
     cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
-    db_file = _make_database(tmp_path, name="narrow", mode="allele-mask", cache_dir=cache_dir)
-    reference = tmp_path / "reference.h5"
-    _build_matrix(
-        db_file, reference, bed_file=bed_file, stb_file=stb_file,
-        gene_ranges=gene_ranges, sparse=False,
+    db_file = _make_database(tmp_path, name="batch-query", mode="allele-mask", cache_dir=cache_dir)
+    calls: list[list[str]] = []
+    original_fetch = allele_mask.fetch_profile_block_rows
+
+    def recording_fetch(*args, **kwargs):
+        calls.append(list(kwargs["sample_ids"]))
+        return original_fetch(*args, **kwargs)
+
+    monkeypatch.setattr(allele_mask, "fetch_profile_block_rows", recording_fetch)
+    with db.connect(db_file) as conn:
+        matrix_hdf5.build_matrix_hdf5_from_duckdb(
+            conn,
+            sample_ids=list(SAMPLES),
+            output_file=tmp_path / "batch-query.h5",
+            genome=GENOME,
+            bed_file=bed_file,
+            stb_file=stb_file,
+            gene_range_table=gene_ranges,
+            min_cov=5,
+            export_batch_mb=128,
+        )
+    assert calls == [list(SAMPLES)]
+
+
+def test_sparse_allele_mask_build_bypasses_dense_batch_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="direct-sparse", mode="allele-mask", cache_dir=cache_dir)
+
+    def reject_dense_loader(*_args, **_kwargs):
+        raise AssertionError("sparse allele-mask build used the dense batch loader")
+
+    monkeypatch.setattr(
+        matrix_hdf5,
+        "_load_duckdb_sample_batch_genome_matrices",
+        reject_dense_loader,
     )
-    monkeypatch.setattr(matrix_hdf5, "MATRIX_READ_WINDOW_SAMPLES", 1)
-    narrow = tmp_path / "narrow.h5"
-    _build_matrix(
-        db_file, narrow, bed_file=bed_file, stb_file=stb_file,
-        gene_ranges=gene_ranges, sparse=False,
+    matrix_file = tmp_path / "direct-sparse.h5"
+    with db.connect(db_file) as conn:
+        matrix_hdf5.build_matrix_hdf5_from_duckdb(
+            conn,
+            sample_ids=list(SAMPLES),
+            output_file=matrix_file,
+            genome=GENOME,
+            bed_file=bed_file,
+            stb_file=stb_file,
+            gene_range_table=gene_ranges,
+            min_cov=5,
+            sparse=True,
+        )
+    assert _hdf_matrix_payload(matrix_file)[0][-1] > 0
+
+
+def test_sparse_allele_mask_build_commits_bounded_stream_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="stream-checkpoints", mode="allele-mask", cache_dir=cache_dir)
+    monkeypatch.setattr(matrix_hdf5, "SPARSE_STREAM_MAX_SAMPLES", 2)
+    monkeypatch.setattr(matrix_hdf5, "SPARSE_STREAM_TARGET_BYTES", 1024**3)
+    events: list[dict[str, object]] = []
+    matrix_file = tmp_path / "stream-checkpoints.h5"
+    with db.connect(db_file) as conn:
+        matrix_hdf5.build_matrix_hdf5_from_duckdb(
+            conn,
+            sample_ids=list(SAMPLES),
+            output_file=matrix_file,
+            genome=GENOME,
+            bed_file=bed_file,
+            stb_file=stb_file,
+            gene_range_table=gene_ranges,
+            min_cov=5,
+            sparse=True,
+            progress_callback=events.append,
+        )
+
+    checkpoints = [event for event in events if event["phase"] == "checkpoint"]
+    assert [event["completed"] for event in checkpoints] == [2, 3]
+    assert all("query=" in str(event["detail"]) for event in checkpoints)
+    assert all("decode=" in str(event["detail"]) for event in checkpoints)
+    assert all("write=" in str(event["detail"]) for event in checkpoints)
+
+
+def test_sparse_allele_mask_build_resumes_from_stream_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="stream-resume", mode="allele-mask", cache_dir=cache_dir)
+    matrix_file = tmp_path / "stream-resume.h5"
+    checkpoint_file = matrix_file.with_suffix(".h5.tmp")
+    monkeypatch.setattr(matrix_hdf5, "SPARSE_STREAM_MAX_SAMPLES", 1)
+    original_loader = matrix_hdf5._load_allele_mask_sample_genome_sparse
+
+    def interrupt_second_sample(*args, **kwargs):
+        if kwargs["sample_id"] == "S2":
+            raise RuntimeError("simulated sparse cancellation")
+        return original_loader(*args, **kwargs)
+
+    monkeypatch.setattr(
+        matrix_hdf5,
+        "_load_allele_mask_sample_genome_sparse",
+        interrupt_second_sample,
     )
-    assert _hdf_matrix_payload(narrow) == _hdf_matrix_payload(reference)
+    with db.connect(db_file) as conn:
+        with pytest.raises(RuntimeError, match="simulated sparse cancellation"):
+            matrix_hdf5.build_matrix_hdf5_from_duckdb(
+                conn,
+                sample_ids=list(SAMPLES),
+                output_file=matrix_file,
+                genome=GENOME,
+                bed_file=bed_file,
+                stb_file=stb_file,
+                gene_range_table=gene_ranges,
+                min_cov=5,
+                sparse=True,
+            )
+    with h5py.File(checkpoint_file, "r") as handle:
+        assert handle.attrs[matrix_hdf5.MATRIX_COMMITTED_SAMPLE_COUNT_ATTR] == 1
+        assert handle["samples"]["sample_name"].asstr()[...].tolist() == ["S1"]
+
+    monkeypatch.setattr(
+        matrix_hdf5,
+        "_load_allele_mask_sample_genome_sparse",
+        original_loader,
+    )
+    with db.connect(db_file) as conn:
+        matrix_hdf5.build_matrix_hdf5_from_duckdb(
+            conn,
+            sample_ids=list(SAMPLES),
+            output_file=matrix_file,
+            genome=GENOME,
+            bed_file=bed_file,
+            stb_file=stb_file,
+            gene_range_table=gene_ranges,
+            min_cov=5,
+            sparse=True,
+        )
+    clean_file = tmp_path / "stream-resume-clean.h5"
+    _build_matrix(
+        db_file,
+        clean_file,
+        bed_file=bed_file,
+        stb_file=stb_file,
+        gene_ranges=gene_ranges,
+        sparse=True,
+    )
+    assert _hdf_matrix_payload(matrix_file) == _hdf_matrix_payload(clean_file)
+
+
+def test_export_batch_mb_divides_samples_into_ordered_matrix_batches(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The memory estimate must directly determine ordered DuckDB/HDF batches."""
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="ordered-batches", mode="allele-mask", cache_dir=cache_dir)
+    calls: list[list[str]] = []
+    original_loader = matrix_hdf5._load_duckdb_sample_batch_genome_matrices
+
+    def recording_loader(*args, **kwargs):
+        calls.append(list(kwargs["sample_ids"]))
+        return original_loader(*args, **kwargs)
+
+    monkeypatch.setattr(matrix_hdf5, "_load_duckdb_sample_batch_genome_matrices", recording_loader)
+    # This reference has 16 matrix positions, so 32 bytes targets two bitmask samples.
+    two_sample_batch_mb = 32 / (1024**2)
+    matrix_file = tmp_path / "ordered-batches.h5"
+    with db.connect(db_file) as conn:
+        matrix_hdf5.build_matrix_hdf5_from_duckdb(
+            conn,
+            sample_ids=list(SAMPLES),
+            output_file=matrix_file,
+            genome=GENOME,
+            bed_file=bed_file,
+            stb_file=stb_file,
+            gene_range_table=gene_ranges,
+            min_cov=5,
+            export_batch_mb=two_sample_batch_mb,
+        )
+    assert calls == [["S1", "S2"], ["S3"]]
+    with h5py.File(matrix_file, "r") as handle:
+        assert handle["samples"]["sample_name"].asstr()[...].tolist() == list(SAMPLES)
 
 
 def test_fetch_profile_block_rows_groups_every_requested_sample(tmp_path: Path) -> None:
@@ -998,6 +1202,220 @@ def test_fetch_profile_block_rows_groups_every_requested_sample(tmp_path: Path) 
     assert set(grouped) == {"S1", "S2", "missing"}
     assert grouped["missing"] == []
     assert grouped["S1"]
+
+
+def test_fetch_profile_block_rows_adds_scalar_bounds_for_duckdb_pruning() -> None:
+    calls: list[tuple[str, list[object]]] = []
+
+    class Result:
+        def fetchmany(self, _size):
+            return []
+
+    class Connection:
+        def execute(self, query, parameters):
+            calls.append((query, parameters))
+            return Result()
+
+    grouped = allele_mask.fetch_profile_block_rows(
+        Connection(),
+        sample_ids=["S9", "S1"],
+        segment_ids=[9, 2],
+    )
+
+    query, parameters = calls[0]
+    assert "sample_id BETWEEN ? AND ?" in query
+    assert "segment_id BETWEEN ? AND ?" in query
+    assert parameters[:4] == ["S1", "S9", 2, 9]
+    assert set(grouped) == {"S1", "S9"}
+
+
+def test_profile_block_stream_uses_bounded_fetches_and_yields_empty_samples() -> None:
+    rows = [
+        ("S1", 2, b"p1", b"d1", 1, "h1"),
+        ("S3", 2, b"p3", b"d3", 1, "h3"),
+    ]
+
+    class Result:
+        def __init__(self):
+            self.offset = 0
+            self.fetch_sizes: list[int] = []
+
+        def fetchmany(self, size):
+            self.fetch_sizes.append(size)
+            chunk = rows[self.offset : self.offset + 1]
+            self.offset += len(chunk)
+            return chunk
+
+    result = Result()
+
+    class Connection:
+        def execute(self, _query, _parameters):
+            return result
+
+    metrics: dict[str, float | int] = {}
+    streamed = list(
+        allele_mask.iter_profile_block_rows(
+            Connection(),
+            sample_ids=["S3", "S1", "S2"],
+            segment_ids=[2],
+            fetch_rows=1,
+            metrics=metrics,
+        )
+    )
+    assert [sample_id for sample_id, _rows in streamed] == ["S1", "S2", "S3"]
+    assert streamed[1][1] == []
+    assert result.fetch_sizes == [1, 1, 1]
+    assert metrics["fetched_rows"] == 2
+
+
+def test_matrix_processing_log_reports_batch_operation(capsys) -> None:
+    logger = ThrottledMatrixLogger("MATRIX-BUILD")
+    logger(
+        {
+            "phase": "processing",
+            "completed": 0,
+            "total": 10,
+            "sample_name": "S1",
+            "genome": GENOME,
+            "stored_rows": 0,
+            "detail": "fetching batch_samples=4 first_sample=S1",
+        }
+    )
+    captured = capsys.readouterr()
+    assert "MATRIX-BUILD PROCESSING" in captured.err
+    assert "detail=fetching batch_samples=4 first_sample=S1" in captured.err
+
+
+def test_full_profile_matrix_build_reports_loader_stage_timings(tmp_path: Path) -> None:
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="full-stage-timing", mode="full", cache_dir=cache_dir)
+    events: list[dict[str, object]] = []
+    with db.connect(db_file) as conn:
+        matrix_hdf5.build_matrix_hdf5_from_duckdb(
+            conn,
+            sample_ids=list(SAMPLES),
+            output_file=tmp_path / "full-stage-timing.h5",
+            genome=GENOME,
+            bed_file=bed_file,
+            stb_file=stb_file,
+            gene_range_table=gene_ranges,
+            min_cov=5,
+            sparse=True,
+            progress_callback=events.append,
+        )
+
+    details = [
+        str(event["detail"])
+        for event in events
+        if event["phase"] == "processing" and str(event.get("detail", "")).startswith("full-profile")
+    ]
+    assert [detail.split("stage=", 1)[1].split(" ", 1)[0] for detail in details] == [
+        "allocate",
+        "query",
+        "stream",
+    ]
+    assert all("seconds=" in detail and "rows=" in detail for detail in details)
+
+
+@pytest.mark.parametrize("storage_mode", ["bitmask", "counts"])
+@pytest.mark.parametrize("sparse", [False, True])
+def test_full_profile_arrow_stream_matches_frame_conversion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    storage_mode: str,
+    sparse: bool,
+) -> None:
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name=f"arrow-{storage_mode}-{sparse}", mode="full", cache_dir=cache_dir)
+
+    def reject_frame_conversion(*_args, **_kwargs):
+        raise AssertionError("full-profile matrix build materialized a Polars sample frame")
+
+    monkeypatch.setattr(matrix_hdf5, "_profile_frame_to_matrix", reject_frame_conversion)
+    matrix_file = tmp_path / f"arrow-{storage_mode}-{sparse}.h5"
+    with db.connect(db_file) as conn:
+        matrix_hdf5.build_matrix_hdf5_from_duckdb(
+            conn,
+            sample_ids=list(SAMPLES),
+            output_file=matrix_file,
+            genome=GENOME,
+            bed_file=bed_file,
+            stb_file=stb_file,
+            gene_range_table=gene_ranges,
+            storage_mode=storage_mode,
+            count_dtype="uint16" if storage_mode == "counts" else None,
+            min_cov=5,
+            sparse=sparse,
+        )
+
+    with h5py.File(matrix_file, "r") as handle:
+        sample_names = handle["samples"]["sample_name"].asstr()[...].tolist()
+        node = handle["matrices"]["0"]
+        if isinstance(node, h5py.Group):
+            dense = np.zeros(
+                (len(SAMPLES), 16) if storage_mode == "bitmask" else (len(SAMPLES), 16, 4),
+                dtype=np.uint8 if storage_mode == "bitmask" else np.uint16,
+            )
+            indptr = node["indptr"][...]
+            indices = node["indices"][...]
+            values = node["values"][...]
+            flat = dense.reshape((len(SAMPLES), -1))
+            for row_index in range(len(SAMPLES)):
+                start, stop = int(indptr[row_index]), int(indptr[row_index + 1])
+                flat[row_index, indices[start:stop]] = values[start:stop]
+        else:
+            dense = node[...]
+
+    expected = np.zeros_like(dense)
+    for row_index, sample_id in enumerate(SAMPLES):
+        for chrom, pos, a_count, c_count, g_count, t_count in _profile_rows(sample_id):
+            if a_count + c_count + g_count + t_count < 5:
+                continue
+            axis = pos - 1 if chrom == "contigA" else 11 + pos - 1
+            counts = np.asarray([a_count, t_count, c_count, g_count], dtype=np.uint16)
+            if storage_mode == "bitmask":
+                expected[row_index, axis] = int(((counts > 0) * matrix_hdf5.BITMASK_BASE_BITS).sum())
+            else:
+                expected[row_index, axis, :] = counts
+    assert sample_names == list(SAMPLES)
+    assert np.array_equal(dense, expected)
+
+
+def test_full_profile_arrow_stream_crosses_record_batch_boundary(tmp_path: Path) -> None:
+    genome = "GCF_ARROW.1"
+    length = 70_000
+    db_file = tmp_path / "arrow-boundary.duckdb"
+    with db.connect(db_file) as conn:
+        conn.execute(
+            f"""
+            INSERT INTO profile_positions
+            SELECT 'S1', 'contig', pos, '{genome}',
+                   CAST(5 AS USMALLINT), CAST(0 AS USMALLINT),
+                   CAST(0 AS USMALLINT), CAST(0 AS USMALLINT), NULL
+            FROM range(1, {length + 1}) positions(pos)
+            """
+        )
+    bed_file = tmp_path / "arrow-boundary.bed"
+    bed_file.write_text(f"contig\t0\t{length}\n")
+    stb_file = tmp_path / "arrow-boundary.stb"
+    stb_file.write_text(f"contig\t{genome}\n")
+    matrix_file = tmp_path / "arrow-boundary.h5"
+
+    with db.connect(db_file) as conn:
+        matrix_hdf5.build_matrix_hdf5_from_duckdb(
+            conn,
+            sample_ids=["S1"],
+            output_file=matrix_file,
+            genome=genome,
+            bed_file=bed_file,
+            stb_file=stb_file,
+            min_cov=5,
+            sparse=False,
+        )
+    with h5py.File(matrix_file, "r") as handle:
+        matrix = handle["matrices"]["0"][0]
+        assert matrix.shape == (length,)
+        assert np.all(matrix == 1)
 
 
 def test_publish_moves_outputs_instead_of_copying(tmp_path: Path) -> None:
@@ -1044,113 +1462,204 @@ def test_publish_refuses_an_empty_output(tmp_path: Path) -> None:
         workflows._atomic_publish(source, tmp_path / "published.parquet")
 
 
-def test_registry_reconcile_rebuilds_rows_from_matrix_files(tmp_path: Path) -> None:
-    """A matrix built read-only can be registered later from the file alone."""
+def test_plan_uses_only_stats_and_hdf5_membership(tmp_path: Path) -> None:
+    """Registry rows must not influence whether a genome needs matrix work."""
     cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
-    db_file = _make_database(tmp_path, name="reconcile", mode="allele-mask", cache_dir=cache_dir)
+    db_file = _make_database(tmp_path, name="plan-hdf", mode="allele-mask", cache_dir=cache_dir)
     matrix_dir = tmp_path / "matrices"
     matrix_dir.mkdir()
     _build_matrix(
-        db_file, matrix_dir / "GCF_000001.1.h5", bed_file=bed_file, stb_file=stb_file,
-        gene_ranges=gene_ranges, sparse=False,
+        db_file,
+        matrix_dir / f"{GENOME}.h5",
+        bed_file=bed_file,
+        stb_file=stb_file,
+        gene_ranges=gene_ranges,
+        sparse=False,
     )
     with db.connect(db_file) as conn:
-        conn.execute("DELETE FROM matrix_stores")
         conn.execute("DELETE FROM matrix_store_samples")
-
-        assert workflows.reconcile_matrix_registry(conn, matrix_dir=matrix_dir) == 1
-
-        store = db.get_matrix_store(conn, "GCF_000001.1")
-        assert store is not None
-        assert store.genome == GENOME
-        assert store.profile_count == len(SAMPLES)
-        materialized = conn.execute(
-            "SELECT sample_id FROM matrix_store_samples ORDER BY sample_id"
-        ).fetchall()
-        assert [row[0] for row in materialized] == sorted(SAMPLES)
-        # A second pass has nothing left to do.
-        assert workflows.reconcile_matrix_registry(conn, matrix_dir=matrix_dir) == 0
-
-
-def test_plan_skips_current_genomes_and_keeps_unverifiable_ones(tmp_path: Path) -> None:
-    """Only a genome the registry can vouch for may skip its job."""
-    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
-    db_file = _make_database(tmp_path, name="plan", mode="allele-mask", cache_dir=cache_dir)
-    matrix_dir = tmp_path / "matrices"
-    matrix_dir.mkdir()
-    _build_matrix(
-        db_file, matrix_dir / "GCF_000001.1.h5", bed_file=bed_file, stb_file=stb_file,
-        gene_ranges=gene_ranges, sparse=False,
-    )
-    filters = db.MatrixFilters()
-    with db.connect(db_file) as conn:
-        workflows.reconcile_matrix_registry(conn, matrix_dir=matrix_dir)
-
-        pending, up_to_date = workflows.plan_matrix_sync_build(
-            conn, matrix_dir=matrix_dir, genomes=[GENOME], filters=filters
-        )
-        assert (pending, up_to_date) == ([], [GENOME])
-
-        # A genome with no matrix file at all must be dispatched.
-        pending, up_to_date = workflows.plan_matrix_sync_build(
-            conn, matrix_dir=matrix_dir, genomes=[GENOME, "GCF_999999.9"], filters=filters
-        )
-        assert pending == ["GCF_999999.9"]
-
-        # A registry row that disagrees with the file must never allow a skip.
-        conn.execute("UPDATE matrix_stores SET profile_count = 999 WHERE matrix_id = 'GCF_000001.1'")
-        pending, up_to_date = workflows.plan_matrix_sync_build(
-            conn, matrix_dir=matrix_dir, genomes=[GENOME], filters=filters
-        )
-        assert (pending, up_to_date) == ([GENOME], [])
-
-
-def test_plan_dispatches_a_genome_with_an_unmaterialized_sample(tmp_path: Path) -> None:
-    """A newly imported eligible sample must bring its genome back into the plan."""
-    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
-    db_file = _make_database(tmp_path, name="behind", mode="allele-mask", cache_dir=cache_dir)
-    matrix_dir = tmp_path / "matrices"
-    matrix_dir.mkdir()
-    _build_matrix(
-        db_file, matrix_dir / "GCF_000001.1.h5", bed_file=bed_file, stb_file=stb_file,
-        gene_ranges=gene_ranges, sparse=False,
-    )
-    with db.connect(db_file) as conn:
-        workflows.reconcile_matrix_registry(conn, matrix_dir=matrix_dir)
-        assert workflows.plan_matrix_sync_build(
-            conn, matrix_dir=matrix_dir, genomes=[GENOME], filters=db.MatrixFilters()
-        ) == ([], [GENOME])
-
-        # Simulate a sample that is eligible but absent from the matrix, exactly
-        # as a freshly imported sample looks to the planner.
-        conn.execute("DELETE FROM matrix_store_samples WHERE sample_id = ?", ["S3"])
-
-        pending, up_to_date = workflows.plan_matrix_sync_build(
-            conn, matrix_dir=matrix_dir, genomes=[GENOME], filters=db.MatrixFilters()
-        )
-        assert (pending, up_to_date) == ([GENOME], [])
-
-
-def test_plan_never_skips_a_matrix_left_mid_append(tmp_path: Path) -> None:
-    """An interrupted append leaves a real .h5; it must not be trusted."""
-    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
-    db_file = _make_database(tmp_path, name="midappend", mode="allele-mask", cache_dir=cache_dir)
-    matrix_dir = tmp_path / "matrices"
-    matrix_dir.mkdir()
-    matrix_file = matrix_dir / "GCF_000001.1.h5"
-    _build_matrix(
-        db_file, matrix_file, bed_file=bed_file, stb_file=stb_file,
-        gene_ranges=gene_ranges, sparse=False,
-    )
-    with db.connect(db_file) as conn:
-        workflows.reconcile_matrix_registry(conn, matrix_dir=matrix_dir)
-    with h5py.File(matrix_file, "r+") as handle:
-        handle.attrs[matrix_hdf5.MATRIX_BUILD_STATE_ATTR] = matrix_hdf5.MATRIX_BUILD_STATE_APPENDING
-    with db.connect(db_file) as conn:
-        pending, up_to_date = workflows.plan_matrix_sync_build(
-            conn, matrix_dir=matrix_dir, genomes=[GENOME], filters=db.MatrixFilters()
-        )
-        assert (pending, up_to_date) == ([GENOME], [])
-        # ...and reconcile must not register an in-progress file either.
         conn.execute("DELETE FROM matrix_stores")
-        assert workflows.reconcile_matrix_registry(conn, matrix_dir=matrix_dir) == 0
+        plan = workflows.plan_matrix_sync_build(
+            conn,
+            matrix_dir=matrix_dir,
+            genomes=[GENOME],
+            filters=db.MatrixFilters(),
+        )
+    assert plan.pending == []
+    assert plan.up_to_date == (GENOME,)
+
+
+def test_plan_marks_a_stats_eligible_sample_missing_from_hdf_as_behind(tmp_path: Path) -> None:
+    """Eligibility comes from stats; membership comes only from the HDF sample axis."""
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="plan-behind", mode="allele-mask", cache_dir=cache_dir)
+    matrix_dir = tmp_path / "matrices"
+    matrix_dir.mkdir()
+    matrix_file = matrix_dir / f"{GENOME}.h5"
+    with db.connect(db_file) as conn:
+        matrix_hdf5.build_matrix_hdf5_from_duckdb(
+            conn,
+            sample_ids=["S1", "S2"],
+            output_file=matrix_file,
+            genome=GENOME,
+            bed_file=bed_file,
+            stb_file=stb_file,
+            gene_range_table=gene_ranges,
+            min_cov=5,
+        )
+        plan = workflows.plan_matrix_sync_build(
+            conn,
+            matrix_dir=matrix_dir,
+            genomes=[GENOME],
+            filters=db.MatrixFilters(),
+        )
+    assert plan.behind == (GENOME,)
+    assert plan.pending == [GENOME]
+
+
+def test_plan_does_not_scan_profiles_to_validate_eligible_samples(tmp_path: Path) -> None:
+    """Missing profile rows are represented by zeros rather than a terabyte-table scan."""
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="plan-no-profile-scan", mode="full", cache_dir=cache_dir)
+    matrix_dir = tmp_path / "matrices"
+    matrix_dir.mkdir()
+    matrix_file = matrix_dir / f"{GENOME}.h5"
+    with db.connect(db_file) as conn:
+        matrix_hdf5.build_matrix_hdf5_from_duckdb(
+            conn,
+            sample_ids=["S1", "S2"],
+            output_file=matrix_file,
+            genome=GENOME,
+            bed_file=bed_file,
+            stb_file=stb_file,
+            gene_range_table=gene_ranges,
+            min_cov=5,
+        )
+        conn.execute("DELETE FROM profile_positions WHERE sample_id = 'S3'")
+        plan = workflows.plan_matrix_sync_build(
+            conn,
+            matrix_dir=matrix_dir,
+            genomes=[GENOME],
+            filters=db.MatrixFilters(),
+        )
+    assert plan.behind == (GENOME,)
+
+
+def test_plan_skips_genomes_without_stats_eligible_samples(tmp_path: Path) -> None:
+    cache_dir, _bed_file, _stb_file, _gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="plan-filtered", mode="allele-mask", cache_dir=cache_dir)
+    with db.connect(db_file) as conn:
+        plan = workflows.plan_matrix_sync_build(
+            conn,
+            matrix_dir=tmp_path / "matrices",
+            genomes=[GENOME],
+            filters=db.MatrixFilters(min_coverage=100.0),
+        )
+    assert plan.skipped == (GENOME,)
+    assert plan.pending == []
+
+
+def test_plan_marks_an_eligible_genome_without_a_file_as_missing(tmp_path: Path) -> None:
+    cache_dir, _bed_file, _stb_file, _gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="plan-missing", mode="allele-mask", cache_dir=cache_dir)
+    with db.connect(db_file) as conn:
+        plan = workflows.plan_matrix_sync_build(
+            conn,
+            matrix_dir=tmp_path / "matrices",
+            genomes=[GENOME],
+            filters=db.MatrixFilters(),
+        )
+    assert plan.missing == (GENOME,)
+    assert plan.pending == [GENOME]
+
+
+def _strip_checkpoint_attrs(matrix_file: Path) -> None:
+    with h5py.File(matrix_file, "r+") as handle:
+        del handle.attrs[matrix_hdf5.MATRIX_BUILD_STATE_ATTR]
+        del handle.attrs[matrix_hdf5.MATRIX_COMMITTED_SAMPLE_COUNT_ATTR]
+        del handle.attrs[matrix_hdf5.MATRIX_REQUIRED_SAMPLE_COUNT_ATTR]
+        del handle.attrs[matrix_hdf5.MATRIX_REQUIRED_SAMPLE_DIGEST_ATTR]
+        del handle["samples"][matrix_hdf5.MATRIX_REQUIRED_SAMPLE_DATASET]
+
+
+def test_plan_accepts_and_upgrades_legacy_hdf_checkpoint_metadata(tmp_path: Path) -> None:
+    """Old matrices remain usable and pay the full sample-list read only once."""
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="plan-legacy", mode="allele-mask", cache_dir=cache_dir)
+    matrix_dir = tmp_path / "matrices"
+    matrix_dir.mkdir()
+    matrix_file = matrix_dir / f"{GENOME}.h5"
+    _build_matrix(
+        db_file,
+        matrix_file,
+        bed_file=bed_file,
+        stb_file=stb_file,
+        gene_ranges=gene_ranges,
+        sparse=False,
+    )
+    _strip_checkpoint_attrs(matrix_file)
+
+    with db.connect(db_file) as conn:
+        plan = workflows.plan_matrix_sync_build(
+            conn,
+            matrix_dir=matrix_dir,
+            genomes=[GENOME],
+            filters=db.MatrixFilters(),
+        )
+    assert plan.up_to_date == (GENOME,)
+    with h5py.File(matrix_file, "r") as handle:
+        assert handle.attrs[matrix_hdf5.MATRIX_BUILD_STATE_ATTR] == "complete"
+        assert handle.attrs[matrix_hdf5.MATRIX_COMMITTED_SAMPLE_COUNT_ATTR] == len(SAMPLES)
+        assert handle.attrs[matrix_hdf5.MATRIX_REQUIRED_SAMPLE_COUNT_ATTR] == len(SAMPLES)
+        assert handle.attrs[matrix_hdf5.MATRIX_REQUIRED_SAMPLE_DIGEST_ATTR] == matrix_hdf5.sample_id_set_digest(
+            list(SAMPLES)
+        )
+        assert handle["samples"][matrix_hdf5.MATRIX_REQUIRED_SAMPLE_DATASET].asstr()[...].tolist() == sorted(SAMPLES)
+
+
+def test_eligibility_summary_digest_matches_hdf_required_sample_digest(tmp_path: Path) -> None:
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="summary-digest", mode="allele-mask", cache_dir=cache_dir)
+    matrix_file = tmp_path / f"{GENOME}.h5"
+    _build_matrix(
+        db_file,
+        matrix_file,
+        bed_file=bed_file,
+        stb_file=stb_file,
+        gene_ranges=gene_ranges,
+        sparse=True,
+    )
+
+    with db.connect(db_file) as conn:
+        summaries = db.eligible_genome_summaries(
+            conn,
+            genomes=[GENOME],
+            filters=db.MatrixFilters(),
+        )
+    assert len(summaries) == 1
+    with h5py.File(matrix_file, "r") as handle:
+        assert summaries[0].sample_count == handle.attrs[matrix_hdf5.MATRIX_REQUIRED_SAMPLE_COUNT_ATTR]
+        assert summaries[0].sample_digest == handle.attrs[matrix_hdf5.MATRIX_REQUIRED_SAMPLE_DIGEST_ATTR]
+
+
+def test_append_rejects_filters_that_remove_committed_matrix_samples(tmp_path: Path) -> None:
+    cache_dir, bed_file, stb_file, gene_ranges = _project_files(tmp_path)
+    db_file = _make_database(tmp_path, name="removed-required", mode="allele-mask", cache_dir=cache_dir)
+    matrix_file = tmp_path / f"{GENOME}.h5"
+    _build_matrix(
+        db_file,
+        matrix_file,
+        bed_file=bed_file,
+        stb_file=stb_file,
+        gene_ranges=gene_ranges,
+        sparse=True,
+    )
+
+    with db.connect(db_file) as conn:
+        with pytest.raises(ValueError, match="filters remove samples already stored"):
+            workflows.append_matrix_from_database(
+                conn,
+                matrix_file=matrix_file,
+                filters=db.MatrixFilters(min_coverage=1000),
+                register=False,
+            )

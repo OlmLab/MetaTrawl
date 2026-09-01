@@ -2569,7 +2569,7 @@ def test_matrix_sync_build_dispatches_one_job_per_genome_with_workflow_config(tm
     assert result.exit_code == 0, result.output
     assert [stage for stage, _, _ in commands] == ["matrix_build", "matrix_build"]
     first_command = commands[0][1]
-    assert first_command[first_command.index("--memory-limit-gb") + 1] == "32.0"
+    assert first_command[first_command.index("--memory-limit-gb") + 1] == "32.0"  # local: 64 GB split across 2 workers
     assert first_command[first_command.index("--export-batch-mb") + 1] == "512.0"
     assert first_command[first_command.index("--duckdb-export-threads") + 1] == "3"
     command_by_sample = {sample: command for _, command, sample in commands}
@@ -2580,6 +2580,95 @@ def test_matrix_sync_build_dispatches_one_job_per_genome_with_workflow_config(tm
     assert "--no-register" in command_by_sample["genome_a"]
     assert "--sparse" in command_by_sample["genome_b"]
     assert "built=2" in result.output
+
+
+def test_matrix_sync_build_checks_genomes_lazily_while_workers_run(tmp_path: Path, monkeypatch) -> None:
+    db_file = tmp_path / "project.duckdb"
+    with registry.connect(db_file):
+        pass
+    summaries = [
+        registry.GenomeEligibilitySummary(
+            genome=f"genome_{index}",
+            sample_count=1,
+            sample_digest=f"digest-{index}",
+        )
+        for index in range(6)
+    ]
+    config = WorkflowConfig.legacy(threads=2, sample_count=6)
+    config = replace(
+        config,
+        stages={
+            **config.stages,
+            "matrix_build": replace(config.stage("matrix_build"), workers=2, threads=1),
+        },
+    )
+    checked: list[str] = []
+    checked_when_first_job_started: list[int] = []
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def classify(summary, *, matrix_dir):
+        checked.append(summary.genome)
+        return workflows.MatrixBuildDecision(
+            genome=summary.genome,
+            matrix_file=Path(matrix_dir) / f"{summary.genome}.h5",
+            status="missing",
+            expected_count=summary.sample_count,
+            expected_digest=summary.sample_digest,
+        )
+
+    class FakeRuntime:
+        def __init__(self, config, *, state_dir, logger, runner=None):
+            pass
+
+        def run(self, stage, command, *, sample, stdout_file=None):
+            nonlocal active, max_active
+            with lock:
+                if not checked_when_first_job_started:
+                    checked_when_first_job_started.append(len(checked))
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.02)
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(cli, "WorkflowRuntime", FakeRuntime)
+    monkeypatch.setattr(workflows, "classify_matrix_sync_build", classify)
+    summary_by_genome = {summary.genome: summary for summary in summaries}
+    monkeypatch.setattr(
+        cli.registry,
+        "eligible_genome_summaries",
+        lambda conn, *, genomes, filters: [summary_by_genome[genome] for genome in genomes],
+    )
+
+    summary = cli._dispatch_matrix_sync_build_jobs(
+        db_file=db_file,
+        matrix_dir=tmp_path / "matrices",
+        genomes=[item.genome for item in summaries],
+        skipped=0,
+        bed_file=None,
+        stb_file=None,
+        bed_dir=None,
+        stb_dir=None,
+        gene_range_table=None,
+        gene_range_dir=None,
+        filters=registry.MatrixFilters(),
+        sparse=True,
+        storage_mode="bitmask",
+        count_dtype=None,
+        min_cov=5,
+        memory_limit_gb=16,
+        export_batch_mb=128,
+        duckdb_export_threads=1,
+        execution_config=config,
+        logger=WorkflowLogger(),
+    )
+
+    assert checked_when_first_job_started == [2]
+    assert sorted(checked) == [item.genome for item in summaries]
+    assert max_active == 2
+    assert summary.built == len(summaries)
 
 
 def test_matrix_sync_build_reports_existing_matrix_without_new_samples_as_up_to_date(tmp_path: Path, monkeypatch) -> None:

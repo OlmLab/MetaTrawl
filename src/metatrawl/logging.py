@@ -53,11 +53,18 @@ class ThrottledMatrixLogger:
             if phase == "start":
                 self.logged_advance = False
                 self.last_processing_detail = None
-            self._emit(f"{phase.upper()}", event, completed=completed, total=total)
+            detail = event.get("detail") if phase == "checkpoint" else None
+            self._emit(
+                f"{phase.upper()}",
+                event,
+                completed=completed,
+                total=total,
+                detail=detail,
+            )
             return
 
         if phase == "processing":
-            detail = event.get("detail")
+            detail = event.get("detail") or event.get("sample_name")
             if detail is None:
                 return
             detail_str = str(detail)

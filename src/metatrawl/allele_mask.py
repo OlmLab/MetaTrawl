@@ -33,6 +33,7 @@ REFERENCE_CACHE_MAX_BASES = 512_000_000
 # an Arrow-backed INSERT ... SELECT costs ~13us per row.
 BLOCK_FLUSH_MAX_ROWS = 2_048
 BLOCK_FLUSH_MAX_BYTES = 256 * 1024**2
+PROFILE_BLOCK_FETCH_ROWS = 256
 
 _COMPRESSOR = zstd.ZstdCompressor(level=6, write_checksum=True)
 _DECOMPRESSOR = zstd.ZstdDecompressor()
@@ -69,6 +70,16 @@ class DecodedProfileBlock:
 
     chrom: str
     start_pos: int
+    masks: np.ndarray
+
+
+@dataclass(frozen=True)
+class DecodedSparseProfileBlock:
+    """Covered local coordinates and allele masks for one sample/scaffold."""
+
+    chrom: str
+    start_pos: int
+    positions: np.ndarray
     masks: np.ndarray
 
 
@@ -415,26 +426,111 @@ def fetch_profile_block_rows(
 ) -> dict[str, list[tuple]]:
     """Fetch raw block rows for several samples with one query.
 
-    Matrix builds otherwise issue one query per sample per genome, which costs
-    ~3.2 ms of dispatch per sample against a warm table versus ~0.15 ms when a
-    window of samples is read together. Rows stay compressed until decoded.
+    Matrix builds otherwise issue one query per sample per genome. Scalar range
+    bounds let DuckDB prune the huge profile-block table before applying the
+    exact list filters; rows stay compressed until decoded.
     """
-    grouped: dict[str, list[tuple]] = {sample_id: [] for sample_id in sample_ids}
-    if not sample_ids or not segment_ids:
-        return grouped
-    rows = conn.execute(
+    return {
+        sample_id: rows
+        for sample_id, rows in iter_profile_block_rows(
+            conn,
+            sample_ids=sample_ids,
+            segment_ids=segment_ids,
+        )
+    }
+
+
+def iter_profile_block_rows(
+    conn,
+    *,
+    sample_ids: list[str],
+    segment_ids: list[int],
+    fetch_rows: int = PROFILE_BLOCK_FETCH_ROWS,
+    metrics: dict[str, float | int] | None = None,
+) -> Iterator[tuple[str, list[tuple]]]:
+    """Stream compressed profile blocks in requested sample order.
+
+    DuckDB may still materialize the ordered query internally, but ``fetchmany``
+    prevents the complete BLOB result from also being retained in Python. Samples
+    without blocks are yielded with an empty list so matrix rows remain aligned.
+    """
+    import time
+
+    if fetch_rows < 1:
+        raise ValueError("fetch_rows must be >= 1")
+    requested = sorted(sample_ids)
+    if not requested or not segment_ids:
+        for sample_id in requested:
+            yield sample_id, []
+        return
+    if len(set(requested)) != len(requested):
+        raise ValueError("Streaming profile block sample IDs must be unique.")
+
+    query_started = time.perf_counter()
+    result = conn.execute(
         """
         SELECT sample_id, segment_id, presence, deviation, covered_positions, payload_hash
         FROM allele_mask_profile_blocks
-        WHERE sample_id IN (SELECT unnest(?))
+        WHERE sample_id BETWEEN ? AND ?
+          AND segment_id BETWEEN ? AND ?
+          AND sample_id IN (SELECT unnest(?))
           AND segment_id IN (SELECT unnest(?))
         ORDER BY sample_id, segment_id
         """,
-        [list(sample_ids), list(segment_ids)],
-    ).fetchall()
-    for row in rows:
-        grouped.setdefault(str(row[0]), []).append(tuple(row[1:]))
-    return grouped
+        [
+            min(sample_ids),
+            max(sample_ids),
+            min(segment_ids),
+            max(segment_ids),
+            list(sample_ids),
+            list(segment_ids),
+        ],
+    )
+    if metrics is not None:
+        metrics["query_seconds"] = float(metrics.get("query_seconds", 0.0)) + (
+            time.perf_counter() - query_started
+        )
+
+    requested_index = 0
+    current_sample: str | None = None
+    current_rows: list[tuple] = []
+    while True:
+        fetch_started = time.perf_counter()
+        rows = result.fetchmany(fetch_rows)
+        if metrics is not None:
+            metrics["fetch_seconds"] = float(metrics.get("fetch_seconds", 0.0)) + (
+                time.perf_counter() - fetch_started
+            )
+            metrics["fetched_rows"] = int(metrics.get("fetched_rows", 0)) + len(rows)
+        if not rows:
+            break
+        for row in rows:
+            sample_id = str(row[0])
+            if current_sample is None:
+                current_sample = sample_id
+            elif sample_id != current_sample:
+                while requested_index < len(requested) and requested[requested_index] < current_sample:
+                    yield requested[requested_index], []
+                    requested_index += 1
+                if requested_index >= len(requested) or requested[requested_index] != current_sample:
+                    raise ValueError(f"DuckDB returned an unexpected profile sample: {current_sample}")
+                yield current_sample, current_rows
+                requested_index += 1
+                current_sample = sample_id
+                current_rows = []
+            current_rows.append(tuple(row[1:]))
+
+    if current_sample is not None:
+        while requested_index < len(requested) and requested[requested_index] < current_sample:
+            yield requested[requested_index], []
+            requested_index += 1
+        if requested_index >= len(requested) or requested[requested_index] != current_sample:
+            raise ValueError(f"DuckDB returned an unexpected profile sample: {current_sample}")
+        yield current_sample, current_rows
+        requested_index += 1
+    while requested_index < len(requested):
+        yield requested[requested_index], []
+        requested_index += 1
 
 
 def iter_decoded_profile_blocks(
@@ -482,40 +578,111 @@ def iter_decoded_profile_blocks(
             raise ValueError(
                 f"Allele-mask profile {sample_id} references an unknown segment: {segment_id}."
             )
+        positions, values = _decode_sparse_profile_row(
+            sample_id=sample_id,
+            genome=genome,
+            reference_segment=reference_segment,
+            presence_blob=presence_blob,
+            deviation_blob=deviation_blob,
+            covered_positions=covered_positions,
+            payload_hash=payload_hash,
+        )
         span = int(reference_segment.span)
-        reference = reference_segment.masks
-        presence_packed = _decompress(
-            presence_blob,
-            expected_size=(span + 7) // 8,
-        )
-        deviation_packed = _decompress(
-            deviation_blob,
-            expected_size=(span + 1) // 2,
-        )
-        if sha256(presence_packed + deviation_packed).hexdigest() != str(payload_hash):
-            raise ValueError(
-                f"Allele-mask payload checksum mismatch for "
-                f"{sample_id}/{genome}/{reference_segment.chrom}."
-            )
-        presence = unpack_presence(presence_packed, span)
-        if int(presence.sum()) != int(covered_positions):
-            raise ValueError(
-                f"Allele-mask covered-position count mismatch for "
-                f"{sample_id}/{genome}/{reference_segment.chrom}."
-            )
-        deviation = unpack_nibbles(deviation_packed, span)
         masks = np.zeros(span, dtype=np.uint8)
-        masks[presence] = reference[presence] ^ deviation[presence]
-        if np.any(masks[presence] == 0):
-            raise ValueError(
-                f"Allele-mask payload decoded an empty covered allele set for "
-                f"{sample_id}/{genome}/{reference_segment.chrom}."
-            )
+        masks[positions] = values
         yield DecodedProfileBlock(
             chrom=reference_segment.chrom,
             start_pos=reference_segment.start_pos,
             masks=masks,
         )
+
+
+def iter_decoded_sparse_profile_blocks(
+    conn,
+    *,
+    sample_id: str,
+    genome: str,
+    reference_cache: dict[str, dict[int, ReferenceSegment]] | None = None,
+    block_rows: list[tuple] | None = None,
+) -> Iterator[DecodedSparseProfileBlock]:
+    """Yield verified covered coordinates without allocating dense scaffold masks."""
+    genome_references = (
+        reference_cache.get(genome) if reference_cache is not None else None
+    )
+    if genome_references is None:
+        genome_references = _load_reference_segments(conn, genome=genome)
+        if reference_cache is not None:
+            reference_cache[genome] = genome_references
+    if not genome_references:
+        return
+
+    rows = block_rows if block_rows is not None else conn.execute(
+        """
+        SELECT segment_id, presence, deviation, covered_positions, payload_hash
+        FROM allele_mask_profile_blocks
+        WHERE sample_id = ?
+          AND segment_id IN (SELECT unnest(?))
+        ORDER BY segment_id
+        """,
+        [sample_id, list(genome_references)],
+    ).fetchall()
+    for segment_id, presence_blob, deviation_blob, covered_positions, payload_hash in rows:
+        reference_segment = genome_references.get(int(segment_id))
+        if reference_segment is None:
+            raise ValueError(
+                f"Allele-mask profile {sample_id} references an unknown segment: {segment_id}."
+            )
+        positions, values = _decode_sparse_profile_row(
+            sample_id=sample_id,
+            genome=genome,
+            reference_segment=reference_segment,
+            presence_blob=presence_blob,
+            deviation_blob=deviation_blob,
+            covered_positions=covered_positions,
+            payload_hash=payload_hash,
+        )
+        yield DecodedSparseProfileBlock(
+            chrom=reference_segment.chrom,
+            start_pos=reference_segment.start_pos,
+            positions=positions,
+            masks=values,
+        )
+
+
+def _decode_sparse_profile_row(
+    *,
+    sample_id: str,
+    genome: str,
+    reference_segment: ReferenceSegment,
+    presence_blob,
+    deviation_blob,
+    covered_positions: int,
+    payload_hash: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Decode one compressed row directly into covered coordinates and values."""
+    span = int(reference_segment.span)
+    presence_packed = _decompress(presence_blob, expected_size=(span + 7) // 8)
+    deviation_packed = _decompress(deviation_blob, expected_size=(span + 1) // 2)
+    if sha256(presence_packed + deviation_packed).hexdigest() != str(payload_hash):
+        raise ValueError(
+            f"Allele-mask payload checksum mismatch for "
+            f"{sample_id}/{genome}/{reference_segment.chrom}."
+        )
+    presence = unpack_presence(presence_packed, span)
+    positions = np.flatnonzero(presence).astype(np.int64, copy=False)
+    if positions.size != int(covered_positions):
+        raise ValueError(
+            f"Allele-mask covered-position count mismatch for "
+            f"{sample_id}/{genome}/{reference_segment.chrom}."
+        )
+    deviation = unpack_nibbles_at_positions(deviation_packed, positions)
+    values = reference_segment.masks[positions] ^ deviation
+    if np.any(values == 0):
+        raise ValueError(
+            f"Allele-mask payload decoded an empty covered allele set for "
+            f"{sample_id}/{genome}/{reference_segment.chrom}."
+        )
+    return positions, values.astype(np.uint8, copy=False)
 
 
 def _load_reference_segments(conn, *, genome: str) -> dict[int, ReferenceSegment]:
@@ -592,6 +759,22 @@ def unpack_nibbles(payload: bytes, length: int) -> np.ndarray:
     values[0::2] = packed & 0x0F
     values[1::2] = packed >> 4
     return values[:length]
+
+
+def unpack_nibbles_at_positions(payload: bytes, positions: np.ndarray) -> np.ndarray:
+    """Decode four-bit masks only at selected zero-based positions."""
+    selected = np.asarray(positions, dtype=np.int64)
+    if selected.size == 0:
+        return np.empty(0, dtype=np.uint8)
+    packed = np.frombuffer(payload, dtype=np.uint8)
+    byte_indices = selected >> 1
+    if int(selected.min()) < 0 or int(byte_indices.max()) >= packed.size:
+        raise ValueError("Nibble positions fall outside the packed payload.")
+    encoded = packed[byte_indices]
+    return np.where((selected & 1) == 0, encoded & 0x0F, encoded >> 4).astype(
+        np.uint8,
+        copy=False,
+    )
 
 
 def _group_codes(batch: pa.RecordBatch, name: str) -> tuple[np.ndarray, list[str]]:

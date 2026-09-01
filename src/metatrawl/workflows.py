@@ -292,6 +292,28 @@ class MatrixFileContext:
 
 
 @dataclass(frozen=True)
+class MatrixFileBuildStatus:
+    """Compact resumable-build state read without touching matrix values."""
+
+    state: str
+    committed_count: int
+    required_count: int
+    required_digest: str
+    legacy_required_catalog: bool
+
+
+@dataclass(frozen=True)
+class MatrixBuildDecision:
+    """One genome's action after comparing stats and HDF5 checkpoints."""
+
+    genome: str
+    matrix_file: Path
+    status: str
+    expected_count: int
+    expected_digest: str
+
+
+@dataclass(frozen=True)
 class MatrixSyncBuildSummary:
     """Result from converging all per-genome matrix files."""
 
@@ -399,6 +421,7 @@ def append_matrix_from_database(
     memory_limit_gb: float = 16.0,
     export_batch_mb: float = 128.0,
     duckdb_export_threads: int = 1,
+    filters: db.MatrixFilters | None = None,
     register: bool = True,
     logger: WorkflowLogger | None = None,
 ) -> int:
@@ -407,28 +430,37 @@ def append_matrix_from_database(
     context = read_matrix_file_context(matrix_file)
     matrix_label = matrix_id or str(context.matrix_file)
     existing_sample_ids = set(context.sample_ids)
-    sample_ids = (
-        [
-            sample_id
-            for sample_id in db.completed_sample_ids(conn)
-            if sample_id not in existing_sample_ids
-        ]
+    active_filters = filters or context.filters
+    required_sample_ids = (
+        db.completed_sample_ids(conn)
         if context.genome == "all"
-        else db.eligible_unmaterialized_sample_ids(
+        else db.eligible_sample_ids(
             conn,
-            matrix_id=None,
-            existing_sample_ids=list(context.sample_ids),
             genome=context.genome,
-            filters=context.filters,
+            filters=active_filters,
         )
     )
-    if not sample_ids:
-        raise ValueError(f"No new complete samples are available to append to matrix: {context.matrix_file}")
+    removed_sample_ids = sorted(existing_sample_ids - set(required_sample_ids))
+    if removed_sample_ids:
+        raise ValueError(
+            "The current matrix filters remove samples already stored in the matrix; "
+            f"rebuild {context.matrix_file}. Removed samples include: "
+            + ", ".join(removed_sample_ids[:20])
+            + (" ..." if len(removed_sample_ids) > 20 else "")
+        )
+    sample_ids = [sample_id for sample_id in required_sample_ids if sample_id not in existing_sample_ids]
 
-    logger.emit(step="matrix-append", status="appending", matrix=matrix_label, samples=len(sample_ids))
+    logger.emit(
+        step="matrix-append",
+        status="appending",
+        matrix=matrix_label,
+        samples=len(sample_ids),
+        required=len(required_sample_ids),
+    )
     matrix_hdf5.append_matrix_hdf5_from_duckdb(
         conn,
         sample_ids=sample_ids,
+        required_sample_ids=required_sample_ids,
         matrix_hdf5_file=context.matrix_file,
         memory_limit_gb=memory_limit_gb,
         export_batch_mb=export_batch_mb,
@@ -436,9 +468,11 @@ def append_matrix_from_database(
         progress_callback=ThrottledMatrixLogger("MATRIX-APPEND"),
     )
     exported_sample_ids = sample_ids
-    if register and matrix_id is not None and db.get_matrix_store(conn, matrix_id) is not None:
+    if exported_sample_ids and register and matrix_id is not None and db.get_matrix_store(conn, matrix_id) is not None:
         db.add_matrix_store_samples(conn, matrix_id=matrix_id, sample_ids=exported_sample_ids)
         db.update_matrix_profile_count(conn, matrix_id=matrix_id)
+    if filters is not None:
+        _write_matrix_hdf5_metatrawl_metadata(context.matrix_file, filters=active_filters)
     logger.emit(step="matrix-append", status="done", matrix=matrix_label, samples=len(exported_sample_ids))
     return len(exported_sample_ids)
 
@@ -475,21 +509,20 @@ def sync_build_matrices(
 
     candidate_count = len(selected_genomes)
     built = appended = up_to_date = skipped = failed = 0
-    if register:
-        # Only a registering run holds a read-write connection, which is what
-        # reconciling needs. Planning then lets an unchanged genome skip opening
-        # its matrix and decoding the whole sample list just to learn it is current.
-        reconcile_matrix_registry(conn, matrix_dir=matrix_dir, logger=logger)
-        selected_genomes, planned_up_to_date = plan_matrix_sync_build(
-            conn,
-            matrix_dir=matrix_dir,
-            genomes=selected_genomes,
-            filters=filters,
-            logger=logger,
-        )
-        up_to_date += len(planned_up_to_date)
-        for genome in planned_up_to_date:
-            logger.emit(step="matrix-sync-build", status="up-to-date", genome=genome, source="registry")
+    plan = plan_matrix_sync_build(
+        conn,
+        matrix_dir=matrix_dir,
+        genomes=selected_genomes,
+        filters=filters,
+        logger=logger,
+    )
+    selected_genomes = plan.pending
+    up_to_date = len(plan.up_to_date)
+    skipped = len(plan.skipped)
+    for genome in plan.up_to_date:
+        logger.emit(step="matrix-sync-build", status="up-to-date", genome=genome, source="hdf5")
+    for genome in plan.skipped:
+        logger.emit(step="matrix-sync-build", status="skipped", genome=genome, error="no eligible samples")
     for genome in selected_genomes:
         matrix_file = matrix_file_for_genome(matrix_dir, genome)
         logger.emit(step="matrix-sync-build", status="genome-start", genome=genome, matrix=matrix_file)
@@ -502,6 +535,7 @@ def sync_build_matrices(
                         memory_limit_gb=memory_limit_gb,
                         export_batch_mb=export_batch_mb,
                         duckdb_export_threads=duckdb_export_threads,
+                        filters=filters,
                         register=register,
                         logger=logger,
                     )
@@ -509,7 +543,12 @@ def sync_build_matrices(
                     if "No new complete samples" not in str(exc):
                         raise
                     up_to_date += 1
-                    logger.emit(step="matrix-sync-build", status="up-to-date", genome=genome, matrix=matrix_file)
+                    logger.emit(
+                        step="matrix-sync-build",
+                        status="up-to-date",
+                        genome=genome,
+                        matrix=matrix_file,
+                    )
                 else:
                     appended += 1
                     logger.emit(
@@ -836,7 +875,19 @@ def read_matrix_file_context(matrix_file: Path) -> MatrixFileContext:
         if "samples" not in handle or "sample_name" not in handle["samples"]:
             sample_ids: tuple[str, ...] = ()
         else:
-            sample_ids = tuple(_decode_hdf5_value(value) for value in handle["samples"]["sample_name"][()])
+            sample_dataset = handle["samples"]["sample_name"]
+            committed_count = int(
+                handle.attrs.get(
+                    matrix_hdf5.MATRIX_COMMITTED_SAMPLE_COUNT_ATTR,
+                    sample_dataset.shape[0],
+                )
+            )
+            if committed_count < 0 or committed_count > int(sample_dataset.shape[0]):
+                raise ValueError(f"Matrix store has an invalid committed sample count: {path}")
+            sample_ids = tuple(
+                _decode_hdf5_value(value)
+                for value in sample_dataset[:committed_count]
+            )
         filters = db.MatrixFilters(
             min_coverage=_optional_float_metadata(metadata, "metatrawl_min_coverage"),
             min_breadth=_optional_float_metadata(metadata, "metatrawl_min_breadth"),
@@ -852,88 +903,19 @@ def read_matrix_file_context(matrix_file: Path) -> MatrixFileContext:
     )
 
 
-def read_matrix_file_state(matrix_file: Path) -> tuple[str, int]:
-    """Read only the build state and committed sample count from a matrix store.
+@dataclass(frozen=True)
+class MatrixBuildPlan:
+    """Genome work derived only from filtered stats and HDF5 membership."""
 
-    These live in root attributes, so this costs one open and no dataset decode —
-    cheap enough to check every matrix before deciding whether to launch a job.
-    """
-    h5py = _import_h5py()
-    with h5py.File(str(Path(matrix_file).expanduser().resolve()), "r") as handle:
-        if (
-            matrix_hdf5.MATRIX_BUILD_STATE_ATTR not in handle.attrs
-            or matrix_hdf5.MATRIX_COMMITTED_SAMPLE_COUNT_ATTR not in handle.attrs
-        ):
-            raise ValueError(f"Matrix store predates resumable builds: {matrix_file}")
-        return (
-            str(handle.attrs[matrix_hdf5.MATRIX_BUILD_STATE_ATTR]),
-            int(handle.attrs[matrix_hdf5.MATRIX_COMMITTED_SAMPLE_COUNT_ATTR]),
-        )
+    missing: tuple[str, ...]
+    behind: tuple[str, ...]
+    up_to_date: tuple[str, ...]
+    skipped: tuple[str, ...]
 
-
-def register_matrix_file(conn, *, matrix_file: Path, logger: WorkflowLogger | None = None) -> bool:
-    """Record one finished matrix store in the registry, reading it from the file.
-
-    The HDF5 file carries every registered field, including the filters written
-    by ``_write_matrix_hdf5_metatrawl_metadata``, so this needs no rebuild.
-    """
-    logger = logger or WorkflowLogger()
-    matrix_file = Path(matrix_file)
-    state, _committed = read_matrix_file_state(matrix_file)
-    if state != matrix_hdf5.MATRIX_BUILD_STATE_COMPLETE:
-        logger.emit(step="matrix-registry", status="skipped-incomplete", matrix=matrix_file, state=state)
-        return False
-    context = read_matrix_file_context(matrix_file)
-    db.register_matrix_store(
-        conn,
-        matrix_id=matrix_file.stem,
-        genome=context.genome,
-        matrix_file=matrix_file,
-        profile_count=len(context.sample_ids),
-        storage_layout=context.storage_layout,
-        sample_ids=list(context.sample_ids),
-        filters=context.filters,
-        overwrite=True,
-    )
-    return True
-
-
-def reconcile_matrix_registry(
-    conn,
-    *,
-    matrix_dir: Path,
-    logger: WorkflowLogger | None = None,
-) -> int:
-    """Re-register matrix stores whose registry rows are missing or stale.
-
-    Dispatched builds run read-only and so cannot register themselves. Rebuilding
-    the rows from the files keeps the registry usable as a dispatch plan without
-    touching any sample data, and costs one attribute read per matrix that
-    already agrees.
-    """
-    logger = logger or WorkflowLogger()
-    matrix_dir = Path(matrix_dir)
-    if not matrix_dir.is_dir():
-        return 0
-    reconciled = 0
-    for matrix_file in discover_matrix_files(matrix_dir):
-        try:
-            state, committed = read_matrix_file_state(matrix_file)
-        except (OSError, ValueError) as exc:
-            logger.emit(step="matrix-registry", status="unreadable", matrix=matrix_file, error=exc)
-            continue
-        if state != matrix_hdf5.MATRIX_BUILD_STATE_COMPLETE:
-            logger.emit(step="matrix-registry", status="in-progress", matrix=matrix_file, state=state)
-            continue
-        store = db.get_matrix_store(conn, matrix_file.stem)
-        if store is not None and int(store.profile_count) == committed:
-            continue
-        register_matrix_file(conn, matrix_file=matrix_file, logger=logger)
-        reconciled += 1
-        logger.emit(step="matrix-registry", status="reconciled", matrix=matrix_file, samples=committed)
-    if reconciled:
-        logger.emit(step="matrix-registry", status="done", reconciled=reconciled)
-    return reconciled
+    @property
+    def pending(self) -> list[str]:
+        """Genomes needing work, missing matrices first so they dispatch first."""
+        return [*self.missing, *self.behind]
 
 
 def plan_matrix_sync_build(
@@ -943,58 +925,147 @@ def plan_matrix_sync_build(
     genomes: list[str],
     filters: db.MatrixFilters,
     logger: WorkflowLogger | None = None,
-) -> tuple[list[str], list[str]]:
-    """Split candidate genomes into those needing work and those already current.
-
-    Returns ``(pending, up_to_date)``. A genome is only declared up to date when
-    the registry and the file agree on the committed sample count and the
-    registry shows no eligible sample missing from the matrix; anything the
-    registry cannot vouch for is dispatched, since the job re-checks the file
-    itself and a needless dispatch is merely wasted work.
-    """
+) -> MatrixBuildPlan:
+    """Plan builds from compact genome-stat summaries and HDF5 checkpoints."""
     logger = logger or WorkflowLogger()
     matrix_dir = Path(matrix_dir)
-    pending: list[str] = []
-    registry_backed: list[tuple[str, str]] = []
-    for genome in genomes:
-        matrix_file = matrix_file_for_genome(matrix_dir, genome)
-        if not matrix_file.exists():
-            pending.append(genome)
-            continue
-        try:
-            state, committed = read_matrix_file_state(matrix_file)
-        except (OSError, ValueError) as exc:
-            logger.emit(step="matrix-sync-build", status="plan-unreadable", genome=genome, error=exc)
-            pending.append(genome)
-            continue
-        if state != matrix_hdf5.MATRIX_BUILD_STATE_COMPLETE:
-            pending.append(genome)
-            continue
-        store = db.get_matrix_store(conn, matrix_file.stem)
-        if store is None or int(store.profile_count) != committed:
-            pending.append(genome)
-            continue
-        registry_backed.append((genome, matrix_file.stem))
-    if registry_backed:
-        behind = set(
-            db.genomes_with_unmaterialized_samples(
-                conn,
-                targets=registry_backed,
-                filters=filters,
+    missing: list[str] = []
+    behind: list[str] = []
+    up_to_date: list[str] = []
+    skipped: list[str] = []
+    logger.emit(step="matrix-sync-build", status="stats-start", genomes=len(genomes))
+    summaries = db.eligible_genome_summaries(conn, genomes=genomes, filters=filters)
+    logger.emit(step="matrix-sync-build", status="stats-done", genomes=len(summaries))
+    eligible_genomes = {summary.genome for summary in summaries}
+    skipped.extend(genome for genome in genomes if genome not in eligible_genomes)
+    for checked, summary in enumerate(summaries, start=1):
+        decision = classify_matrix_sync_build(summary, matrix_dir=matrix_dir)
+        if decision.status == "missing":
+            missing.append(summary.genome)
+        elif decision.status == "behind":
+            behind.append(summary.genome)
+        else:
+            up_to_date.append(summary.genome)
+        if checked % 100 == 0 or checked == len(summaries):
+            logger.emit(
+                step="matrix-sync-build",
+                status="checking",
+                checked=checked,
+                total=len(summaries),
             )
-        )
-        pending.extend(genome for genome, _matrix_id in registry_backed if genome in behind)
-    pending = _dedupe_preserving_order(pending)
-    pending_set = set(pending)
-    up_to_date = [genome for genome in genomes if genome not in pending_set]
     logger.emit(
         step="matrix-sync-build",
         status="planned",
         candidates=len(genomes),
-        pending=len(pending),
+        missing=len(missing),
+        behind=len(behind),
         up_to_date=len(up_to_date),
+        skipped=len(skipped),
     )
-    return pending, up_to_date
+    return MatrixBuildPlan(
+        missing=tuple(missing),
+        behind=tuple(behind),
+        up_to_date=tuple(up_to_date),
+        skipped=tuple(skipped),
+    )
+
+
+def read_matrix_file_build_status(matrix_file: Path, *, upgrade_legacy: bool = True) -> MatrixFileBuildStatus:
+    """Read compact completion metadata, upgrading older complete matrices once."""
+    path = Path(matrix_file).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Matrix store file does not exist: {path}")
+    h5py = _import_h5py()
+    mode = "r+" if upgrade_legacy else "r"
+    with h5py.File(str(path), mode) as handle:
+        if "samples" not in handle or "sample_name" not in handle["samples"]:
+            raise ValueError(f"Matrix store is missing its sample catalog: {path}")
+        sample_dataset = handle["samples"]["sample_name"]
+        sample_count = int(sample_dataset.shape[0])
+        has_state = matrix_hdf5.MATRIX_BUILD_STATE_ATTR in handle.attrs
+        has_committed = matrix_hdf5.MATRIX_COMMITTED_SAMPLE_COUNT_ATTR in handle.attrs
+        if has_state != has_committed:
+            raise ValueError(f"Matrix store has incomplete checkpoint metadata: {path}")
+        state = (
+            _decode_hdf5_value(handle.attrs[matrix_hdf5.MATRIX_BUILD_STATE_ATTR])
+            if has_state
+            else matrix_hdf5.MATRIX_BUILD_STATE_COMPLETE
+        )
+        committed_count = (
+            int(handle.attrs[matrix_hdf5.MATRIX_COMMITTED_SAMPLE_COUNT_ATTR])
+            if has_committed
+            else sample_count
+        )
+        if committed_count < 0 or committed_count > sample_count:
+            raise ValueError(f"Matrix store has an invalid committed sample count: {path}")
+        if state == matrix_hdf5.MATRIX_BUILD_STATE_COMPLETE and committed_count != sample_count:
+            raise ValueError(f"Completed matrix has uncommitted sample rows: {path}")
+
+        has_required_count = matrix_hdf5.MATRIX_REQUIRED_SAMPLE_COUNT_ATTR in handle.attrs
+        has_required_digest = matrix_hdf5.MATRIX_REQUIRED_SAMPLE_DIGEST_ATTR in handle.attrs
+        required_dataset = handle["samples"].get(matrix_hdf5.MATRIX_REQUIRED_SAMPLE_DATASET)
+        if has_required_count != has_required_digest or has_required_count != (required_dataset is not None):
+            raise ValueError(f"Matrix store has incomplete required-sample metadata: {path}")
+        legacy = not has_required_count
+        if legacy:
+            committed_names = [
+                _decode_hdf5_value(value)
+                for value in sample_dataset[:committed_count]
+            ]
+            required_count = committed_count
+            required_digest = matrix_hdf5.sample_id_set_digest(committed_names)
+            if upgrade_legacy:
+                matrix_hdf5.set_required_sample_catalog(handle, committed_names, h5py_module=h5py)
+                if not has_state:
+                    handle.attrs[matrix_hdf5.MATRIX_BUILD_STATE_ATTR] = state
+                    handle.attrs[matrix_hdf5.MATRIX_COMMITTED_SAMPLE_COUNT_ATTR] = committed_count
+                handle.flush()
+        else:
+            required_count = int(handle.attrs[matrix_hdf5.MATRIX_REQUIRED_SAMPLE_COUNT_ATTR])
+            required_digest = _decode_hdf5_value(
+                handle.attrs[matrix_hdf5.MATRIX_REQUIRED_SAMPLE_DIGEST_ATTR]
+            )
+            if required_count != int(required_dataset.shape[0]):
+                raise ValueError(f"Matrix required-sample count does not match its catalog: {path}")
+        return MatrixFileBuildStatus(
+            state=state,
+            committed_count=committed_count,
+            required_count=required_count,
+            required_digest=required_digest,
+            legacy_required_catalog=legacy,
+        )
+
+
+def classify_matrix_sync_build(
+    summary: db.GenomeEligibilitySummary,
+    *,
+    matrix_dir: Path,
+) -> MatrixBuildDecision:
+    """Classify one genome without reading any matrix or profile-position values."""
+    matrix_file = matrix_file_for_genome(matrix_dir, summary.genome)
+    if not matrix_file.exists():
+        status = "missing"
+    else:
+        try:
+            checkpoint = read_matrix_file_build_status(matrix_file)
+        except (OSError, ValueError):
+            status = "behind"
+        else:
+            status = (
+                "up_to_date"
+                if checkpoint.state == matrix_hdf5.MATRIX_BUILD_STATE_COMPLETE
+                and checkpoint.committed_count == checkpoint.required_count
+                and checkpoint.required_count == summary.sample_count
+                and checkpoint.required_digest == summary.sample_digest
+                else "behind"
+            )
+    return MatrixBuildDecision(
+        genome=summary.genome,
+        matrix_file=matrix_file,
+        status=status,
+        expected_count=summary.sample_count,
+        expected_digest=summary.sample_digest,
+    )
 
 
 def _write_matrix_hdf5_metatrawl_metadata(matrix_file: Path, *, filters: db.MatrixFilters) -> None:
