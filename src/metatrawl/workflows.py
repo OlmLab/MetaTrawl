@@ -5,6 +5,8 @@ from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import errno
+import hashlib
+import json
 import os
 from pathlib import Path
 import queue
@@ -44,6 +46,18 @@ class SyncSummary:
     skipped: int
     failed: int
     cleaned_files: int
+
+
+@dataclass(frozen=True)
+class FixedReferenceContext:
+    """Immutable shared profiling assets derived from user-supplied references."""
+
+    reference: cache.PreparedReference
+    bed_file: Path
+    gene_range_table: Path
+    null_model_file: Path
+    profiling_contract_file: Path
+    reference_key: str
 
 
 @dataclass(frozen=True)
@@ -1103,6 +1117,194 @@ def _optional_float_metadata(metadata: dict[str, str], key: str) -> float | None
     return float(value)
 
 
+def _fixed_reference_mode(
+    *,
+    reference_genome: Path | None,
+    reference_genome_genes: Path | None,
+    reference_stb: Path | None,
+) -> bool:
+    values = {
+        "--reference-genome": reference_genome,
+        "--reference-genome-genes": reference_genome_genes,
+        "--reference-stb": reference_stb,
+    }
+    if not any(value is not None for value in values.values()):
+        return False
+    missing = [option for option, value in values.items() if value is None]
+    if missing:
+        raise ValueError(
+            "Fixed-reference profiling requires --reference-genome, "
+            "--reference-genome-genes, and --reference-stb together; missing: "
+            + ", ".join(missing)
+        )
+    return True
+
+
+def _prepare_fixed_reference_context(
+    *,
+    reference_genome: Path | None,
+    reference_genome_genes: Path | None,
+    reference_stb: Path | None,
+    cache_dir: Path,
+    runtime: WorkflowRuntime,
+    logger: WorkflowLogger,
+) -> FixedReferenceContext | None:
+    """Prepare one content-addressed reference and index shared by all samples."""
+    if not _fixed_reference_mode(
+        reference_genome=reference_genome,
+        reference_genome_genes=reference_genome_genes,
+        reference_stb=reference_stb,
+    ):
+        return None
+    assert reference_genome is not None
+    assert reference_genome_genes is not None
+    assert reference_stb is not None
+    sources = {
+        "reference": Path(reference_genome).expanduser().resolve(),
+        "genes": Path(reference_genome_genes).expanduser().resolve(),
+        "stb": Path(reference_stb).expanduser().resolve(),
+    }
+    for label, path in sources.items():
+        if not _valid_file(path):
+            raise FileNotFoundError(f"Fixed-reference {label} file is missing or empty: {path}")
+    source_hashes = {label: _sha256_file(path) for label, path in sources.items()}
+    digest = hashlib.sha256(
+        json.dumps(source_hashes, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    root = Path(cache_dir) / "fixed_references" / digest
+    cached = _fixed_reference_context_from_dir(root, digest)
+    if cached is not None:
+        logger.emit(step="fixed-reference", status="cached", reference_key=digest, path=root)
+        return cached
+
+    root.parent.mkdir(parents=True, exist_ok=True)
+    temporary = root.with_name(f".{digest}.{uuid.uuid4().hex}.tmp")
+    temporary.mkdir(parents=True)
+    sample = f"fixed-reference-{digest[:12]}"
+    logger.emit(step="fixed-reference", status="preparing", reference_key=digest, path=root)
+    try:
+        staged_reference = temporary / "reference.fna"
+        staged_genes = temporary / "genes.fna"
+        staged_stb = temporary / "reference.stb"
+        _atomic_copy(sources["reference"], staged_reference)
+        _atomic_copy(sources["genes"], staged_genes)
+        _atomic_copy(sources["stb"], staged_stb)
+        assets_dir = temporary / "profiling_assets"
+        runtime.run(
+            "prepare_profile",
+            [
+                "zipstrain",
+                "utilities",
+                "prepare_profiling",
+                "--reference-fasta",
+                str(staged_reference),
+                "--gene-fasta",
+                str(staged_genes),
+                "--stb-file",
+                str(staged_stb),
+                "--output-dir",
+                str(assets_dir),
+            ],
+            sample=sample,
+        )
+        shared_reference = assets_dir / "reference.fasta"
+        required_assets = (
+            shared_reference,
+            assets_dir / "genomes_bed_file.bed",
+            assets_dir / "gene_range_table.tsv",
+            assets_dir / "null_model.parquet",
+            assets_dir / "profiling_contract.json",
+        )
+        missing = [str(path) for path in required_assets if not _valid_file(path)]
+        if missing:
+            raise RuntimeError("Fixed-reference preparation did not produce: " + ", ".join(missing))
+        _ensure_reference_fai(
+            profile_work=assets_dir,
+            run_id=sample,
+            logger=logger,
+            runtime=runtime,
+        )
+        runtime.run(
+            "bowtie_build",
+            [
+                "bowtie2-build",
+                "--threads",
+                str(runtime.threads("bowtie_build")),
+                str(shared_reference),
+                str(shared_reference),
+            ],
+            sample=sample,
+        )
+        if not _bowtie_index_complete(shared_reference):
+            raise RuntimeError(f"Fixed-reference Bowtie2 index is incomplete: {shared_reference}")
+        (temporary / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "reference_key": digest,
+                    "source_files": {label: str(path) for label, path in sources.items()},
+                    "sha256": source_hashes,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        (temporary / ".ready").write_text("ready\n")
+        if root.exists():
+            cached = _fixed_reference_context_from_dir(root, digest)
+            if cached is None:
+                raise RuntimeError(f"Fixed-reference cache is incomplete: {root}")
+            shutil.rmtree(temporary)
+            return cached
+        temporary.replace(root)
+    except Exception:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    prepared = _fixed_reference_context_from_dir(root, digest)
+    if prepared is None:
+        raise RuntimeError(f"Fixed-reference cache publication failed: {root}")
+    logger.emit(step="fixed-reference", status="ready", reference_key=digest, path=root)
+    return prepared
+
+
+def _fixed_reference_context_from_dir(root: Path, reference_key: str) -> FixedReferenceContext | None:
+    assets = root / "profiling_assets"
+    reference_fasta = assets / "reference.fasta"
+    required = (
+        root / ".ready",
+        root / "genes.fna",
+        root / "reference.stb",
+        reference_fasta,
+        assets / "genomes_bed_file.bed",
+        assets / "gene_range_table.tsv",
+        assets / "null_model.parquet",
+        assets / "profiling_contract.json",
+        Path(str(reference_fasta) + ".fai"),
+    )
+    if not all(_valid_file(path) for path in required) or not _bowtie_index_complete(reference_fasta):
+        return None
+    return FixedReferenceContext(
+        reference=cache.PreparedReference(
+            reference_fasta=reference_fasta,
+            gene_fasta=root / "genes.fna",
+            stb_file=root / "reference.stb",
+        ),
+        bed_file=assets / "genomes_bed_file.bed",
+        gene_range_table=assets / "gene_range_table.tsv",
+        null_model_file=assets / "null_model.parquet",
+        profiling_contract_file=assets / "profiling_contract.json",
+        reference_key=reference_key,
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def profile_sra_runs(
     *,
     run_ids: list[str],
@@ -1112,6 +1314,9 @@ def profile_sra_runs(
     sylph_db: Path | None = None,
     output_dir: Path | None = None,
     accessions_dir: Path | None = None,
+    reference_genome: Path | None = None,
+    reference_genome_genes: Path | None = None,
+    reference_stb: Path | None = None,
     threads: int = 8,
     workflow_config: WorkflowConfig | None = None,
     logger: WorkflowLogger | None = None,
@@ -1127,24 +1332,38 @@ def profile_sra_runs(
     """
     logger = logger or WorkflowLogger()
     workflow_config = workflow_config or WorkflowConfig.legacy(threads=threads, sample_count=len(run_ids))
+    with db.connect(db_file) as conn:
+        sample_inputs = db.sample_inputs_for_runs(conn, run_ids)
     runtime = WorkflowRuntime(workflow_config, state_dir=Path(scratch_dir), logger=logger, runner=subprocess.run)
-    cache_manager = cache.GenomeCache(
-        cache_dir,
+    fixed_reference = _prepare_fixed_reference_context(
+        reference_genome=reference_genome,
+        reference_genome_genes=reference_genome_genes,
+        reference_stb=reference_stb,
+        cache_dir=Path(cache_dir),
+        runtime=runtime,
         logger=logger,
-        downloader=lambda accession, output: cache.download_genome_with_datasets(
-            accession,
-            output,
-            command_runner=lambda command: runtime.run("genome_download", command, sample=accession),
-        ),
-        prodigal_runner=lambda genome, output: cache.run_prodigal_gene_fasta(
-            genome,
-            output,
-            command_runner=lambda command: runtime.run("prodigal", command, sample=genome.stem),
-        ),
-        download_workers=workflow_config.stage("genome_download").workers,
-        prodigal_workers=workflow_config.stage("prodigal").workers,
     )
-    sylph_db = _resolve_existing_sylph_db(sylph_db) if sylph_db is not None else None
+    cache_manager: cache.GenomeCache | None = None
+    if fixed_reference is None:
+        cache_manager = cache.GenomeCache(
+            cache_dir,
+            logger=logger,
+            downloader=lambda accession, output: cache.download_genome_with_datasets(
+                accession,
+                output,
+                command_runner=lambda command: runtime.run("genome_download", command, sample=accession),
+            ),
+            prodigal_runner=lambda genome, output: cache.run_prodigal_gene_fasta(
+                genome,
+                output,
+                command_runner=lambda command: runtime.run("prodigal", command, sample=genome.stem),
+            ),
+            download_workers=workflow_config.stage("genome_download").workers,
+            prodigal_workers=workflow_config.stage("prodigal").workers,
+        )
+        sylph_db = _resolve_existing_sylph_db(sylph_db) if sylph_db is not None else None
+    elif sylph_db is not None:
+        logger.emit(step="sylph", status="skipped-fixed-reference", syldb=sylph_db)
     max_workers = max(1, min(len(run_ids), workflow_config.sample_workers))
     logger.emit(step="profile-sra", status="start", samples=len(run_ids), workers=max_workers, db=db_file)
     failures: dict[str, str] = {}
@@ -1160,7 +1379,9 @@ def profile_sra_runs(
             future = executor.submit(
                 _profile_one_sra_run,
                 run_id=run_id,
+                sample_input=sample_inputs[run_id],
                 cache_manager=cache_manager,
+                fixed_reference=fixed_reference,
                 scratch_dir=Path(scratch_dir),
                 sylph_db=sylph_db,
                 output_dir=Path(output_dir) if output_dir is not None else None,
@@ -1223,6 +1444,9 @@ def sync_remaining_profiles(
     output_dir: Path,
     sylph_db: Path | None = None,
     accessions_dir: Path | None = None,
+    reference_genome: Path | None = None,
+    reference_genome_genes: Path | None = None,
+    reference_stb: Path | None = None,
     threads: int = 8,
     workflow_config: WorkflowConfig | None = None,
     check_dependencies: bool = True,
@@ -1231,9 +1455,18 @@ def sync_remaining_profiles(
 ) -> SyncSummary:
     """Profile remaining SRA runs and import completed output bundles."""
     logger = logger or WorkflowLogger()
+    fixed_reference_mode = _fixed_reference_mode(
+        reference_genome=reference_genome,
+        reference_genome_genes=reference_genome_genes,
+        reference_stb=reference_stb,
+    )
     if check_dependencies:
         logger.emit(step="dependency-check", status="start")
-        healthcheck.assert_dependencies()
+        required_executables = healthcheck.REQUIRED_EXECUTABLES
+        if fixed_reference_mode:
+            skipped = {"sylph", "datasets", "prodigal"}
+            required_executables = tuple(command for command in required_executables if command not in skipped)
+        healthcheck.assert_dependencies(healthcheck.collect_checks(executables=required_executables))
         logger.emit(step="dependency-check", status="done")
 
     with db.connect(db_file) as conn:
@@ -1266,6 +1499,9 @@ def sync_remaining_profiles(
             sylph_db=sylph_db,
             output_dir=output_dir,
             accessions_dir=accessions_dir,
+            reference_genome=reference_genome,
+            reference_genome_genes=reference_genome_genes,
+            reference_stb=reference_stb,
             threads=threads,
             workflow_config=workflow_config,
             logger=logger,
@@ -1320,7 +1556,7 @@ def discover_profile_bundle(*, output_dir: Path, run_id: str) -> db.ProfileBundl
         required_name="genome_stats_file",
         run_id=run_id,
     )
-    sylph_abundance_file = _first_existing_path(
+    sylph_abundance_file = _optional_existing_path(
         output_dir,
         [
             f"{run_id}.sylph.parquet",
@@ -1330,8 +1566,6 @@ def discover_profile_bundle(*, output_dir: Path, run_id: str) -> db.ProfileBundl
             f"{run_id}_sylph.csv",
             f"{run_id}_sylph.tsv",
         ],
-        required_name="sylph_abundance_file",
-        run_id=run_id,
     )
     gene_stats_file = _optional_existing_path(
         output_dir,
@@ -1390,7 +1624,9 @@ def _profile_bundle_size(bundle: db.ProfileBundle) -> int:
 def _profile_one_sra_run(
     *,
     run_id: str,
-    cache_manager: cache.GenomeCache,
+    sample_input: db.SampleInput,
+    cache_manager: cache.GenomeCache | None,
+    fixed_reference: FixedReferenceContext | None,
     scratch_dir: Path,
     sylph_db: Path | None,
     output_dir: Path | None,
@@ -1402,6 +1638,8 @@ def _profile_one_sra_run(
     if output_dir is not None and _published_profile_bundle_complete(
         run_id=run_id,
         output_dir=Path(output_dir),
+        require_sylph=fixed_reference is None,
+        reference_key=fixed_reference.reference_key if fixed_reference is not None else None,
     ):
         logger.emit(
             sample=run_id,
@@ -1410,8 +1648,12 @@ def _profile_one_sra_run(
             path=Path(output_dir),
         )
         return
+    if fixed_reference is not None and output_dir is not None:
+        _remove_published_sylph_outputs(Path(output_dir), run_id)
     sample_scratch = Path(scratch_dir) / run_id
     sample_scratch.mkdir(parents=True, exist_ok=True)
+    if fixed_reference is not None:
+        _checkpoint_fixed_reference(sample_scratch, fixed_reference.reference_key, run_id=run_id, logger=logger)
     reads_dir = sample_scratch / "reads"
     reads_dir.mkdir(parents=True, exist_ok=True)
     sra_dir = sample_scratch / "sra"
@@ -1422,92 +1664,128 @@ def _profile_one_sra_run(
     if not _sample_fastqs(sample_scratch, required=False) and not (
         _valid_file(bam_file) and read_layout is not None
     ):
-        logger.emit(sample=run_id, step="download", status="start")
-        download_threads = runtime.threads("sra_download")
-        if not _valid_file(sra_archive):
-            sra_dir.mkdir(parents=True, exist_ok=True)
+        if sample_input.input_type == "local":
+            logger.emit(sample=run_id, step="stage-reads", status="start")
+            fastqs = _stage_local_reads(
+                sample_input,
+                reads_dir=reads_dir,
+                runtime=runtime,
+            )
+            _write_read_layout(sample_scratch, fastqs)
+            logger.emit(
+                sample=run_id,
+                step="stage-reads",
+                status="done",
+                fastqs=len(fastqs),
+                layout="paired" if len(fastqs) == 2 else "single",
+            )
+        else:
+            logger.emit(sample=run_id, step="download", status="start")
+            download_threads = runtime.threads("sra_download")
+            if not _valid_file(sra_archive):
+                sra_dir.mkdir(parents=True, exist_ok=True)
+                runtime.run(
+                    "sra_download",
+                    ["prefetch", "--output-directory", str(sra_dir), run_id],
+                    sample=run_id,
+                )
+            else:
+                logger.emit(sample=run_id, step="prefetch", status="cached", file=sra_archive)
             runtime.run(
                 "sra_download",
-                ["prefetch", "--output-directory", str(sra_dir), run_id],
+                ["fasterq-dump", str(sra_archive), "--outdir", str(reads_dir), "--threads", str(download_threads)],
+                sample=run_id,
+            )
+            fastqs = _sample_fastqs(sample_scratch)
+            _write_read_layout(sample_scratch, fastqs)
+            removed_bytes = _remove_path(sra_dir)
+            logger.emit(
+                sample=run_id,
+                step="download",
+                status="done",
+                fastqs=len(fastqs),
+                freed_sra_gb=f"{removed_bytes / 1024**3:.2f}",
+            )
+    elif _valid_file(bam_file) and read_layout is not None:
+        logger.emit(
+            sample=run_id,
+            step="stage-reads" if sample_input.input_type == "local" else "download",
+            status="checkpointed-bam",
+            bam=bam_file,
+        )
+    else:
+        fastqs = _sample_fastqs(sample_scratch)
+        _write_read_layout(sample_scratch, fastqs)
+        if sample_input.input_type == "local":
+            logger.emit(sample=run_id, step="stage-reads", status="cached", fastqs=len(fastqs))
+        else:
+            removed_bytes = _remove_path(sra_dir)
+            logger.emit(
+                sample=run_id,
+                step="download",
+                status="cached",
+                fastqs=len(fastqs),
+                freed_sra_gb=f"{removed_bytes / 1024**3:.2f}",
+            )
+
+    if fixed_reference is not None:
+        reference = fixed_reference.reference
+        logger.emit(
+            sample=run_id,
+            step="reference",
+            status="fixed",
+            reference=reference.reference_fasta,
+            reference_key=fixed_reference.reference_key,
+        )
+    else:
+        accessions_file = sample_scratch / "accessions.txt"
+        if not accessions_file.exists() and accessions_dir is not None:
+            source = _find_sample_accessions_file(accessions_dir, run_id)
+            if source is not None:
+                shutil.copy2(source, accessions_file)
+                logger.emit(sample=run_id, step="sylph", status="using-accessions-file", file=source)
+        sylph_output = sample_scratch / f"{run_id}.sylph.tsv"
+        if not accessions_file.exists():
+            if sylph_db is None:
+                raise FileNotFoundError(
+                    f"sample={run_id} step=sylph missing accession list and no Sylph database was provided. "
+                    "Pass --sylph-db so MetaTrawl can run `sylph profile`, or pass --accessions-dir as a manual override."
+                )
+            logger.emit(sample=run_id, step="sylph", status="start", syldb=sylph_db)
+            _run_sylph_profile(
+                sylph_db=sylph_db,
+                sample_scratch=sample_scratch,
+                run_id=run_id,
+                runtime=runtime,
+                output_file=sylph_output,
+            )
+            accessions = extract_accessions_from_sylph_table(sylph_output)
+            if not accessions:
+                raise ValueError(f"sample={run_id} step=sylph produced no nonzero genome accessions: {sylph_output}")
+            _write_accessions_file(accessions_file, accessions)
+            logger.emit(sample=run_id, step="sylph", status="done", genomes=len(accessions), output=sylph_output)
+        else:
+            logger.emit(sample=run_id, step="sylph", status="cached", file=accessions_file)
+        if output_dir is not None and _valid_file(sylph_output):
+            output_dir.mkdir(parents=True, exist_ok=True)
+            published_sylph = output_dir / f"{run_id}.sylph.tsv"
+            if not _valid_file(published_sylph):
+                _atomic_copy(sylph_output, published_sylph)
+                logger.emit(sample=run_id, step="sylph", status="published", file=published_sylph)
+
+        accessions = cache.read_accessions_file(accessions_file)
+        reference_dir = sample_scratch / "reference"
+        reference = _cached_reference(reference_dir)
+        if reference is None:
+            if cache_manager is None:
+                raise RuntimeError(f"sample={run_id} step=cache genome cache is unavailable")
+            reference = cache_manager.prepare_reference(
+                accessions=accessions,
+                output_dir=reference_dir,
                 sample=run_id,
             )
         else:
-            logger.emit(sample=run_id, step="prefetch", status="cached", file=sra_archive)
-        runtime.run(
-            "sra_download",
-            ["fasterq-dump", str(sra_archive), "--outdir", str(reads_dir), "--threads", str(download_threads)],
-            sample=run_id,
-        )
-        fastqs = _sample_fastqs(sample_scratch)
-        _write_read_layout(sample_scratch, fastqs)
-        removed_bytes = _remove_path(sra_dir)
-        logger.emit(
-            sample=run_id,
-            step="download",
-            status="done",
-            fastqs=len(fastqs),
-            freed_sra_gb=f"{removed_bytes / 1024**3:.2f}",
-        )
-    elif _valid_file(bam_file) and read_layout is not None:
-        logger.emit(sample=run_id, step="download", status="checkpointed-bam", bam=bam_file)
-    else:
-        fastqs = _sample_fastqs(sample_scratch)
-        _write_read_layout(sample_scratch, fastqs)
-        removed_bytes = _remove_path(sra_dir)
-        logger.emit(
-            sample=run_id,
-            step="download",
-            status="cached",
-            fastqs=len(fastqs),
-            freed_sra_gb=f"{removed_bytes / 1024**3:.2f}",
-        )
-
-    accessions_file = sample_scratch / "accessions.txt"
-    if not accessions_file.exists() and accessions_dir is not None:
-        source = _find_sample_accessions_file(accessions_dir, run_id)
-        if source is not None:
-            shutil.copy2(source, accessions_file)
-            logger.emit(sample=run_id, step="sylph", status="using-accessions-file", file=source)
-    sylph_output = sample_scratch / f"{run_id}.sylph.tsv"
-    if not accessions_file.exists():
-        if sylph_db is None:
-            raise FileNotFoundError(
-                f"sample={run_id} step=sylph missing accession list and no Sylph database was provided. "
-                "Pass --sylph-db so MetaTrawl can run `sylph profile`, or pass --accessions-dir as a manual override."
-            )
-        logger.emit(sample=run_id, step="sylph", status="start", syldb=sylph_db)
-        _run_sylph_profile(
-            sylph_db=sylph_db,
-            sample_scratch=sample_scratch,
-            run_id=run_id,
-            runtime=runtime,
-            output_file=sylph_output,
-        )
-        accessions = extract_accessions_from_sylph_table(sylph_output)
-        if not accessions:
-            raise ValueError(f"sample={run_id} step=sylph produced no nonzero genome accessions: {sylph_output}")
-        _write_accessions_file(accessions_file, accessions)
-        logger.emit(sample=run_id, step="sylph", status="done", genomes=len(accessions), output=sylph_output)
-    else:
-        logger.emit(sample=run_id, step="sylph", status="cached", file=accessions_file)
-    if output_dir is not None and _valid_file(sylph_output):
-        output_dir.mkdir(parents=True, exist_ok=True)
-        published_sylph = output_dir / f"{run_id}.sylph.tsv"
-        if not _valid_file(published_sylph):
-            _atomic_copy(sylph_output, published_sylph)
-            logger.emit(sample=run_id, step="sylph", status="published", file=published_sylph)
-
-    accessions = cache.read_accessions_file(accessions_file)
-    reference_dir = sample_scratch / "reference"
-    reference = _cached_reference(reference_dir)
-    if reference is None:
-        reference = cache_manager.prepare_reference(
-            accessions=accessions,
-            output_dir=reference_dir,
-            sample=run_id,
-        )
-    else:
-        logger.emit(sample=run_id, step="cache", status="cached-reference", reference=reference.reference_fasta)
+            logger.emit(sample=run_id, step="cache", status="cached-reference", reference=reference.reference_fasta)
     logger.emit(sample=run_id, step="profile", status="ready", reference=reference.reference_fasta)
     if output_dir is not None:
         _run_alignment_and_profile(
@@ -1517,12 +1795,52 @@ def _profile_one_sra_run(
             output_dir=output_dir,
             runtime=runtime,
             profile_config=profile_config,
+            fixed_reference=fixed_reference,
             logger=logger,
         )
 
 
 def _valid_file(path: Path) -> bool:
     return path.is_file() and path.stat().st_size > 0
+
+
+def _checkpoint_fixed_reference(
+    sample_scratch: Path,
+    reference_key: str,
+    *,
+    run_id: str,
+    logger: WorkflowLogger,
+) -> None:
+    """Invalidate reference-dependent sample checkpoints when inputs change."""
+    marker = sample_scratch / "fixed_reference.json"
+    current_key: str | None = None
+    if marker.is_file():
+        try:
+            current_key = str(json.loads(marker.read_text()).get("reference_key"))
+        except (json.JSONDecodeError, OSError, AttributeError):
+            current_key = None
+    if current_key == reference_key:
+        return
+    removed = 0
+    for path in (
+        sample_scratch / f"{run_id}.bam",
+        sample_scratch / f"{run_id}.bam.tmp",
+        sample_scratch / "zipstrain_profile",
+        sample_scratch / "reference",
+    ):
+        removed += _remove_path(path)
+    if current_key is not None or removed:
+        logger.emit(
+            sample=run_id,
+            step="checkpoint",
+            status="reference-changed",
+            previous_reference_key=current_key,
+            reference_key=reference_key,
+            removed_gb=f"{removed / 1024**3:.2f}",
+        )
+    temporary = marker.with_name(f".{marker.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(json.dumps({"reference_key": reference_key}, sort_keys=True) + "\n")
+    temporary.replace(marker)
 
 
 def _read_layout(sample_scratch: Path) -> str | None:
@@ -1540,6 +1858,58 @@ def _write_read_layout(sample_scratch: Path, fastqs: list[Path]) -> str:
     temporary.write_text(layout + "\n")
     temporary.replace(path)
     return layout
+
+
+def _stage_local_reads(
+    sample_input: db.SampleInput,
+    *,
+    reads_dir: Path,
+    runtime: WorkflowRuntime,
+) -> list[Path]:
+    """Copy registered local reads into disposable scratch atomically."""
+    if sample_input.input_type != "local" or sample_input.read_1_file is None:
+        raise ValueError(f"sample={sample_input.sample_id} has no registered local read_1")
+    sources = [sample_input.read_1_file]
+    if sample_input.read_2_file is not None:
+        sources.append(sample_input.read_2_file)
+    reads_dir.mkdir(parents=True, exist_ok=True)
+    destinations: list[Path] = []
+    for index, source in enumerate(sources, start=1):
+        source = Path(source)
+        if not _valid_file(source):
+            raise FileNotFoundError(
+                f"sample={sample_input.sample_id} step=stage-reads "
+                f"source is missing or empty: {source}"
+            )
+        suffix = _fastq_suffix(source)
+        stem = sample_input.sample_id if len(sources) == 1 else f"{sample_input.sample_id}_{index}"
+        destination = reads_dir / f"{stem}{suffix}"
+        if not _valid_file(destination):
+            temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                runtime.run(
+                    "sra_download",
+                    ["cp", str(source), str(temporary)],
+                    sample=sample_input.sample_id,
+                )
+                if not _valid_file(temporary):
+                    raise RuntimeError(
+                        f"sample={sample_input.sample_id} step=stage-reads "
+                        f"copy produced an empty file: {temporary}"
+                    )
+                temporary.replace(destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+        destinations.append(destination)
+    return destinations
+
+
+def _fastq_suffix(path: Path) -> str:
+    name = path.name.lower()
+    for suffix in (".fastq.gz", ".fq.gz", ".fastq", ".fq"):
+        if name.endswith(suffix):
+            return suffix
+    raise ValueError(f"Local read file must use a FASTQ extension: {path}")
 
 
 def _remove_path(path: Path) -> int:
@@ -1607,6 +1977,7 @@ def _run_alignment_and_profile(
     output_dir: Path,
     runtime: WorkflowRuntime | _DirectRuntime | None = None,
     profile_config: ProfileConfig | None = None,
+    fixed_reference: FixedReferenceContext | None = None,
     threads: int | None = None,
     logger: WorkflowLogger,
 ) -> None:
@@ -1618,35 +1989,52 @@ def _run_alignment_and_profile(
     profile_work = sample_scratch / "zipstrain_profile"
     profile_work.mkdir(parents=True, exist_ok=True)
 
-    prepared_outputs = (
-        profile_work / "genomes_bed_file.bed",
-        profile_work / "gene_range_table.tsv",
-        profile_work / "profiling_contract.json",
-    )
-    if not all(_valid_file(path) for path in prepared_outputs):
-        logger.emit(sample=run_id, step="prepare-profile", status="start")
-        runtime.run(
-            "prepare_profile",
-            [
-                "zipstrain",
-                "utilities",
-                "prepare_profiling",
-                "--reference-fasta",
-                str(reference.reference_fasta),
-                "--gene-fasta",
-                str(reference.gene_fasta),
-                "--stb-file",
-                str(reference.stb_file),
-                "--output-dir",
-                str(profile_work),
-            ],
-            sample=run_id,
-        )
-        logger.emit(sample=run_id, step="prepare-profile", status="done")
+    if fixed_reference is not None:
+        bed_file = fixed_reference.bed_file
+        gene_range_table = fixed_reference.gene_range_table
+        null_model_file = fixed_reference.null_model_file
+        profiling_contract_file = fixed_reference.profiling_contract_file
+        profiling_reference_fasta = fixed_reference.reference.reference_fasta
+        logger.emit(sample=run_id, step="prepare-profile", status="shared")
     else:
-        logger.emit(sample=run_id, step="prepare-profile", status="cached")
-    _ensure_null_model(profile_work=profile_work, run_id=run_id, logger=logger, runtime=runtime)
-    _ensure_reference_fai(profile_work=profile_work, run_id=run_id, logger=logger, runtime=runtime)
+        prepared_outputs = (
+            profile_work / "genomes_bed_file.bed",
+            profile_work / "gene_range_table.tsv",
+            profile_work / "profiling_contract.json",
+        )
+        if not all(_valid_file(path) for path in prepared_outputs):
+            logger.emit(sample=run_id, step="prepare-profile", status="start")
+            runtime.run(
+                "prepare_profile",
+                [
+                    "zipstrain",
+                    "utilities",
+                    "prepare_profiling",
+                    "--reference-fasta",
+                    str(reference.reference_fasta),
+                    "--gene-fasta",
+                    str(reference.gene_fasta),
+                    "--stb-file",
+                    str(reference.stb_file),
+                    "--output-dir",
+                    str(profile_work),
+                ],
+                sample=run_id,
+            )
+            logger.emit(sample=run_id, step="prepare-profile", status="done")
+        else:
+            logger.emit(sample=run_id, step="prepare-profile", status="cached")
+        null_model_file = _ensure_null_model(
+            profile_work=profile_work,
+            run_id=run_id,
+            logger=logger,
+            runtime=runtime,
+        )
+        _ensure_reference_fai(profile_work=profile_work, run_id=run_id, logger=logger, runtime=runtime)
+        bed_file = profile_work / "genomes_bed_file.bed"
+        gene_range_table = profile_work / "gene_range_table.tsv"
+        profiling_contract_file = profile_work / "profiling_contract.json"
+        profiling_reference_fasta = profile_work / "reference.fasta"
 
     bam_file = sample_scratch / f"{run_id}.bam"
     if not _valid_file(bam_file):
@@ -1716,8 +2104,10 @@ def _run_alignment_and_profile(
     reads_dir = sample_scratch / "reads"
     if reads_dir.exists() and not any(reads_dir.iterdir()):
         reads_dir.rmdir()
-    for index_file in _bowtie_index_paths(reference.reference_fasta):
-        released += _remove_path(index_file)
+    reference_is_sample_scratch = reference.reference_fasta.resolve().is_relative_to(sample_scratch.resolve())
+    if reference_is_sample_scratch:
+        for index_file in _bowtie_index_paths(reference.reference_fasta):
+            released += _remove_path(index_file)
     logger.emit(
         sample=run_id,
         step="scratch",
@@ -1725,7 +2115,12 @@ def _run_alignment_and_profile(
         freed_gb=f"{released / 1024**3:.2f}",
     )
 
-    if not _published_profile_bundle_complete(run_id=run_id, output_dir=output_dir):
+    if not _published_profile_bundle_complete(
+        run_id=run_id,
+        output_dir=output_dir,
+        require_sylph=fixed_reference is None,
+        reference_key=fixed_reference.reference_key if fixed_reference is not None else None,
+    ):
         logger.emit(sample=run_id, step="profile", status="start")
         profile_command = [
             "zipstrain",
@@ -1734,17 +2129,17 @@ def _run_alignment_and_profile(
             "--bam-file",
             str(bam_file),
             "--bed-file",
-            str(profile_work / "genomes_bed_file.bed"),
+            str(bed_file),
             "--stb-file",
             str(reference.stb_file),
             "--null-model",
-            str(profile_work / "null_model.parquet"),
+            str(null_model_file),
             "--gene-range-table",
-            str(profile_work / "gene_range_table.tsv"),
+            str(gene_range_table),
             "--reference-fasta",
-            str(profile_work / "reference.fasta"),
+            str(profiling_reference_fasta),
             "--profiling-contract",
-            str(profile_work / "profiling_contract.json"),
+            str(profiling_contract_file),
             "--max-concurrency",
             str(runtime.threads("profile")),
             "--min-mapq",
@@ -1766,10 +2161,20 @@ def _run_alignment_and_profile(
             sample=run_id,
         )
         _publish_profile_outputs(run_id=run_id, profile_work=profile_work, output_dir=output_dir)
-        _publish_bundle_ready_marker(output_dir, run_id)
+        _publish_bundle_ready_marker(
+            output_dir,
+            run_id,
+            require_sylph=fixed_reference is None,
+            reference_key=fixed_reference.reference_key if fixed_reference is not None else None,
+        )
         logger.emit(sample=run_id, step="profile", status="done", output_dir=output_dir)
     else:
-        _publish_bundle_ready_marker(output_dir, run_id)
+        _publish_bundle_ready_marker(
+            output_dir,
+            run_id,
+            require_sylph=fixed_reference is None,
+            reference_key=fixed_reference.reference_key if fixed_reference is not None else None,
+        )
         logger.emit(sample=run_id, step="profile", status="cached", output_dir=output_dir)
     released = _remove_path(bam_file)
     released += _remove_path(profile_work)
@@ -1822,23 +2227,65 @@ def _profile_bundle_ready_marker(output_dir: Path, run_id: str) -> Path:
     return Path(output_dir) / f".{run_id}.bundle.ready"
 
 
-def _publish_bundle_ready_marker(output_dir: Path, run_id: str) -> None:
-    if not _published_profile_bundle_complete(run_id=run_id, output_dir=output_dir):
+def _remove_published_sylph_outputs(output_dir: Path, run_id: str) -> None:
+    for suffix in (
+        ".sylph.parquet",
+        ".sylph.csv",
+        ".sylph.tsv",
+        "_sylph.parquet",
+        "_sylph.csv",
+        "_sylph.tsv",
+    ):
+        (Path(output_dir) / f"{run_id}{suffix}").unlink(missing_ok=True)
+
+
+def _publish_bundle_ready_marker(
+    output_dir: Path,
+    run_id: str,
+    *,
+    require_sylph: bool = True,
+    reference_key: str | None = None,
+) -> None:
+    if not _published_profile_bundle_complete(
+        run_id=run_id,
+        output_dir=output_dir,
+        require_sylph=require_sylph,
+        reference_key=None,
+    ):
         raise RuntimeError(f"sample={run_id} step=profile cannot publish an incomplete output bundle")
     marker = _profile_bundle_ready_marker(output_dir, run_id)
     temporary = marker.with_name(f".{marker.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text("ready\n")
+    payload = {"status": "ready", "reference_key": reference_key}
+    temporary.write_text(json.dumps(payload, sort_keys=True) + "\n")
     temporary.replace(marker)
 
 
-def _published_profile_bundle_complete(*, run_id: str, output_dir: Path) -> bool:
-    required = (
+def _published_profile_bundle_complete(
+    *,
+    run_id: str,
+    output_dir: Path,
+    require_sylph: bool = True,
+    reference_key: str | None = None,
+) -> bool:
+    required = [
         output_dir / f"{run_id}.profile.parquet",
         output_dir / f"{run_id}.genome_stats.parquet",
         output_dir / f"{run_id}.gene_stats.parquet",
-        output_dir / f"{run_id}.sylph.tsv",
-    )
-    return all(_valid_file(path) for path in required)
+    ]
+    if require_sylph:
+        required.append(output_dir / f"{run_id}.sylph.tsv")
+    if not all(_valid_file(path) for path in required):
+        return False
+    if reference_key is None:
+        return True
+    marker = _profile_bundle_ready_marker(output_dir, run_id)
+    if not marker.is_file():
+        return False
+    try:
+        payload = json.loads(marker.read_text())
+    except (json.JSONDecodeError, OSError):
+        return False
+    return payload.get("reference_key") == reference_key
 
 
 def _ensure_null_model(*, profile_work: Path, run_id: str, logger: WorkflowLogger, runtime: WorkflowRuntime) -> Path:

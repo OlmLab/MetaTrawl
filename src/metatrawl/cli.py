@@ -92,7 +92,7 @@ def runs_group() -> None:
 def runs_add(db_file: Path, run_ids: tuple[str, ...]) -> None:
     """Add SRA run IDs to the registry."""
     with registry.connect(db_file) as conn:
-        added, reactivated = registry.add_runs(conn, list(run_ids))
+        added, reactivated = registry.add_sra_inputs(conn, list(run_ids))
     click.echo(f"added={added} reactivated={reactivated}")
 
 
@@ -114,6 +114,58 @@ def runs_delete(db_file: Path, run_ids: tuple[str, ...]) -> None:
     with registry.connect(db_file) as conn:
         deleted = registry.delete_runs(conn, list(run_ids))
     click.echo(f"deleted={deleted}")
+
+
+@cli.group("samples")
+def samples_group() -> None:
+    """Register SRA or local-read sample inputs."""
+
+
+@samples_group.command("add-sra-ids")
+@click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
+@click.option(
+    "--input-file",
+    "input_file",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="CSV containing a Run column.",
+)
+def samples_add_sra_ids(db_file: Path, input_file: Path) -> None:
+    """Register SRA runs from an SRA/ENA-compatible metadata CSV."""
+    run_ids = _read_sra_input_csv(input_file)
+    try:
+        with registry.connect(db_file) as conn:
+            added, reactivated = registry.add_sra_inputs(conn, run_ids)
+    except (FileNotFoundError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        f"input_type=sra rows={len(run_ids)} added={added} "
+        f"reactivated={reactivated}"
+    )
+
+
+@samples_group.command("add-reads")
+@click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
+@click.option(
+    "--input-file",
+    "input_file",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="CSV containing sample_id, read_1, and read_2 columns.",
+)
+def samples_add_reads(db_file: Path, input_file: Path) -> None:
+    """Register local FASTQ paths without copying read data."""
+    inputs = _read_local_read_input_csv(input_file)
+    try:
+        with registry.connect(db_file) as conn:
+            added, reactivated = registry.add_local_read_inputs(conn, inputs)
+    except (FileNotFoundError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    paired = sum(item.read_2_file is not None for item in inputs)
+    click.echo(
+        f"input_type=local rows={len(inputs)} paired={paired} "
+        f"single={len(inputs) - paired} added={added} reactivated={reactivated}"
+    )
 
 
 @cli.group("profiles")
@@ -439,6 +491,9 @@ def cache_serve(cache_dir: Path, host: str, port: int) -> None:
 @click.option("--sylph-db", type=click.Path(path_type=Path), help="Sylph database used to select genomes from reads.")
 @click.option("--output-dir", type=click.Path(path_type=Path), help="Directory where Sylph/profile outputs are written.")
 @click.option("--accessions-dir", type=click.Path(path_type=Path), help="Manual override directory with per-run accession files.")
+@click.option("--reference-genome", type=click.Path(path_type=Path), help="Fixed reference FASTA; skips Sylph and genome downloading.")
+@click.option("--reference-genome-genes", type=click.Path(path_type=Path), help="Prodigal-compatible gene nucleotide FASTA for the fixed reference.")
+@click.option("--reference-stb", type=click.Path(path_type=Path), help="Scaffold-to-genome table for the fixed reference.")
 @click.option("--threads", type=int, default=8, show_default=True)
 @click.option("--workflow-config", type=click.Path(path_type=Path), help="TOML/JSON stage concurrency and execution policy.")
 def profile_sra(
@@ -449,6 +504,9 @@ def profile_sra(
     sylph_db: Path | None,
     output_dir: Path | None,
     accessions_dir: Path | None,
+    reference_genome: Path | None,
+    reference_genome_genes: Path | None,
+    reference_stb: Path | None,
     threads: int,
     workflow_config: Path | None,
 ) -> None:
@@ -463,6 +521,9 @@ def profile_sra(
         sylph_db=sylph_db,
         output_dir=output_dir,
         accessions_dir=accessions_dir,
+        reference_genome=reference_genome,
+        reference_genome_genes=reference_genome_genes,
+        reference_stb=reference_stb,
         threads=threads,
         workflow_config=execution_config,
         logger=WorkflowLogger(),
@@ -476,6 +537,9 @@ def profile_sra(
 @click.option("--output-dir", required=True, type=click.Path(path_type=Path), help="Directory where profile outputs are written.")
 @click.option("--sylph-db", type=click.Path(path_type=Path), help="Sylph database used to select genomes from reads.")
 @click.option("--accessions-dir", type=click.Path(path_type=Path), help="Manual override directory with per-run accession files.")
+@click.option("--reference-genome", type=click.Path(path_type=Path), help="Fixed reference FASTA; skips Sylph, genome downloading, and Prodigal.")
+@click.option("--reference-genome-genes", type=click.Path(path_type=Path), help="Prodigal-compatible gene nucleotide FASTA for the fixed reference.")
+@click.option("--reference-stb", type=click.Path(path_type=Path), help="Scaffold-to-genome table for the fixed reference.")
 @click.option("--threads", type=int, default=8, show_default=True)
 @click.option("--workflow-config", type=click.Path(path_type=Path), help="TOML/JSON stage concurrency and execution policy.")
 @click.option("--skip-dependency-check", is_flag=True, help="Do not preflight external tools before syncing.")
@@ -487,6 +551,9 @@ def sync_profile(
     output_dir: Path,
     sylph_db: Path | None,
     accessions_dir: Path | None,
+    reference_genome: Path | None,
+    reference_genome_genes: Path | None,
+    reference_stb: Path | None,
     threads: int,
     workflow_config: Path | None,
     skip_dependency_check: bool,
@@ -504,6 +571,9 @@ def sync_profile(
             output_dir=output_dir,
             sylph_db=sylph_db,
             accessions_dir=accessions_dir,
+            reference_genome=reference_genome,
+            reference_genome_genes=reference_genome_genes,
+            reference_stb=reference_stb,
             threads=threads,
             workflow_config=execution_config,
             check_dependencies=not skip_dependency_check,
@@ -1652,6 +1722,59 @@ def _read_remaining_csv(input_file: Path) -> list[str]:
         if reader.fieldnames is None or "run_id" not in reader.fieldnames:
             raise click.UsageError("remaining CSV must contain a run_id column")
         return [row["run_id"] for row in reader if row.get("run_id")]
+
+
+def _read_sra_input_csv(input_file: Path) -> list[str]:
+    with input_file.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None or "Run" not in reader.fieldnames:
+            raise click.UsageError("SRA input CSV must contain a Run column")
+        run_ids = [
+            str(row["Run"]).strip()
+            for row in reader
+            if row.get("Run") and str(row["Run"]).strip()
+        ]
+    if not run_ids:
+        raise click.UsageError("SRA input CSV contains no Run values")
+    return run_ids
+
+
+def _read_local_read_input_csv(input_file: Path) -> list[registry.SampleInput]:
+    required = {"sample_id", "read_1", "read_2"}
+    with input_file.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            raise click.UsageError("Local-read input CSV is empty")
+        missing = required - set(reader.fieldnames)
+        if missing:
+            raise click.UsageError(
+                "Local-read input CSV missing required columns: "
+                + ", ".join(sorted(missing))
+            )
+        inputs: list[registry.SampleInput] = []
+        for line_number, row in enumerate(reader, start=2):
+            sample_id = str(row.get("sample_id") or "").strip()
+            read_1 = str(row.get("read_1") or "").strip()
+            read_2 = str(row.get("read_2") or "").strip()
+            if not sample_id:
+                raise click.UsageError(
+                    f"Local-read input CSV has an empty sample_id at line {line_number}"
+                )
+            if not read_1:
+                raise click.UsageError(
+                    f"Local-read input CSV has an empty read_1 at line {line_number}"
+                )
+            inputs.append(
+                registry.SampleInput(
+                    sample_id=sample_id,
+                    input_type="local",
+                    read_1_file=Path(read_1),
+                    read_2_file=Path(read_2) if read_2 else None,
+                )
+            )
+    if not inputs:
+        raise click.UsageError("Local-read input CSV contains no samples")
+    return inputs
 
 
 def _read_profile_manifest(manifest: Path) -> list[registry.ProfileBundle]:

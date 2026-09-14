@@ -28,6 +28,15 @@ CREATE TABLE IF NOT EXISTS sra_runs (
     deleted_at DOUBLE
 );
 
+CREATE TABLE IF NOT EXISTS sample_inputs (
+    sample_id VARCHAR PRIMARY KEY,
+    input_type VARCHAR NOT NULL CHECK (input_type IN ('sra', 'local')),
+    read_1_file VARCHAR,
+    read_2_file VARCHAR,
+    created_at DOUBLE NOT NULL,
+    updated_at DOUBLE NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS samples (
     sample_id VARCHAR PRIMARY KEY,
     run_id VARCHAR NOT NULL,
@@ -41,7 +50,7 @@ CREATE TABLE IF NOT EXISTS profiles (
     profile_file VARCHAR NOT NULL,
     genome_stats_file VARCHAR NOT NULL,
     gene_stats_file VARCHAR,
-    sylph_abundance_file VARCHAR NOT NULL,
+    sylph_abundance_file VARCHAR,
     profile_storage_mode VARCHAR NOT NULL DEFAULT 'full',
     profile_min_cov INTEGER,
     created_at DOUBLE NOT NULL,
@@ -198,8 +207,18 @@ class ProfileBundle:
     run_id: str
     profile_file: Path
     genome_stats_file: Path
-    sylph_abundance_file: Path
+    sylph_abundance_file: Path | None = None
     gene_stats_file: Path | None = None
+
+
+@dataclass(frozen=True)
+class SampleInput:
+    """Registered source used to produce one sample profile."""
+
+    sample_id: str
+    input_type: str
+    read_1_file: Path | None = None
+    read_2_file: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -361,6 +380,7 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     # chrom/pos/ACGT only. Dropping it is metadata-only and idempotent.
     conn.execute("ALTER TABLE profile_positions DROP COLUMN IF EXISTS gene")
     _migrate_profile_counts_to_uint16(conn)
+    _run_once(conn, "allow_profiles_without_sylph", _allow_profiles_without_sylph)
     _run_once(conn, "normalize_sylph_genomes", _normalize_existing_sylph_genomes)
     if had_legacy_matrix_profiles:
         conn.execute(
@@ -506,6 +526,155 @@ def add_runs(conn: duckdb.DuckDBPyConnection, run_ids: list[str]) -> tuple[int, 
     return added, reactivated
 
 
+def add_sra_inputs(
+    conn: duckdb.DuckDBPyConnection,
+    run_ids: list[str],
+) -> tuple[int, int]:
+    """Register SRA accessions without changing existing local-read inputs."""
+    run_ids = _normalize_ids(run_ids)
+    if not run_ids:
+        return 0, 0
+    conflicts = conn.execute(
+        """
+        SELECT sample_id
+        FROM sample_inputs
+        WHERE sample_id IN (SELECT unnest(?))
+          AND input_type <> 'sra'
+        ORDER BY sample_id
+        """,
+        [run_ids],
+    ).fetchall()
+    if conflicts:
+        names = ", ".join(str(row[0]) for row in conflicts)
+        raise ValueError(f"Samples already registered with local reads: {names}")
+
+    added, reactivated = add_runs(conn, run_ids)
+    now = time.time()
+    conn.executemany(
+        """
+        INSERT INTO sample_inputs
+          (sample_id, input_type, read_1_file, read_2_file, created_at, updated_at)
+        VALUES (?, 'sra', NULL, NULL, ?, ?)
+        ON CONFLICT (sample_id) DO UPDATE SET
+          updated_at = excluded.updated_at
+        """,
+        [(run_id, now, now) for run_id in run_ids],
+    )
+    return added, reactivated
+
+
+def add_local_read_inputs(
+    conn: duckdb.DuckDBPyConnection,
+    inputs: list[SampleInput],
+) -> tuple[int, int]:
+    """Register local read paths without copying their contents."""
+    normalized: list[SampleInput] = []
+    seen: dict[str, tuple[Path, Path | None]] = {}
+    for item in inputs:
+        sample_ids = _normalize_ids([item.sample_id])
+        if not sample_ids:
+            continue
+        sample_id = sample_ids[0]
+        if item.read_1_file is None:
+            raise ValueError(f"sample={sample_id} is missing read_1")
+        read_1 = Path(item.read_1_file).expanduser().resolve()
+        read_2 = Path(item.read_2_file).expanduser().resolve() if item.read_2_file is not None else None
+        for label, path in (("read_1", read_1), ("read_2", read_2)):
+            if path is not None and (not path.is_file() or path.stat().st_size == 0):
+                raise FileNotFoundError(f"sample={sample_id} {label} is missing or empty: {path}")
+            if path is not None and not path.name.lower().endswith((".fastq", ".fq", ".fastq.gz", ".fq.gz")):
+                raise ValueError(f"sample={sample_id} {label} must be a FASTQ file: {path}")
+        if read_2 is not None and read_1 == read_2:
+            raise ValueError(f"sample={sample_id} read_1 and read_2 must be different files")
+        paths = (read_1, read_2)
+        previous = seen.get(sample_id)
+        if previous is not None and previous != paths:
+            raise ValueError(f"Local-read CSV contains conflicting rows for sample_id={sample_id}")
+        if previous is None:
+            seen[sample_id] = paths
+            normalized.append(
+                SampleInput(
+                    sample_id=sample_id,
+                    input_type="local",
+                    read_1_file=read_1,
+                    read_2_file=read_2,
+                )
+            )
+    if not normalized:
+        return 0, 0
+
+    sample_ids = [item.sample_id for item in normalized]
+    conflicts = conn.execute(
+        """
+        SELECT sample_id
+        FROM sample_inputs
+        WHERE sample_id IN (SELECT unnest(?))
+          AND input_type <> 'local'
+        ORDER BY sample_id
+        """,
+        [sample_ids],
+    ).fetchall()
+    if conflicts:
+        names = ", ".join(str(row[0]) for row in conflicts)
+        raise ValueError(f"Samples already registered as SRA inputs: {names}")
+
+    added, reactivated = add_runs(conn, sample_ids)
+    now = time.time()
+    conn.executemany(
+        """
+        INSERT INTO sample_inputs
+          (sample_id, input_type, read_1_file, read_2_file, created_at, updated_at)
+        VALUES (?, 'local', ?, ?, ?, ?)
+        ON CONFLICT (sample_id) DO UPDATE SET
+          read_1_file = excluded.read_1_file,
+          read_2_file = excluded.read_2_file,
+          updated_at = excluded.updated_at
+        """,
+        [
+            (
+                item.sample_id,
+                str(item.read_1_file),
+                str(item.read_2_file) if item.read_2_file is not None else None,
+                now,
+                now,
+            )
+            for item in normalized
+        ],
+    )
+    return added, reactivated
+
+
+def sample_inputs_for_runs(
+    conn: duckdb.DuckDBPyConnection,
+    run_ids: list[str],
+) -> dict[str, SampleInput]:
+    """Resolve registered inputs, interpreting legacy rows as SRA accessions."""
+    normalized = _normalize_ids(run_ids)
+    if not normalized:
+        return {}
+    rows = conn.execute(
+        """
+        SELECT requested.run_id,
+               coalesce(inputs.input_type, 'sra') AS input_type,
+               inputs.read_1_file,
+               inputs.read_2_file
+        FROM (SELECT unnest(?) AS run_id) requested
+        LEFT JOIN sample_inputs inputs
+          ON inputs.sample_id = requested.run_id
+        """,
+        [normalized],
+    ).fetchall()
+    return {
+        str(run_id): SampleInput(
+            sample_id=str(run_id),
+            input_type=str(input_type),
+            read_1_file=Path(read_1) if read_1 is not None else None,
+            read_2_file=Path(read_2) if read_2 is not None else None,
+        )
+        for run_id, input_type, read_1, read_2 in rows
+    }
+
+
 def delete_runs(conn: duckdb.DuckDBPyConnection, run_ids: list[str]) -> int:
     """Soft-delete active SRA runs and return the number changed."""
     now = time.time()
@@ -628,7 +797,8 @@ def _validate_profile_bundle(
         add_runs(conn, [bundle.run_id])
     _require_existing_file(bundle.profile_file, "profile_file")
     _require_existing_file(bundle.genome_stats_file, "genome_stats_file")
-    _require_existing_file(bundle.sylph_abundance_file, "sylph_abundance_file")
+    if bundle.sylph_abundance_file is not None:
+        _require_existing_file(bundle.sylph_abundance_file, "sylph_abundance_file")
     if bundle.gene_stats_file is not None:
         _require_existing_file(bundle.gene_stats_file, "gene_stats_file")
 
@@ -668,7 +838,8 @@ def _import_profile_bundle_rows(
     _insert_genome_stats(conn, sample_id=sample_id, stats_file=bundle.genome_stats_file)
     if bundle.gene_stats_file is not None:
         _insert_gene_stats(conn, sample_id=sample_id, stats_file=bundle.gene_stats_file)
-    _insert_sylph_abundance(conn, sample_id=sample_id, abundance_file=bundle.sylph_abundance_file)
+    if bundle.sylph_abundance_file is not None:
+        _insert_sylph_abundance(conn, sample_id=sample_id, abundance_file=bundle.sylph_abundance_file)
 
     created_at = float(existing[0]) if existing is not None else now
     conn.execute(
@@ -690,7 +861,7 @@ def _import_profile_bundle_rows(
             str(bundle.profile_file),
             str(bundle.genome_stats_file),
             str(bundle.gene_stats_file) if bundle.gene_stats_file is not None else None,
-            str(bundle.sylph_abundance_file),
+            str(bundle.sylph_abundance_file) if bundle.sylph_abundance_file is not None else None,
             storage.mode,
             storage.min_cov,
             profile_created_at,
@@ -1795,6 +1966,11 @@ def _run_once(
         [name, time.time()],
     )
     return True
+
+
+def _allow_profiles_without_sylph(conn: duckdb.DuckDBPyConnection) -> None:
+    """Permit fixed-reference profiles that intentionally skip Sylph."""
+    conn.execute("ALTER TABLE profiles ALTER COLUMN sylph_abundance_file DROP NOT NULL")
 
 
 def _normalize_existing_sylph_genomes(conn: duckdb.DuckDBPyConnection) -> None:

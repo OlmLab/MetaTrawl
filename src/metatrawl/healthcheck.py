@@ -90,10 +90,11 @@ def collect_checks(
     *,
     executable_probe: ExecutableProbe = probe_executable,
     package_probe: PackageProbe = probe_package,
+    executables: tuple[str, ...] = REQUIRED_EXECUTABLES,
 ) -> list[Check]:
     """Collect the small dependency report shown by ``metatrawl test``."""
     checks: list[Check] = []
-    for command in REQUIRED_EXECUTABLES:
+    for command in executables:
         ok, detail = executable_probe(command)
         checks.append(Check(name=command, status="ok" if ok else "missing", detail=detail))
     for import_name, package_name in REQUIRED_PACKAGES:

@@ -6,7 +6,7 @@
 
 MetaTrawl streamlines [ZipStrain](https://github.com/parsaghadermarzi/ZipStrain)
 for very large-scale, strain-level analysis of metagenomic samples. It turns a
-collection of SRA run IDs into a durable, queryable project database and
+collection of SRA runs or local read sets into a durable, queryable project database and
 coordinates the expensive steps needed to profile and compare thousands of
 samples efficiently.
 
@@ -82,8 +82,8 @@ problems:
 MetaTrawl addresses these problems with a mutable DuckDB project store and an
 incremental workflow:
 
-1. Register SRA runs.
-2. Download and screen reads with Sylph.
+1. Register SRA accessions or local FASTQ paths.
+2. Download SRA reads when needed and screen all reads with Sylph.
 3. Reuse a shared genome and Prodigal cache.
 4. Align reads and profile samples with ZipStrain.
 5. Import profile positions, genome statistics, gene statistics, and Sylph
@@ -131,6 +131,50 @@ pip install metatrawl
 The PyPI package installs MetaTrawl and its Python dependencies. It does not
 install the external command-line tools required by the complete SRA profiling
 workflow. Use Bioconda unless those tools are already installed independently.
+
+### Docker
+
+The repository Dockerfile installs MetaTrawl, ZipStrain, PyTorch, HDF5 support,
+Sylph, Bowtie2, Samtools, Prodigal, SRA Toolkit, and NCBI Datasets. Build the
+portable CPU image from the repository root:
+
+```bash
+docker build -t metatrawl:latest .
+docker run --rm metatrawl:latest check
+```
+
+When building on an Apple Silicon Mac for an x86_64 cluster such as Alpine,
+select the target architecture explicitly:
+
+```bash
+docker build --platform linux/amd64 -t metatrawl:latest .
+```
+
+Mount a project directory at `/work` to run a workflow:
+
+```bash
+docker run --rm \
+  -v "$PWD:/work" \
+  metatrawl:latest \
+  init --db /work/metatrawl.duckdb
+```
+
+For NVIDIA GPU comparison, build against a PyTorch CUDA wheel index compatible
+with the host driver and launch through the NVIDIA Container Toolkit:
+
+```bash
+docker build \
+  --platform linux/amd64 \
+  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128 \
+  -t metatrawl:cuda .
+
+docker run --rm --gpus all \
+  --entrypoint python \
+  metatrawl:cuda \
+  -c "import torch; print(torch.cuda.is_available())"
+```
+
+The CPU and CUDA images otherwise contain the same MetaTrawl workflow tools.
 
 ### Verify The Installation
 
@@ -192,19 +236,46 @@ The threshold is part of the database contract and cannot be changed later.
 gene-level popANI. Count matrices, conANI, cosANI, raw A/C/G/T profile queries,
 and count reconstruction require normal `full` storage.
 
-### 2. Add SRA Runs
+### 2. Register Sample Inputs
+
+For SRA inputs, provide a CSV with the standard `Run` field. Other
+SRA/ENA metadata columns are allowed and ignored by registration:
+
+```csv
+Run,study_accession,bioproject
+SRR000001,SRP000001,PRJNA000001
+SRR000002,SRP000001,PRJNA000001
+```
 
 ```bash
-metatrawl runs add \
+metatrawl samples add-sra-ids \
   --db metatrawl.duckdb \
-  SRR000001 SRR000002 SRR000003
+  --input-file sra_samples.csv
 ```
 
-Check what is registered:
+For local reads, use the deterministic columns `sample_id`, `read_1`, and
+`read_2`. Leave `read_2` empty for a single-end sample:
+
+```csv
+sample_id,read_1,read_2
+sample_001,/data/sample_001_R1.fastq.gz,/data/sample_001_R2.fastq.gz
+sample_002,/data/sample_002.fastq.gz,
+```
 
 ```bash
-metatrawl runs list --db metatrawl.duckdb
+metatrawl samples add-reads \
+  --db metatrawl.duckdb \
+  --input-file local_reads.csv
 ```
+
+Registration validates the local files and stores their absolute paths in
+DuckDB. It does not copy read data. `sync-profile` copies a sample's reads into
+disposable scratch only when that sample starts. The original files are never
+deleted. On a cluster, the registered paths must be visible from the worker
+nodes.
+
+The older `metatrawl runs add/list/delete` commands remain available. Runs
+created by older MetaTrawl versions are interpreted as SRA inputs.
 
 Check the whole project status:
 
@@ -217,8 +288,8 @@ remaining profiles, profile rows, matrices, and compares.
 
 ### 3. Profile Remaining Runs And Import Them
 
-Use `sync-profile` for the high-level profile sync. It finds remaining SRA runs,
-downloads reads, runs Sylph, prepares the genome cache, aligns reads, runs
+Use `sync-profile` for the high-level profile sync. It finds remaining samples,
+downloads SRA reads or stages registered local reads, runs Sylph, prepares the genome cache, aligns reads, runs
 ZipStrain profiling, imports completed outputs into DuckDB, and removes
 per-sample scratch/results after successful import.
 
@@ -247,6 +318,39 @@ METATRAWL sample=SRR123 step=cleanup status=done removed=scratch/SRR123
 
 Use an absolute `--sylph-db` path when possible. MetaTrawl validates the file
 before launching workers.
+
+#### Profile against a fixed reference
+
+When every sample should be mapped against the same existing reference, provide
+the reference FASTA, its Prodigal-compatible nucleotide gene FASTA, and the STB
+scaffold-to-genome mapping together:
+
+```bash
+metatrawl sync-profile \
+  --db metatrawl.duckdb \
+  --cache-dir cache \
+  --scratch-dir scratch \
+  --output-dir outputs \
+  --reference-genome /references/reference.fna \
+  --reference-genome-genes /references/reference.genes.fna \
+  --reference-stb /references/reference.stb \
+  --threads 16
+```
+
+This mode skips Sylph, NCBI genome downloading, and Prodigal. MetaTrawl stages
+the three inputs into a content-addressed directory under
+`cache/fixed_references/`, prepares the ZipStrain profiling assets, and builds
+the Bowtie2 index once. All sample workers reuse those immutable files. The
+three options are required together; the reference may contain multiple
+scaffolds or genomes as long as the STB maps every scaffold correctly and the
+gene FASTA follows the Prodigal header contract.
+
+Fixed-reference samples have no rows in `sylph_abundance`. Profile positions,
+genome statistics, and gene statistics are imported normally. A later matrix
+build using `--min-sylph-abundance` therefore excludes these samples. The
+reference, gene, and STB content hashes are part of the resume checkpoint, so
+changing any input prevents reuse of BAM/profile checkpoints generated against
+the previous reference.
 
 ### 4. Sync Matrix Requirement Files
 
@@ -487,7 +591,7 @@ Every `sync` command follows the same three rules:
 - **Resumable.** If it is interrupted — a crash, a killed job, a cluster
   preemption — rerunning it continues from the last durable checkpoint rather
   than starting over.
-- **Incremental.** When you add new SRA runs (or new eligible samples), a rerun
+- **Incremental.** When you add new SRA runs or local reads, a rerun
   processes only the new work and leaves finished work untouched.
 
 The source of truth for "what is done" is durable state, never in-memory
@@ -499,7 +603,7 @@ disposable; the durable state is authoritative.
 
 ### `sync-profile`: profile remaining runs
 
-**Work set.** MetaTrawl profiles the *remaining runs*: every registered run that
+**Work set.** MetaTrawl profiles the *remaining samples*: every registered input that
 is not soft-deleted and does not yet have a `complete` sample. A run marked
 `failed` stays in this set, so a rerun automatically retries it. A run that
 imported successfully is `complete` and is skipped.
@@ -514,10 +618,15 @@ output before running, so an interrupted sample resumes mid-flight:
 | Stage | Skips when |
 | --- | --- |
 | SRA download (`prefetch`, `fasterq-dump`) | non-empty FASTQs already exist in scratch |
+| Local-read staging | registered FASTQs have already been copied into scratch |
 | Sylph genome selection | an `accessions.txt` already exists |
 | Reference preparation (shared cache) | the concatenated per-sample reference is already built |
 | Bowtie2 index + alignment | a complete Bowtie2 index and a non-empty BAM already exist |
 | ZipStrain `profile-single` | a complete published output bundle already exists |
+
+With fixed-reference profiling, the Sylph and genome-cache rows do not apply.
+The prepared ZipStrain assets and Bowtie2 index are shared by every sample and
+are reused when their reference/gene/STB content hash is unchanged.
 
 **Commit-then-clean.** When a sample finishes, MetaTrawl imports its ZipStrain
 outputs into DuckDB in the coordinator thread (serially, so there is never more

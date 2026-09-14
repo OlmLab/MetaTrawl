@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import csv
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -171,6 +172,7 @@ def test_init_creates_duckdb_schema(tmp_path: Path) -> None:
     tables = {row[0] for row in duckdb.connect(str(db_file)).execute("SHOW TABLES").fetchall()}
     assert {
         "sra_runs",
+        "sample_inputs",
         "samples",
         "profiles",
         "profile_positions",
@@ -195,6 +197,161 @@ def test_adding_run_ids_is_idempotent(tmp_path: Path) -> None:
     assert "added=2" in first.output
     assert second.exit_code == 0, second.output
     assert "added=0" in second.output
+
+
+def test_samples_add_sra_ids_accepts_sra_metadata_csv_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    input_file = tmp_path / "sra.csv"
+    input_file.write_text(
+        "Run,study_accession,bioproject\n"
+        "ERR100001,ERP1,PRJEB1\n"
+        "ERR100002,ERP1,PRJEB1\n"
+    )
+
+    first = runner.invoke(
+        cli.cli,
+        ["samples", "add-sra-ids", "--db", str(db_file), "--input-file", str(input_file)],
+    )
+    second = runner.invoke(
+        cli.cli,
+        ["samples", "add-sra-ids", "--db", str(db_file), "--input-file", str(input_file)],
+    )
+
+    assert first.exit_code == 0, first.output
+    assert "rows=2 added=2" in first.output
+    assert second.exit_code == 0, second.output
+    assert "rows=2 added=0" in second.output
+    with registry.connect(db_file) as conn:
+        assert registry.remaining_runs(conn) == ["ERR100001", "ERR100002"]
+        assert conn.execute(
+            "SELECT sample_id, input_type FROM sample_inputs ORDER BY sample_id"
+        ).fetchall() == [("ERR100001", "sra"), ("ERR100002", "sra")]
+
+
+def test_samples_add_sra_ids_requires_run_column(tmp_path: Path) -> None:
+    runner = CliRunner()
+    input_file = tmp_path / "sra.csv"
+    input_file.write_text("run_id\nSRR1\n")
+
+    result = runner.invoke(
+        cli.cli,
+        [
+            "samples",
+            "add-sra-ids",
+            "--db",
+            str(tmp_path / "metatrawl.duckdb"),
+            "--input-file",
+            str(input_file),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "Run" in result.output
+
+
+@pytest.mark.parametrize("paired", [False, True])
+def test_samples_add_reads_registers_paths_without_copying(
+    tmp_path: Path,
+    paired: bool,
+) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    read_1 = source_dir / "lane_R1.fastq.gz"
+    read_1.write_bytes(b"read one")
+    read_2 = source_dir / "lane_R2.fastq.gz"
+    if paired:
+        read_2.write_bytes(b"read two")
+    input_file = tmp_path / "local.csv"
+    input_file.write_text(
+        "sample_id,read_1,read_2\n"
+        f"LOCAL_1,{read_1},{read_2 if paired else ''}\n"
+    )
+
+    result = runner.invoke(
+        cli.cli,
+        ["samples", "add-reads", "--db", str(db_file), "--input-file", str(input_file)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert f"paired={1 if paired else 0}" in result.output
+    assert not (tmp_path / "scratch").exists()
+    assert read_1.read_bytes() == b"read one"
+    if paired:
+        assert read_2.read_bytes() == b"read two"
+    with registry.connect(db_file) as conn:
+        registered = registry.sample_inputs_for_runs(conn, ["LOCAL_1"])["LOCAL_1"]
+    assert registered.input_type == "local"
+    assert registered.read_1_file == read_1.resolve()
+    assert registered.read_2_file == (read_2.resolve() if paired else None)
+
+
+def test_samples_add_reads_rejects_missing_required_columns_and_files(
+    tmp_path: Path,
+) -> None:
+    runner = CliRunner()
+    db_file = tmp_path / "metatrawl.duckdb"
+    missing_column = tmp_path / "missing-column.csv"
+    missing_column.write_text("sample_id,read_1\nLOCAL_1,/reads/r1.fastq.gz\n")
+    missing_file = tmp_path / "missing-file.csv"
+    missing_file.write_text(
+        f"sample_id,read_1,read_2\nLOCAL_1,{tmp_path / 'absent.fastq.gz'},\n"
+    )
+
+    column_result = runner.invoke(
+        cli.cli,
+        ["samples", "add-reads", "--db", str(db_file), "--input-file", str(missing_column)],
+    )
+    file_result = runner.invoke(
+        cli.cli,
+        ["samples", "add-reads", "--db", str(db_file), "--input-file", str(missing_file)],
+    )
+
+    assert column_result.exit_code != 0
+    assert "read_2" in column_result.output
+    assert file_result.exit_code != 0
+    assert "missing or empty" in file_result.output
+    with registry.connect(db_file) as conn:
+        assert registry.remaining_runs(conn) == []
+
+
+def test_sample_input_type_cannot_be_changed_implicitly(tmp_path: Path) -> None:
+    db_file = tmp_path / "metatrawl.duckdb"
+    read_1 = tmp_path / "reads.fastq"
+    read_1.write_text("@r1\nACGT\n+\n!!!!\n")
+
+    with registry.connect(db_file) as conn:
+        registry.add_sra_inputs(conn, ["SHARED_ID"])
+        with pytest.raises(ValueError, match="already registered as SRA"):
+            registry.add_local_read_inputs(
+                conn,
+                [
+                    registry.SampleInput(
+                        sample_id="SHARED_ID",
+                        input_type="local",
+                        read_1_file=read_1,
+                    )
+                ],
+            )
+
+    local_db = tmp_path / "local.duckdb"
+    with registry.connect(local_db) as conn:
+        registry.add_local_read_inputs(
+            conn,
+            [
+                registry.SampleInput(
+                    sample_id="SHARED_ID",
+                    input_type="local",
+                    read_1_file=read_1,
+                )
+            ],
+        )
+        with pytest.raises(ValueError, match="registered with local reads"):
+            registry.add_sra_inputs(conn, ["SHARED_ID"])
 
 
 def test_schema_migrates_pre_v1_stat_tables_without_rebuild(tmp_path: Path) -> None:
@@ -910,6 +1067,82 @@ def test_profile_sra_deletes_temporary_reference_files_after_success(tmp_path: P
     assert not (scratch_dir / "SRR1").exists()
 
 
+@pytest.mark.parametrize("paired", [False, True])
+def test_profile_sync_stages_registered_local_reads_without_sra_download(
+    tmp_path: Path,
+    monkeypatch,
+    paired: bool,
+) -> None:
+    db_file = tmp_path / "metatrawl.duckdb"
+    scratch_dir = tmp_path / "scratch"
+    output_dir = tmp_path / "outputs"
+    accessions_dir = tmp_path / "accessions"
+    accessions_dir.mkdir()
+    (accessions_dir / "LOCAL_1.accessions.txt").write_text("GCF_1\n")
+    read_1 = tmp_path / "source_R1.fastq"
+    read_1.write_text("@r1\nACGT\n+\n!!!!\n")
+    read_2 = tmp_path / "source_R2.fastq"
+    if paired:
+        read_2.write_text("@r2\nTGCA\n+\n!!!!\n")
+    with registry.connect(db_file) as conn:
+        registry.add_local_read_inputs(
+            conn,
+            [
+                registry.SampleInput(
+                    sample_id="LOCAL_1",
+                    input_type="local",
+                    read_1_file=read_1,
+                    read_2_file=read_2 if paired else None,
+                )
+            ],
+        )
+
+    class FakeGenomeCache:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def prepare_reference(self, *, accessions: list[str], output_dir: Path, sample: str | None = None):
+            output_dir.mkdir(parents=True, exist_ok=True)
+            reference = output_dir / "reference.fna"
+            genes = output_dir / "genes.fna"
+            reference.write_text(">contig\nACGT\n")
+            genes.write_text(">gene\nAC\n")
+            return cache.PreparedReference(reference_fasta=reference, gene_fasta=genes)
+
+    observed: dict[str, object] = {}
+
+    def fake_alignment_and_profile(**kwargs) -> None:
+        sample_scratch = Path(kwargs["sample_scratch"])
+        fastqs = workflows._sample_fastqs(sample_scratch)
+        observed["names"] = [path.name for path in fastqs]
+        observed["contents"] = [path.read_text() for path in fastqs]
+        observed["layout"] = (sample_scratch / "read_layout.txt").read_text().strip()
+
+    monkeypatch.setattr(workflows.cache, "GenomeCache", FakeGenomeCache)
+    monkeypatch.setattr(workflows, "_run_alignment_and_profile", fake_alignment_and_profile)
+
+    failures = workflows.profile_sra_runs(
+        run_ids=["LOCAL_1"],
+        db_file=db_file,
+        cache_dir=tmp_path / "cache",
+        scratch_dir=scratch_dir,
+        output_dir=output_dir,
+        accessions_dir=accessions_dir,
+        logger=WorkflowLogger(),
+    )
+
+    assert failures == {}
+    assert observed["names"] == (
+        ["LOCAL_1_1.fastq", "LOCAL_1_2.fastq"] if paired else ["LOCAL_1.fastq"]
+    )
+    assert observed["layout"] == ("paired" if paired else "single")
+    assert observed["contents"] == (
+        [read_1.read_text(), read_2.read_text()] if paired else [read_1.read_text()]
+    )
+    assert read_1.exists()
+    assert not (scratch_dir / "LOCAL_1").exists()
+
+
 def test_profile_sra_sample_workers_bound_unimported_backlog(
     tmp_path: Path,
     monkeypatch,
@@ -1272,6 +1505,192 @@ def test_profile_sra_runs_sylph_and_extracts_accessions(tmp_path: Path, monkeypa
     assert prepared_accessions == [["GCF_000001.1"]]
     assert (output_dir / "SRR1.sylph.tsv").read_text().startswith("Genome_file")
     assert not (scratch_dir / "SRR1").exists()
+
+
+def test_fixed_reference_options_are_all_or_none(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="--reference-genome-genes, and --reference-stb together"):
+        workflows._fixed_reference_mode(
+            reference_genome=tmp_path / "reference.fna",
+            reference_genome_genes=None,
+            reference_stb=None,
+        )
+
+
+def test_fixed_reference_assets_and_bowtie_index_are_prepared_once(tmp_path: Path) -> None:
+    reference = tmp_path / "input.fna"
+    genes = tmp_path / "input.genes.fna"
+    stb = tmp_path / "input.stb"
+    reference.write_text(">contig\nACGT\n")
+    genes.write_text(">contig_1 # 1 # 4 # 1 # ID=1\nACGT\n")
+    stb.write_text("contig\tgenome_a\n")
+    calls: list[list[str]] = []
+
+    class FakeRuntime:
+        def threads(self, stage: str) -> int:
+            return 2
+
+        def run(self, stage: str, cmd: list[str], *, sample: str, **kwargs) -> None:
+            calls.append(cmd)
+            if cmd[:3] == ["zipstrain", "utilities", "prepare_profiling"]:
+                output = Path(cmd[cmd.index("--output-dir") + 1])
+                output.mkdir(parents=True)
+                (output / "reference.fasta").write_text(reference.read_text())
+                (output / "genomes_bed_file.bed").write_text("contig\t1\t4\n")
+                (output / "gene_range_table.tsv").write_text("contig_1\tcontig\t1\t4\n")
+                (output / "null_model.parquet").write_text("null")
+                (output / "profiling_contract.json").write_text("{}")
+            elif cmd[:2] == ["samtools", "faidx"]:
+                Path(str(cmd[2]) + ".fai").write_text("contig\t4\t8\t4\t5\n")
+            elif cmd[0] == "bowtie2-build":
+                for index_path in workflows._bowtie_index_paths(Path(cmd[-1]))[:6]:
+                    index_path.write_text("index")
+            else:
+                raise AssertionError(f"unexpected command: {cmd}")
+
+    runtime = FakeRuntime()
+    kwargs = {
+        "reference_genome": reference,
+        "reference_genome_genes": genes,
+        "reference_stb": stb,
+        "cache_dir": tmp_path / "cache",
+        "runtime": runtime,
+        "logger": WorkflowLogger(),
+    }
+    first = workflows._prepare_fixed_reference_context(**kwargs)
+    second = workflows._prepare_fixed_reference_context(**kwargs)
+
+    assert first is not None
+    assert second == first
+    assert first.reference.reference_fasta.is_file()
+    assert first.reference.stb_file.read_text() == "contig\tgenome_a\n"
+    assert sum(call[:3] == ["zipstrain", "utilities", "prepare_profiling"] for call in calls) == 1
+    assert sum(call[0] == "bowtie2-build" for call in calls) == 1
+
+
+def test_fixed_reference_profile_skips_sylph_and_genome_cache(tmp_path: Path, monkeypatch) -> None:
+    source_reads = tmp_path / "reads.fastq"
+    source_reads.write_text("@r1\nACGT\n+\n!!!!\n")
+    shared = tmp_path / "cache" / "fixed"
+    shared.mkdir(parents=True)
+    reference = cache.PreparedReference(
+        reference_fasta=shared / "reference.fasta",
+        gene_fasta=shared / "genes.fna",
+        stb_file=shared / "reference.stb",
+    )
+    reference.reference_fasta.write_text(">contig\nACGT\n")
+    reference.gene_fasta.write_text(">contig_1 # 1 # 4 # 1 # ID=1\nACGT\n")
+    reference.stb_file.write_text("contig\tgenome_a\n")
+    for name in ("bed", "ranges", "null", "contract"):
+        (shared / name).write_text(name)
+    fixed = workflows.FixedReferenceContext(
+        reference=reference,
+        bed_file=shared / "bed",
+        gene_range_table=shared / "ranges",
+        null_model_file=shared / "null",
+        profiling_contract_file=shared / "contract",
+        reference_key="fixed-key",
+    )
+    observed: dict[str, object] = {}
+
+    def fake_alignment_and_profile(**kwargs) -> None:
+        observed.update(kwargs)
+
+    monkeypatch.setattr(workflows, "_run_alignment_and_profile", fake_alignment_and_profile)
+    workflows._profile_one_sra_run(
+        run_id="LOCAL_1",
+        sample_input=registry.SampleInput(
+            sample_id="LOCAL_1",
+            input_type="local",
+            read_1_file=source_reads,
+        ),
+        cache_manager=None,
+        fixed_reference=fixed,
+        scratch_dir=tmp_path / "scratch",
+        sylph_db=tmp_path / "unused.syldb",
+        output_dir=tmp_path / "outputs",
+        accessions_dir=None,
+        runtime=workflows._DirectRuntime(1),
+        profile_config=ProfileConfig(),
+        logger=WorkflowLogger(),
+    )
+
+    sample_scratch = tmp_path / "scratch" / "LOCAL_1"
+    assert observed["fixed_reference"] == fixed
+    assert observed["reference"] == reference
+    assert not (sample_scratch / "accessions.txt").exists()
+    assert not list(sample_scratch.glob("*.sylph.tsv"))
+
+
+def test_fixed_reference_checkpoint_invalidates_only_reference_dependent_files(tmp_path: Path) -> None:
+    sample_scratch = tmp_path / "scratch" / "S1"
+    reads = sample_scratch / "reads" / "S1.fastq"
+    reads.parent.mkdir(parents=True)
+    reads.write_text("reads")
+    (sample_scratch / "S1.bam").write_text("bam")
+    profile_work = sample_scratch / "zipstrain_profile"
+    profile_work.mkdir()
+    (profile_work / "partial").write_text("partial")
+    (sample_scratch / "fixed_reference.json").write_text('{"reference_key": "old"}\n')
+
+    workflows._checkpoint_fixed_reference(
+        sample_scratch,
+        "new",
+        run_id="S1",
+        logger=WorkflowLogger(),
+    )
+
+    assert reads.exists()
+    assert not (sample_scratch / "S1.bam").exists()
+    assert not profile_work.exists()
+    assert json.loads((sample_scratch / "fixed_reference.json").read_text())["reference_key"] == "new"
+
+
+def test_profile_bundle_import_allows_missing_sylph_output(tmp_path: Path) -> None:
+    db_file = tmp_path / "metatrawl.duckdb"
+    bundle = _write_bundle_files(tmp_path, "S1")
+    bundle.sylph_abundance_file.unlink()
+    fixed_bundle = registry.ProfileBundle(
+        run_id=bundle.run_id,
+        profile_file=bundle.profile_file,
+        genome_stats_file=bundle.genome_stats_file,
+        gene_stats_file=bundle.gene_stats_file,
+        sylph_abundance_file=None,
+    )
+    with registry.connect(db_file) as conn:
+        registry.add_runs(conn, ["S1"])
+        registry.import_profile_bundle(conn, fixed_bundle)
+        assert registry.completed_sample_ids(conn) == ["S1"]
+        assert conn.execute("SELECT count(*) FROM sylph_abundance").fetchone() == (0,)
+        assert conn.execute(
+            "SELECT sylph_abundance_file FROM profiles WHERE run_id = 'S1'"
+        ).fetchone() == (None,)
+
+
+def test_existing_profiles_table_is_migrated_to_allow_missing_sylph(tmp_path: Path) -> None:
+    db_file = tmp_path / "legacy.duckdb"
+    with duckdb.connect(str(db_file)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE profiles (
+                run_id VARCHAR PRIMARY KEY,
+                profile_file VARCHAR NOT NULL,
+                genome_stats_file VARCHAR NOT NULL,
+                gene_stats_file VARCHAR,
+                sylph_abundance_file VARCHAR NOT NULL,
+                profile_storage_mode VARCHAR NOT NULL DEFAULT 'full',
+                profile_min_cov INTEGER,
+                created_at DOUBLE NOT NULL,
+                updated_at DOUBLE NOT NULL
+            )
+            """
+        )
+        registry.init_schema(conn)
+        conn.execute(
+            "INSERT INTO profiles VALUES ('S1', 'profile', 'stats', 'genes', NULL, 'full', NULL, 1, 1)"
+        )
+        assert conn.execute(
+            "SELECT sylph_abundance_file FROM profiles WHERE run_id = 'S1'"
+        ).fetchone() == (None,)
 
 
 def test_alignment_and_profile_stage_publishes_outputs(tmp_path: Path, monkeypatch) -> None:
