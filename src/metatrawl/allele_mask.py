@@ -108,6 +108,12 @@ class AlleleMaskWriteCache:
         ensure_reference_genome(conn, genome=genome, cache_dir=cache_dir)
         self._ensured_genomes.add(genome)
 
+    def clear(self) -> None:
+        """Discard IDs and references that may have been rolled back."""
+        self._segments.clear()
+        self._ensured_genomes.clear()
+        self._cached_bases = 0
+
     def segment(self, conn, *, genome: str, chrom: str) -> ReferenceSegment:
         """Return one decoded reference scaffold, loading it only on a miss."""
         key = (genome, chrom)

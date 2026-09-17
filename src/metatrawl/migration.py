@@ -11,12 +11,14 @@ import duckdb
 
 from metatrawl import allele_mask
 from metatrawl import db
+from metatrawl import provenance
 
 
 MigrationProgressCallback = Callable[[dict[str, object]], None]
 _COPY_BATCH_ROWS = 262_144
 _REGISTRY_TABLES = (
     "sra_runs",
+    "sample_inputs",
     "samples",
     "profiles",
     "genome_stats",
@@ -26,6 +28,12 @@ _REGISTRY_TABLES = (
     "matrix_stores",
     "matrix_store_samples",
     "matrix_compares",
+    "profiling_contracts",
+    "workflow_runs",
+    "sample_provenance",
+    "profile_references",
+    "profiling_contract_assets",
+    "provenance_events",
 )
 
 
@@ -62,7 +70,7 @@ def migrate_full_database(
 
     output_existed = output_db.exists()
     output_db.parent.mkdir(parents=True, exist_ok=True)
-    source = duckdb.connect(str(source_db), read_only=True)
+    source = db.connect_read_only(source_db)
     target = db.connect(output_db)
     try:
         source_storage = db.profile_storage_config(source)
@@ -273,6 +281,13 @@ def _initialize_target(
             target,
             progress_callback=progress_callback,
         )
+        # Storage conversion creates a derived database, not a new scientific
+        # profiling run. Preserve contracts while keeping the target's UUID.
+        target.execute("INSERT INTO sample_provenance SELECT sample_id, NULL, 'legacy-unknown', NULL, '{}', ? FROM samples WHERE sample_id NOT IN (SELECT sample_id FROM sample_provenance)", [time.time()])
+        if provenance.table_exists(source, "database_metadata"):
+            source_uuid, baseline = source.execute("SELECT database_uuid, accepted_contract_id FROM database_metadata WHERE id=1").fetchone()
+            target.execute("UPDATE database_metadata SET accepted_contract_id=? WHERE id=1", [baseline])
+            provenance.event(target, kind="storage-conversion", details={"source_database_uuid": source_uuid, "storage": "allele-mask", "min_cov": min_cov})
         target.execute(
             """
             UPDATE profiles

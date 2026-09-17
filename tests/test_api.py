@@ -136,7 +136,7 @@ def test_genome_view_queries_sylph_by_accession(tmp_path: Path) -> None:
     assert result["sample_id"].to_list() == ["sample_a", "sample_b"]
 
 
-def test_connect_migrates_legacy_float_profile_counts(tmp_path: Path) -> None:
+def test_connect_preserves_legacy_float_profile_counts_without_rewrite(tmp_path: Path) -> None:
     db_path = tmp_path / "legacy.duckdb"
     with registry.connect(db_path) as conn:
         conn.execute(
@@ -171,7 +171,7 @@ def test_connect_migrates_legacy_float_profile_counts(tmp_path: Path) -> None:
         )
         values = conn.execute("SELECT A, C, G, T FROM profile_positions").fetchone()
 
-    assert types == {"A": "USMALLINT", "C": "USMALLINT", "G": "USMALLINT", "T": "USMALLINT"}
+    assert types == {"A": "DOUBLE", "C": "DOUBLE", "G": "DOUBLE", "T": "DOUBLE"}
     assert values == (5, 0, 1, 2)
 
 

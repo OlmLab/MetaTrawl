@@ -13,6 +13,7 @@ import duckdb
 import polars as pl
 
 from metatrawl import allele_mask
+from metatrawl import provenance
 
 
 ExportProgressCallback = Callable[[dict[str, object]], None]
@@ -209,6 +210,7 @@ class ProfileBundle:
     genome_stats_file: Path
     sylph_abundance_file: Path | None = None
     gene_stats_file: Path | None = None
+    provenance_file: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -272,8 +274,13 @@ def connect(
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = duckdb.connect(str(path))
-    _apply_connection_settings(conn, memory_limit_gb=memory_limit_gb, threads=threads)
-    init_schema(conn)
+    try:
+        provenance.check_schema(conn)
+        _apply_connection_settings(conn, memory_limit_gb=memory_limit_gb, threads=threads)
+        init_schema(conn)
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
@@ -285,7 +292,12 @@ def connect_read_only(
 ) -> duckdb.DuckDBPyConnection:
     """Open a read-only DuckDB connection for concurrent matrix jobs."""
     conn = duckdb.connect(str(Path(db_path)), read_only=True)
-    _apply_connection_settings(conn, memory_limit_gb=memory_limit_gb, threads=threads)
+    try:
+        provenance.check_schema(conn)
+        _apply_connection_settings(conn, memory_limit_gb=memory_limit_gb, threads=threads)
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
@@ -335,6 +347,7 @@ def _apply_connection_settings(
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create and lightly migrate registry tables."""
+    provenance.check_schema(conn)
     had_legacy_matrix_profiles = _table_exists(conn, "matrix_store_profiles")
     conn.execute(SCHEMA_SQL)
     conn.execute("ALTER TABLE sra_runs ADD COLUMN IF NOT EXISTS status VARCHAR DEFAULT 'added'")
@@ -379,7 +392,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     # MetaTrawl never reads profile_positions.gene: the matrix export selects
     # chrom/pos/ACGT only. Dropping it is metadata-only and idempotent.
     conn.execute("ALTER TABLE profile_positions DROP COLUMN IF EXISTS gene")
-    _migrate_profile_counts_to_uint16(conn)
+    # Legacy count conversion rewrites the entire profile table. Keep the
+    # existing physical types on metadata-only adoption; imports cast explicitly.
     _run_once(conn, "allow_profiles_without_sylph", _allow_profiles_without_sylph)
     _run_once(conn, "normalize_sylph_genomes", _normalize_existing_sylph_genomes)
     if had_legacy_matrix_profiles:
@@ -390,6 +404,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
             FROM matrix_store_profiles
             """
         )
+
+    provenance.migrate(conn)
 
 
 def profile_storage_config(conn: duckdb.DuckDBPyConnection) -> ProfileStorageConfig:
@@ -740,6 +756,8 @@ def import_profile_bundle(
     add_run_if_missing: bool = False,
     cache_dir: Path | None = None,
     reference_cache: allele_mask.AlleleMaskWriteCache | None = None,
+    allow_incompatible_profiles: bool = False,
+    workflow_run_id: str | None = None,
 ) -> None:
     """Import profile, stat, and abundance files into project tables."""
     import_profile_bundles(
@@ -748,6 +766,8 @@ def import_profile_bundle(
         add_runs_if_missing=add_run_if_missing,
         cache_dir=cache_dir,
         reference_cache=reference_cache,
+        allow_incompatible_profiles=allow_incompatible_profiles,
+        workflow_run_id=workflow_run_id,
     )
 
 
@@ -758,6 +778,8 @@ def import_profile_bundles(
     add_runs_if_missing: bool = False,
     cache_dir: Path | None = None,
     reference_cache: allele_mask.AlleleMaskWriteCache | None = None,
+    allow_incompatible_profiles: bool = False,
+    workflow_run_id: str | None = None,
 ) -> None:
     """Import multiple bundles in one transaction using one DuckDB writer."""
     if not bundles:
@@ -772,6 +794,12 @@ def import_profile_bundles(
     conn.execute("BEGIN TRANSACTION")
     try:
         for bundle in bundles:
+            provenance.record_import(
+                conn, sample_id=bundle.run_id,
+                manifest=provenance.read_manifest(bundle.profile_file, bundle.run_id, bundle.provenance_file),
+                allow=allow_incompatible_profiles, run_id=workflow_run_id,
+                storage_mode=storage.mode,
+            )
             _import_profile_bundle_rows(
                 conn,
                 bundle,
@@ -782,6 +810,8 @@ def import_profile_bundles(
         conn.execute("COMMIT")
     except Exception:
         _rollback_quietly(conn)
+        if reference_cache is not None:
+            reference_cache.clear()
         raise
 
 
@@ -903,6 +933,7 @@ def add_profiles(
     *,
     add_runs_if_missing: bool = False,
     cache_dir: Path | None = None,
+    allow_incompatible_profiles: bool = False,
 ) -> int:
     """Import completed profile bundles by SRA run ID."""
     for bundle in bundles:
@@ -911,6 +942,7 @@ def add_profiles(
             bundle,
             add_run_if_missing=add_runs_if_missing,
             cache_dir=cache_dir,
+            allow_incompatible_profiles=allow_incompatible_profiles,
         )
     return len(bundles)
 
@@ -1924,28 +1956,6 @@ def _table_exists(conn: duckdb.DuckDBPyConnection, table_name: str) -> bool:
         [table_name],
     ).fetchone()
     return row is not None
-
-
-def _migrate_profile_counts_to_uint16(conn: duckdb.DuckDBPyConnection) -> None:
-    """Convert legacy floating-point profile counts to unsigned 16-bit integers."""
-    column_types = {
-        str(name): str(data_type).upper()
-        for name, data_type in conn.execute(
-            """
-            SELECT column_name, data_type
-            FROM information_schema.columns
-            WHERE table_schema = current_schema()
-              AND table_name = 'profile_positions'
-              AND column_name IN ('A', 'C', 'G', 'T')
-            """
-        ).fetchall()
-    }
-    for column in ("A", "C", "G", "T"):
-        if column_types.get(column) != "USMALLINT":
-            conn.execute(
-                f'ALTER TABLE profile_positions ALTER COLUMN "{column}" '
-                f'TYPE USMALLINT USING "{column}"::USMALLINT'
-            )
 
 
 def _run_once(

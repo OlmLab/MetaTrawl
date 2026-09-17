@@ -10,6 +10,10 @@ collection of SRA runs or local read sets into a durable, queryable project data
 coordinates the expensive steps needed to profile and compare thousands of
 samples efficiently.
 
+See [database versioning and profiling provenance](docs/database-provenance.md)
+for compatibility checks, adopting existing databases, and explicitly accepting
+unknown historical settings.
+
 ## MetaTrawl is a wrapper around ZipStrain
 
 MetaTrawl is **not** a replacement for ZipStrain and does not reimplement any of
@@ -134,7 +138,7 @@ workflow. Use Bioconda unless those tools are already installed independently.
 
 ### Docker
 
-The repository Dockerfile installs MetaTrawl, ZipStrain, PyTorch, HDF5 support,
+The repository Dockerfile installs DiMetaTrawl, ZipStrain, PyTorch, HDF5 support,
 Sylph, Bowtie2, Samtools, Prodigal, SRA Toolkit, and NCBI Datasets. Build the
 portable CPU image from the repository root:
 

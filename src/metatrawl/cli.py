@@ -19,6 +19,7 @@ from metatrawl import db as registry
 from metatrawl import genome_views
 from metatrawl import healthcheck
 from metatrawl import migration
+from metatrawl import provenance
 from metatrawl import viewer
 from metatrawl import workflows
 from metatrawl.config import WorkflowConfig, load_workflow_config
@@ -191,6 +192,8 @@ def profiles_remaining(db_file: Path, output_file: Path | None) -> None:
 
 
 @profiles_group.command("import")
+@click.option("--allow-incompatible-profiles", is_flag=True, help="Acknowledge and record unknown or mismatched profiling provenance.")
+@click.option("--provenance-file", type=click.Path(exists=True, path_type=Path), help="Bundle provenance JSON; otherwise discovered beside the profile.")
 @click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
 @click.option("--run-id", required=True, help="SRA run ID / sample ID.")
 @click.option("--profile-file", required=True, type=click.Path(path_type=Path), help="ZipStrain profile parquet.")
@@ -212,6 +215,8 @@ def profiles_import(
     sylph_abundance_file: Path,
     cache_dir: Path | None,
     add_run: bool,
+    allow_incompatible_profiles: bool,
+    provenance_file: Path | None,
 ) -> None:
     """Import profile rows, stats, and Sylph abundance into DuckDB."""
     bundle = registry.ProfileBundle(
@@ -220,6 +225,7 @@ def profiles_import(
         genome_stats_file=genome_stats_file,
         gene_stats_file=gene_stats_file,
         sylph_abundance_file=sylph_abundance_file,
+        provenance_file=provenance_file,
     )
     try:
         with registry.connect(db_file) as conn:
@@ -227,6 +233,7 @@ def profiles_import(
                 conn,
                 bundle,
                 add_run_if_missing=add_run,
+                allow_incompatible_profiles=allow_incompatible_profiles,
                 cache_dir=cache_dir,
             )
     except (FileNotFoundError, ValueError) as exc:
@@ -235,6 +242,7 @@ def profiles_import(
 
 
 @profiles_group.command("add")
+@click.option("--allow-incompatible-profiles", is_flag=True, help="Acknowledge and record unknown or mismatched profiling provenance.")
 @click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
 @click.option("--manifest", required=True, type=click.Path(path_type=Path), help="Completed profile manifest CSV.")
 @click.option(
@@ -248,6 +256,7 @@ def profiles_add(
     manifest: Path,
     cache_dir: Path | None,
     add_runs: bool,
+    allow_incompatible_profiles: bool,
 ) -> None:
     """Import completed profile bundles from a manifest CSV."""
     bundles = _read_profile_manifest(manifest)
@@ -257,6 +266,7 @@ def profiles_add(
                 conn,
                 bundles,
                 add_runs_if_missing=add_runs,
+                allow_incompatible_profiles=allow_incompatible_profiles,
                 cache_dir=cache_dir,
             )
     except (FileNotFoundError, ValueError) as exc:
@@ -484,6 +494,7 @@ def cache_serve(cache_dir: Path, host: str, port: int) -> None:
 
 
 @cli.command("profile-sra")
+@click.option("--allow-incompatible-profiles", is_flag=True, help="Acknowledge unknown legacy scratch checkpoints; recorded in bundle provenance.")
 @click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
 @click.option("--remaining-csv", required=True, type=click.Path(path_type=Path), help="CSV from profiles remaining.")
 @click.option("--cache-dir", required=True, type=click.Path(path_type=Path), help="Shared genome cache directory.")
@@ -509,6 +520,7 @@ def profile_sra(
     reference_stb: Path | None,
     threads: int,
     workflow_config: Path | None,
+    allow_incompatible_profiles: bool,
 ) -> None:
     """Run the local SRA profiling lifecycle with scratch cleanup."""
     run_ids = _read_remaining_csv(remaining_csv)
@@ -526,11 +538,13 @@ def profile_sra(
         reference_stb=reference_stb,
         threads=threads,
         workflow_config=execution_config,
+        allow_incompatible_profiles=allow_incompatible_profiles,
         logger=WorkflowLogger(),
     )
 
 
 @cli.command("sync-profile")
+@click.option("--allow-incompatible-profiles", is_flag=True, help="Acknowledge and record unknown or mismatched profiling provenance.")
 @click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
 @click.option("--cache-dir", required=True, type=click.Path(path_type=Path), help="Shared genome cache directory.")
 @click.option("--scratch-dir", required=True, type=click.Path(path_type=Path), help="Disposable worker scratch directory.")
@@ -558,6 +572,7 @@ def sync_profile(
     workflow_config: Path | None,
     skip_dependency_check: bool,
     keep_profile_outputs: bool,
+    allow_incompatible_profiles: bool,
 ) -> None:
     """Profile all remaining runs and import completed outputs into DuckDB."""
     try:
@@ -578,6 +593,7 @@ def sync_profile(
             workflow_config=execution_config,
             check_dependencies=not skip_dependency_check,
             cleanup_outputs=not keep_profile_outputs,
+            allow_incompatible_profiles=allow_incompatible_profiles,
             logger=WorkflowLogger(),
         )
     except (FileNotFoundError, RuntimeError, ValueError, healthcheck.DependencyCheckError) as exc:
@@ -1793,6 +1809,7 @@ def _read_profile_manifest(manifest: Path) -> list[registry.ProfileBundle]:
                 genome_stats_file=Path(row["genome_stats_file"]),
                 gene_stats_file=Path(row["gene_stats_file"]) if row.get("gene_stats_file") else None,
                 sylph_abundance_file=Path(row["sylph_abundance_file"]),
+                provenance_file=Path(row["provenance_file"]) if row.get("provenance_file") else None,
             )
             for row in reader
         ]
@@ -1806,6 +1823,70 @@ def _print_rows(rows: list[dict[str, object]], *, columns: list[str], title: str
     for row in rows:
         table.add_row(*(str(row.get(column, "")) for column in columns))
     console.print(table)
+
+
+@cli.group("database")
+def database_group() -> None:
+    """Inspect schema versions, profiling contracts, and provenance history."""
+
+
+@database_group.command("info")
+@click.option("--db", "db_file", required=True, type=click.Path(exists=True, path_type=Path))
+def database_info(db_file: Path) -> None:
+    """Show database identity and contracts without modifying the database."""
+    try:
+        with registry.connect_read_only(db_file) as conn:
+            click.echo(json.dumps(provenance.describe(conn), indent=2, sort_keys=True))
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@database_group.command("migrate")
+@click.option("--db", "db_file", required=True, type=click.Path(exists=True, path_type=Path))
+def database_migrate(db_file: Path) -> None:
+    """Adopt legacy data with metadata-only versioning; never infer old settings."""
+    try:
+        with registry.connect(db_file) as conn:
+            click.echo(json.dumps(provenance.describe(conn), indent=2, sort_keys=True))
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@database_group.command("contract-template")
+@click.option("--workflow-config", type=click.Path(exists=True, path_type=Path))
+def database_contract_template(workflow_config: Path | None) -> None:
+    """Print effective settings for this installation, not inferred historical settings."""
+    config = load_workflow_config(workflow_config, threads=1, sample_count=1)
+    click.echo(json.dumps(provenance.profiling_contract(config.profile), indent=2, sort_keys=True))
+
+
+@database_group.command("history")
+@click.option("--db", "db_file", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--limit", default=50, type=click.IntRange(min=1))
+def database_history(db_file: Path, limit: int) -> None:
+    """Show recent overrides and historical declarations."""
+    with registry.connect_read_only(db_file) as conn:
+        if not provenance.table_exists(conn, "provenance_events"):
+            click.echo("[]")
+            return
+        rows = conn.execute("SELECT created_at, sample_id, workflow_run_id, kind, details_json FROM provenance_events ORDER BY created_at DESC LIMIT ?", [limit]).fetchall()
+        click.echo(json.dumps([dict(time=r[0], sample=r[1], run=r[2], kind=r[3], details=json.loads(r[4])) for r in rows], indent=2))
+
+
+@database_group.command("declare-contract")
+@click.option("--db", "db_file", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--contract-file", required=True, type=click.Path(exists=True, path_type=Path), help="JSON containing a complete effective profiling contract.")
+@click.option("--sample-id", multiple=True, help="Repeat for selected legacy samples; omitted means all legacy-unknown samples.")
+@click.option("--reason", required=True, help="How the historical settings were established.")
+def database_declare_contract(db_file: Path, contract_file: Path, sample_id: tuple[str, ...], reason: str) -> None:
+    """Attach user-declared settings to legacy samples, never verified provenance."""
+    try:
+        contract = json.loads(contract_file.read_text())
+        with registry.connect(db_file) as conn:
+            count = provenance.declare_legacy(conn, contract=contract, samples=list(sample_id) if sample_id else None, reason=reason)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"declared={count} provenance=user-declared")
 
 
 if __name__ == "__main__":

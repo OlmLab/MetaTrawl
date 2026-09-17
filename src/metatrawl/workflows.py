@@ -27,6 +27,7 @@ from metatrawl import cache
 from metatrawl import db
 from metatrawl import healthcheck
 from metatrawl import matrix_hdf5
+from metatrawl import provenance
 from metatrawl.config import MatrixCompareConfig, ProfileConfig, ProfileImportConfig, WorkflowConfig
 from metatrawl.execution import WorkflowRuntime
 from metatrawl.logging import ThrottledMatrixLogger, WorkflowLogger
@@ -83,6 +84,8 @@ class _ProfileBundleImporter:
         config: ProfileImportConfig,
         cleanup_outputs: bool,
         logger: WorkflowLogger,
+        allow_incompatible_profiles: bool = False,
+        workflow_run_id: str | None = None,
     ) -> None:
         self.db_file = Path(db_file)
         self.output_dir = Path(output_dir)
@@ -90,6 +93,8 @@ class _ProfileBundleImporter:
         self.config = config
         self.cleanup_outputs = cleanup_outputs
         self.logger = logger
+        self.allow_incompatible_profiles = allow_incompatible_profiles
+        self.workflow_run_id = workflow_run_id
         # One cache for the importer's whole lifetime: reference segments are
         # immutable once written, so decoding them per sample was pure repeat work.
         self.reference_cache = allele_mask.AlleleMaskWriteCache()
@@ -216,6 +221,8 @@ class _ProfileBundleImporter:
                 [item.bundle for item in items],
                 cache_dir=self.cache_dir,
                 reference_cache=self.reference_cache,
+                allow_incompatible_profiles=self.allow_incompatible_profiles,
+                workflow_run_id=self.workflow_run_id,
             )
         except Exception as batch_error:
             if len(items) > 1:
@@ -263,6 +270,8 @@ class _ProfileBundleImporter:
                 item.bundle,
                 cache_dir=self.cache_dir,
                 reference_cache=self.reference_cache,
+                allow_incompatible_profiles=self.allow_incompatible_profiles,
+                workflow_run_id=self.workflow_run_id,
             )
         except Exception as exc:
             self._record_failure(item, exc)
@@ -1169,7 +1178,7 @@ def _prepare_fixed_reference_context(
             raise FileNotFoundError(f"Fixed-reference {label} file is missing or empty: {path}")
     source_hashes = {label: _sha256_file(path) for label, path in sources.items()}
     digest = hashlib.sha256(
-        json.dumps(source_hashes, sort_keys=True, separators=(",", ":")).encode()
+        json.dumps({"sources": source_hashes, "null_model": provenance.zipstrain_defaults()["null_model"]}, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     root = Path(cache_dir) / "fixed_references" / digest
     cached = _fixed_reference_context_from_dir(root, digest)
@@ -1196,6 +1205,7 @@ def _prepare_fixed_reference_context(
                 "zipstrain",
                 "utilities",
                 "prepare_profiling",
+                    *provenance.null_model_options(),
                 "--reference-fasta",
                 str(staged_reference),
                 "--gene-fasta",
@@ -1322,6 +1332,7 @@ def profile_sra_runs(
     logger: WorkflowLogger | None = None,
     raise_on_error: bool = True,
     completion_callback: Callable[[str], None] | None = None,
+    allow_incompatible_profiles: bool = False,
 ) -> dict[str, str]:
     """Profile SRA runs, retaining failed stage outputs for resumable retries.
 
@@ -1388,6 +1399,7 @@ def profile_sra_runs(
                 accessions_dir=Path(accessions_dir) if accessions_dir is not None else None,
                 runtime=runtime,
                 profile_config=workflow_config.profile,
+                allow_incompatible_profiles=allow_incompatible_profiles,
                 logger=logger,
             )
             futures[future] = run_id
@@ -1451,6 +1463,7 @@ def sync_remaining_profiles(
     workflow_config: WorkflowConfig | None = None,
     check_dependencies: bool = True,
     cleanup_outputs: bool = True,
+    allow_incompatible_profiles: bool = False,
     logger: WorkflowLogger | None = None,
 ) -> SyncSummary:
     """Profile remaining SRA runs and import completed output bundles."""
@@ -1480,6 +1493,14 @@ def sync_remaining_profiles(
         threads=threads,
         sample_count=len(run_ids),
     )
+    with db.connect(db_file) as conn:
+        workflow_run_id = provenance.start_run(
+            conn, contract=provenance.profiling_contract(workflow_config.profile),
+            allow=allow_incompatible_profiles,
+            details={"command": "sync-profile", "software": provenance.package_versions(),
+                     "config": provenance.operational_config(workflow_config), "db": str(db_file),
+                     "fixed_reference": fixed_reference_mode},
+        )
     logger.emit(step="sync", status="start", remaining=len(run_ids), output_dir=output_dir)
     skipped = 0
     importer = _ProfileBundleImporter(
@@ -1489,7 +1510,10 @@ def sync_remaining_profiles(
         config=workflow_config.profile_import,
         cleanup_outputs=cleanup_outputs,
         logger=logger,
+        allow_incompatible_profiles=allow_incompatible_profiles,
+        workflow_run_id=workflow_run_id,
     )
+    run_status = "failed"
     try:
         failures = profile_sra_runs(
             run_ids=run_ids,
@@ -1507,9 +1531,18 @@ def sync_remaining_profiles(
             logger=logger,
             raise_on_error=False,
             completion_callback=importer.submit,
+            allow_incompatible_profiles=allow_incompatible_profiles,
         ) or {}
+        run_status = "complete" if not failures else "failed"
     finally:
-        importer.finish()
+        try:
+            importer.finish()
+        except BaseException:
+            run_status = "failed"
+            raise
+        finally:
+            with db.connect(db_file) as conn:
+                provenance.finish_run(conn, workflow_run_id, "failed" if importer.failures else run_status)
     failures.update(importer.failures)
     if failures:
         with db.connect(db_file) as conn:
@@ -1591,6 +1624,7 @@ def cleanup_profile_bundle(bundle: db.ProfileBundle) -> int:
         bundle.genome_stats_file,
         bundle.gene_stats_file,
         bundle.sylph_abundance_file,
+        bundle.provenance_file or provenance.manifest_path(bundle.profile_file),
     ]
     seen: set[Path] = set()
     for path in paths:
@@ -1634,6 +1668,7 @@ def _profile_one_sra_run(
     runtime: WorkflowRuntime,
     profile_config: ProfileConfig,
     logger: WorkflowLogger,
+    allow_incompatible_profiles: bool = False,
 ) -> None:
     if output_dir is not None and _published_profile_bundle_complete(
         run_id=run_id,
@@ -1796,6 +1831,8 @@ def _profile_one_sra_run(
             runtime=runtime,
             profile_config=profile_config,
             fixed_reference=fixed_reference,
+            allow_incompatible_profiles=allow_incompatible_profiles,
+            sample_input=sample_input,
             logger=logger,
         )
 
@@ -1980,14 +2017,41 @@ def _run_alignment_and_profile(
     fixed_reference: FixedReferenceContext | None = None,
     threads: int | None = None,
     logger: WorkflowLogger,
+    allow_incompatible_profiles: bool = False,
+    sample_input: db.SampleInput | None = None,
 ) -> None:
     runtime = runtime or _DirectRuntime(threads or 1)
     profile_config = profile_config or ProfileConfig()
+    scientific_contract = provenance.profiling_contract(profile_config)
     if reference.stb_file is None:
         raise ValueError(f"sample={run_id} step=profile missing STB file from cache reference preparation")
     output_dir.mkdir(parents=True, exist_ok=True)
     profile_work = sample_scratch / "zipstrain_profile"
     profile_work.mkdir(parents=True, exist_ok=True)
+    # Never stamp changed settings onto an existing checkpoint.
+    settings_checkpoint = sample_scratch / "profiling_settings.json"
+    legacy_marker = sample_scratch / "legacy_checkpoint_acknowledged"
+    legacy_checkpoint = legacy_marker.exists() or (
+        not settings_checkpoint.exists()
+        and ((sample_scratch / f"{run_id}.bam").exists() or any(profile_work.iterdir()))
+    )
+    if legacy_checkpoint:
+        provenance.require_compatible([f"sample={run_id} existing scratch checkpoint has unknown historical settings"], allow_incompatible_profiles)
+        legacy_marker.touch()
+    if settings_checkpoint.exists():
+        previous = json.loads(settings_checkpoint.read_text())
+        changes = provenance.differences(previous, scientific_contract)
+        if changes:
+            raise ValueError(f"sample={run_id} checkpoint settings differ: {'; '.join(changes)}. "
+                             "Use a new scratch directory to regenerate this sample.")
+    else:
+        settings_checkpoint.write_text(provenance.canonical(scientific_contract) + "\n")
+
+    references = provenance.reference_catalog(reference)
+    reference_checkpoint = sample_scratch / "profiling_references.json"
+    if reference_checkpoint.exists() and json.loads(reference_checkpoint.read_text()) != references:
+        raise ValueError(f"sample={run_id} checkpoint reference sequence or annotation changed. Use a new scratch directory.")
+    reference_checkpoint.write_text(provenance.canonical(references) + "\n")
 
     if fixed_reference is not None:
         bed_file = fixed_reference.bed_file
@@ -2010,6 +2074,7 @@ def _run_alignment_and_profile(
                     "zipstrain",
                     "utilities",
                     "prepare_profiling",
+                    *provenance.null_model_options(),
                     "--reference-fasta",
                     str(reference.reference_fasta),
                     "--gene-fasta",
@@ -2153,14 +2218,28 @@ def _run_alignment_and_profile(
             "--output-dir",
             str(profile_work),
         ]
-        if profile_config.min_read_ani is not None:
-            profile_command.extend(["--min-read-ani", str(profile_config.min_read_ani)])
+        profile_command.extend(["--min-read-ani", str(scientific_contract["profile"]["min_read_ani"])])
         runtime.run(
             "profile",
             profile_command,
             sample=run_id,
         )
         _publish_profile_outputs(run_id=run_id, profile_work=profile_work, output_dir=output_dir)
+        provenance.write_manifest(
+            profile_file=output_dir / f"{run_id}.profile.parquet", sample_id=run_id,
+            contract=scientific_contract, references=references,
+            details={"software": provenance.package_versions(), "software_scope": "coordinator",
+                     "legacy_checkpoint_acknowledged": legacy_checkpoint,
+                     "input": {"type": sample_input.input_type,
+                               "sample_id": sample_input.sample_id,
+                               "read_1": str(sample_input.read_1_file) if sample_input.read_1_file else None,
+                               "read_2": str(sample_input.read_2_file) if sample_input.read_2_file else None} if sample_input else None,
+                     "read_layout": read_layout, "effective_read_inclusion": read_inclusion,
+                     "null_model_sha256": provenance.sha256_file(null_model_file),
+                     "zipstrain_asset_contract": json.loads(profiling_contract_file.read_text()),
+                     "profile_command": profile_command},
+            status="user-declared" if legacy_checkpoint else "recorded",
+        )
         _publish_bundle_ready_marker(
             output_dir,
             run_id,
@@ -2299,6 +2378,7 @@ def _ensure_null_model(*, profile_work: Path, run_id: str, logger: WorkflowLogge
             "zipstrain",
             "utilities",
             "build-null-model",
+            *provenance.null_model_options(),
             "--output-file",
             str(null_model),
         ],

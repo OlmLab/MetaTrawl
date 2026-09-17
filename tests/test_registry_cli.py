@@ -21,6 +21,7 @@ from metatrawl import cache
 from metatrawl import cli
 from metatrawl import db as registry
 from metatrawl import workflows
+from metatrawl import provenance
 from metatrawl.config import ProfileConfig, ProfileImportConfig, WorkflowConfig
 from metatrawl.logging import WorkflowLogger
 
@@ -93,6 +94,9 @@ def _write_bundle_files(tmp_path: Path, run_id: str, *, coverage: float = 2.0, b
             "abundance": [abundance],
         }
     ).write_csv(sylph_file)
+    provenance.write_manifest(profile_file=profile_file, sample_id=run_id,
+                              contract=provenance.profiling_contract(ProfileConfig()),
+                              references={}, details={"fixture": True})
     return registry.ProfileBundle(
         run_id=run_id,
         profile_file=profile_file,
@@ -1211,6 +1215,7 @@ def test_profile_importer_batches_bundles_on_one_writer_and_cleans_after_commit(
         registry.add_runs(conn, run_ids)
     for run_id in run_ids:
         bundle = _write_bundle_files(output_dir, run_id)
+        provenance.manifest_path(bundle.profile_file).rename(provenance.manifest_path(output_dir / f"{run_id}.profile.parquet"))
         bundle.profile_file.rename(output_dir / f"{run_id}.profile.parquet")
 
     original_import = registry.import_profile_bundles
@@ -1248,7 +1253,7 @@ def test_profile_importer_batches_bundles_on_one_writer_and_cleans_after_commit(
     assert sum(batch_sizes) == 3
     assert any(size > 1 for size in batch_sizes)
     assert writer_threads == {"metatrawl-profile-importer"}
-    assert importer.cleaned_files == 12
+    assert importer.cleaned_files == 15
     assert not list(output_dir.iterdir())
     import_logs = capsys.readouterr().err
     assert "step=import status=batch-active" in import_logs
@@ -1268,6 +1273,7 @@ def test_profile_importer_falls_back_to_individual_transactions_on_bad_bundle(
         registry.add_runs(conn, run_ids)
     for run_id in run_ids:
         bundle = _write_bundle_files(output_dir, run_id)
+        provenance.manifest_path(bundle.profile_file).rename(provenance.manifest_path(output_dir / f"{run_id}.profile.parquet"))
         bundle.profile_file.rename(output_dir / f"{run_id}.profile.parquet")
     (output_dir / "SRR_BAD.genome_stats.parquet").write_text("not parquet")
 
@@ -1324,6 +1330,7 @@ def test_sync_profile_replenishes_workers_while_single_importer_is_busy(
         nonlocal profiled
         output_dir.mkdir(parents=True, exist_ok=True)
         bundle = _write_bundle_files(output_dir, run_id)
+        provenance.manifest_path(bundle.profile_file).rename(provenance.manifest_path(output_dir / f"{run_id}.profile.parquet"))
         bundle.profile_file.rename(output_dir / f"{run_id}.profile.parquet")
         with profiled_lock:
             profiled += 1
@@ -1385,6 +1392,7 @@ def test_profile_sra_requeues_an_existing_published_bundle_without_reprofiling(
     output_dir = tmp_path / "outputs"
     output_dir.mkdir()
     bundle = _write_bundle_files(output_dir, "SRR1")
+    provenance.manifest_path(bundle.profile_file).rename(provenance.manifest_path(output_dir / "SRR1.profile.parquet"))
     bundle.profile_file.rename(output_dir / "SRR1.profile.parquet")
     bundle.sylph_abundance_file.rename(output_dir / "SRR1.sylph.tsv")
     completed: list[str] = []
@@ -1706,7 +1714,7 @@ def test_alignment_and_profile_stage_publishes_outputs(tmp_path: Path, monkeypat
         stb_file=reference_dir / "reference.stb",
     )
     reference.reference_fasta.write_text(">contig\nACGT\n")
-    reference.gene_fasta.write_text(">gene\nAC\n")
+    reference.gene_fasta.write_text(">contig_1 # 1 # 2 # 1\nAC\n")
     reference.stb_file.write_text("contig\tGCF_1\n")
     run_calls: list[list[str]] = []
     shell_calls: list[str] = []
@@ -1792,7 +1800,7 @@ def test_alignment_profile_builds_null_model_when_prepare_does_not(tmp_path: Pat
         stb_file=reference_dir / "reference.stb",
     )
     reference.reference_fasta.write_text(">contig\nACGT\n")
-    reference.gene_fasta.write_text(">gene\nAC\n")
+    reference.gene_fasta.write_text(">contig_1 # 1 # 2 # 1\nAC\n")
     reference.stb_file.write_text("contig\tGCF_1\n")
     run_calls: list[list[str]] = []
 
@@ -1804,6 +1812,7 @@ def test_alignment_profile_builds_null_model_when_prepare_does_not(tmp_path: Pat
             (output_dir / "reference.fasta").write_text(">contig\nACGT\n")
             (output_dir / "genomes_bed_file.bed").write_text("contig\t1\t4\n")
             (output_dir / "gene_range_table.tsv").write_text("gene\tcontig\t1\t2\n")
+            (output_dir / "profiling_contract.json").write_text("{}")
         if cmd[:3] == ["zipstrain", "utilities", "build-null-model"]:
             Path(cmd[cmd.index("--output-file") + 1]).write_text("null")
         if cmd[:2] == ["samtools", "faidx"]:
@@ -1838,6 +1847,10 @@ def test_alignment_profile_builds_null_model_when_prepare_does_not(tmp_path: Pat
     assert not (sample_scratch / "zipstrain_profile").exists()
     assert profile_call[profile_call.index("--null-model") + 1].endswith("null_model.parquet")
     assert profile_call[profile_call.index("--read-inclusion") + 1] == "all-mapped"
+    manifest = provenance.read_manifest(tmp_path / "outputs" / "SRR1.profile.parquet", "SRR1")
+    assert manifest["contract"]["profile"]["read_inclusion"] == "proper-pairs"
+    assert manifest["details"]["effective_read_inclusion"] == "all-mapped"
+    assert manifest["details"]["read_layout"] == "single"
 
 
 def test_profile_failure_keeps_validated_bam_after_releasing_reads(
@@ -1855,7 +1868,7 @@ def test_profile_failure_keeps_validated_bam_after_releasing_reads(
         stb_file=reference_dir / "reference.stb",
     )
     reference.reference_fasta.write_text(">contig\nACGT\n")
-    reference.gene_fasta.write_text(">gene\nAC\n")
+    reference.gene_fasta.write_text(">contig_1 # 1 # 2 # 1\nAC\n")
     reference.stb_file.write_text("contig\tGCF_1\n")
 
     def fake_run(cmd: list[str], *, sample: str, step: str) -> None:
@@ -1933,6 +1946,7 @@ def test_sync_profiles_remaining_runs_and_imports_outputs(tmp_path: Path, monkey
         assert kwargs["run_ids"] == ["SRR2"]
         output_dir.mkdir(parents=True, exist_ok=True)
         bundle = _write_bundle_files(output_dir, "SRR2")
+        provenance.manifest_path(bundle.profile_file).rename(provenance.manifest_path(output_dir / "SRR2.profile.parquet"))
         bundle.profile_file.rename(output_dir / "SRR2.profile.parquet")
         kwargs["completion_callback"]("SRR2")
 
@@ -1957,7 +1971,7 @@ def test_sync_profiles_remaining_runs_and_imports_outputs(tmp_path: Path, monkey
     assert result.exit_code == 0, result.output
     assert "requested=1" in result.output
     assert "imported=1" in result.output
-    assert "cleaned_files=4" in result.output
+    assert "cleaned_files=5" in result.output
     with duckdb.connect(str(db_file)) as conn:
         assert conn.execute("SELECT sample_id FROM samples ORDER BY sample_id").fetchall() == [("SRR1",), ("SRR2",)]
         assert conn.execute("SELECT count(*) FROM profile_positions WHERE sample_id = 'SRR2'").fetchone()[0] == 2
@@ -2056,6 +2070,7 @@ def test_sync_profile_runs_profile_sync(tmp_path: Path, monkeypatch) -> None:
     def fake_profile_sra_runs(**kwargs) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
         bundle = _write_bundle_files(output_dir, "SRR1")
+        provenance.manifest_path(bundle.profile_file).rename(provenance.manifest_path(output_dir / "SRR1.profile.parquet"))
         bundle.profile_file.rename(output_dir / "SRR1.profile.parquet")
         kwargs["completion_callback"]("SRR1")
 
@@ -2092,6 +2107,7 @@ def test_sync_can_keep_profile_outputs_for_debugging(tmp_path: Path, monkeypatch
     def fake_profile_sra_runs(**kwargs) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
         bundle = _write_bundle_files(output_dir, "SRR1")
+        provenance.manifest_path(bundle.profile_file).rename(provenance.manifest_path(output_dir / "SRR1.profile.parquet"))
         bundle.profile_file.rename(output_dir / "SRR1.profile.parquet")
         kwargs["completion_callback"]("SRR1")
 
@@ -2134,6 +2150,7 @@ def test_sync_checkpoints_successful_samples_before_reporting_failures(tmp_path:
     def fake_profile_sra_runs(**kwargs):
         output_dir.mkdir(parents=True, exist_ok=True)
         bundle = _write_bundle_files(output_dir, "SRR_GOOD")
+        provenance.manifest_path(bundle.profile_file).rename(provenance.manifest_path(output_dir / "SRR_GOOD.profile.parquet"))
         bundle.profile_file.rename(output_dir / "SRR_GOOD.profile.parquet")
         kwargs["completion_callback"]("SRR_GOOD")
         return {"SRR_BAD": "prodigal crashed"}

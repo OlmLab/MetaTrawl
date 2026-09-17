@@ -16,6 +16,8 @@ from metatrawl import db
 from metatrawl import matrix_hdf5
 from metatrawl import migration
 from metatrawl import workflows
+from metatrawl import provenance
+from metatrawl.config import ProfileConfig
 from metatrawl.api import ProfileCountsUnavailableError, open_database
 from metatrawl.logging import ThrottledMatrixLogger
 
@@ -118,6 +120,9 @@ def _write_bundle(tmp_path: Path, sample: str) -> db.ProfileBundle:
             "abundance": [0.2],
         }
     ).write_csv(sylph)
+    provenance.write_manifest(profile_file=profile_file, sample_id=sample,
+                              contract=provenance.profiling_contract(ProfileConfig()),
+                              references={}, details={"fixture": True})
     return db.ProfileBundle(
         run_id=sample,
         profile_file=profile_file,

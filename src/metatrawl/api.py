@@ -10,6 +10,7 @@ import duckdb
 import polars as pl
 
 from metatrawl import db as registry
+from metatrawl import provenance
 
 
 class ProfileCountsUnavailableError(RuntimeError):
@@ -27,6 +28,11 @@ class MetaTrawlDatabase:
     def genome(self, genome: str) -> GenomeView:
         """Return a genome-centric view across all samples."""
         return GenomeView(self.path, _required_text(genome, "genome"))
+
+    def metadata(self) -> dict:
+        """Read schema identity and profiling contracts without migrating old data."""
+        with duckdb.connect(str(self.path), read_only=True) as conn:
+            return provenance.describe(conn)
 
     def sample(self, sample_id: str) -> SampleView:
         """Return a view of all stored data for one sample."""
@@ -88,6 +94,7 @@ class Query:
     def collect(self) -> pl.DataFrame:
         """Execute the query and return an eager Polars DataFrame."""
         with duckdb.connect(str(self.db_path), read_only=True) as conn:
+            provenance.check_schema(conn)
             return conn.execute(self.sql, list(self.parameters)).pl()
 
     def lazy(self) -> pl.LazyFrame:
@@ -116,6 +123,7 @@ class Query:
             f"(FORMAT PARQUET, COMPRESSION {_sql_string(compression)})"
         )
         with duckdb.connect(str(self.db_path), read_only=True) as conn:
+            provenance.check_schema(conn)
             conn.execute(copy_sql, list(self.parameters))
         return path
 
