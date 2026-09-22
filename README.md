@@ -1,264 +1,127 @@
 # MetaTrawl
 
 <p align="center">
-  <img src="metatrawl-concept.svg" alt="MetaTrawl gathers bacterial chromosomes from large metagenomic collections and organizes them for strain-level comparison" width="100%">
+  <img src="assets/metatrawl-concept.svg" alt="MetaTrawl organizes bacterial genomes from large metagenomic collections for strain-level comparison" width="100%">
 </p>
 
-MetaTrawl streamlines [ZipStrain](https://github.com/parsaghadermarzi/ZipStrain)
-for very large-scale, strain-level analysis of metagenomic samples. It turns a
-collection of SRA runs or local read sets into a durable, queryable project database and
-coordinates the expensive steps needed to profile and compare thousands of
-samples efficiently.
+<p align="center">
+  <a href="https://pypi.org/project/metatrawl/"><img alt="PyPI" src="https://img.shields.io/pypi/v/metatrawl?style=flat-square"></a>
+  <a href="https://pypi.org/project/metatrawl/"><img alt="Python" src="https://img.shields.io/pypi/pyversions/metatrawl?style=flat-square"></a>
+  <a href="https://hub.docker.com/r/parsaghadermazi/metatrawl"><img alt="Docker" src="https://img.shields.io/docker/v/parsaghadermazi/metatrawl?sort=semver&style=flat-square&label=docker"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/OlmLab/MetaTrawl?style=flat-square"></a>
+</p>
 
-See [database versioning and profiling provenance](docs/database-provenance.md)
-for compatibility checks, adopting existing databases, and explicitly accepting
-unknown historical settings.
+MetaTrawl is a workflow and data layer for large-scale strain analysis of
+metagenomic samples. Starting from SRA run accessions or local reads, it manages
+reference discovery, alignment, [ZipStrain](https://github.com/OlmLab/ZipStrain)
+profiling, durable storage, genome-specific matrices, pairwise comparisons, and
+interactive genome views.
 
-## MetaTrawl is a wrapper around ZipStrain
+It is designed for projects that outgrow collections of loose profile files.
+Samples can be added over time, expensive stages can run locally or through
+Slurm, and every sync command derives its remaining work from durable state.
 
-MetaTrawl is **not** a replacement for ZipStrain and does not reimplement any of
-its science. Every heavy computation in the pipeline is a ZipStrain call that
-MetaTrawl prepares inputs for, runs, and files the outputs from. MetaTrawl is the
-orchestration and data-management layer that makes running ZipStrain at the scale
-of thousands of metagenomes practical.
+## What MetaTrawl Provides
 
-The division of labor is strict:
+- **One project database.** Profile data, genome and gene statistics, Sylph
+  abundance, sample state, and provenance live in DuckDB.
+- **Incremental workflows.** Add samples and rerun the same commands; completed
+  profiles, matrices, comparisons, and views are reused.
+- **Controlled parallelism.** Configure workers, threads, memory, retries, and
+  local or Slurm execution independently for each stage.
+- **Shared reference caching.** Concurrent workers reuse downloaded genomes,
+  Prodigal annotations, Bowtie2 indexes, and matrix requirement files.
+- **Compact storage.** Choose complete positional profiles or allele-mask
+  storage for projects focused on popANI.
+- **Native ZipStrain outputs.** Per-genome HDF5 matrices and comparison DuckDB
+  files remain usable through ZipStrain itself.
+- **Analysis access.** Query the project through Python and Polars or generate
+  self-contained genome views with heatmaps, dendrograms, clusters, and neighbor
+  networks.
 
-| ZipStrain does the science | MetaTrawl does the plumbing |
-| --- | --- |
-| Profiles a sample against a reference (`profile-single`) | Registers SRA runs, downloads reads, selects the per-sample reference, aligns, and feeds ZipStrain |
-| Builds the null model and profiling contract (`prepare_profiling`, `build-null-model`) | Runs those steps once per sample and caches their inputs |
-| Computes the strain matrix and all-vs-all ANI (`matrix_pairs.matrix_compare`) | Decides which samples are eligible, assembles the matrix, and stores the comparison |
-| Defines the HDF5 matrix and comparison-database formats | Keeps one durable matrix and comparison per genome and appends to them incrementally |
+## Workflow
 
-Under the hood, MetaTrawl drives these ZipStrain touchpoints for you:
-
-- `zipstrain utilities prepare_profiling` — turn a reference into a BED file,
-  gene-range table, and profiling contract.
-- `zipstrain utilities build-null-model` — build the per-sample null model.
-- `zipstrain utilities profile-single` — the actual strain profiling step.
-- ZipStrain's HDF5 matrix layout — every matrix MetaTrawl writes is a native
-  ZipStrain matrix store.
-- `zipstrain.matrix_pairs.matrix_compare` — the resumable all-vs-all comparison.
-
-Around those, MetaTrawl orchestrates the external tools ZipStrain expects to
-already have inputs from: SRA Toolkit (`prefetch`, `fasterq-dump`), Sylph, NCBI
-`datasets`, Prodigal, Bowtie2, and Samtools. You never call any of these by
-hand — MetaTrawl does, in the right order, with a shared cache and per-sample
-checkpointing.
-
-### The whole pipeline is five commands
-
-Once your project database exists, the entire ZipStrain workflow — from raw SRA
-run IDs to browsable per-genome strain comparisons — is five `sync` commands you
-can rerun as often as you like:
-
-```bash
-metatrawl sync-profile        --db metatrawl.duckdb ...   # download → align → ZipStrain profile → import
-metatrawl matrix sync-build   --db metatrawl.duckdb ...   # assemble one ZipStrain matrix per genome
-metatrawl matrix sync-compare --db metatrawl.duckdb ...   # ZipStrain all-vs-all ANI per matrix
-metatrawl sync-genome-views   --db metatrawl.duckdb ...   # static, browser-ready bundles
-metatrawl view genomes        --view-dir genome_views     # explore the results
+```text
+SRA accessions or local FASTQs
+            │
+            ▼
+  sync-profile ───────► DuckDB project store
+            │              profiles · stats · abundance · provenance
+            ▼
+  matrix sync-build ──► one HDF5 matrix per genome
+            │
+            ▼
+  matrix sync-compare ► one comparison DuckDB per genome
+            │
+            ▼
+  sync-genome-views ──► static interactive genome bundles
 ```
 
-Every `sync` command is idempotent, resumable, and incremental: add more runs at
-any time, rerun the same five commands, and each one does only the outstanding
-work. The full decision logic behind that behavior is documented in
-[How Sync Works (The Logic)](#how-sync-works-the-logic).
-
-## Why MetaTrawl?
-
-Running a strain-level workflow over a few samples is straightforward. Running
-the same workflow over thousands of metagenomes introduces a different set of
-problems:
-
-- Which SRA runs have already been processed?
-- How can workers share downloaded genomes and Prodigal annotations safely?
-- How can temporary reads, alignments, and per-sample references be removed
-  without losing the durable results?
-- How can samples be selected for a genome-specific matrix using coverage,
-  breadth, BER, or Sylph abundance?
-- How can newly added samples be appended without rebuilding matrices or
-  recomputing completed sample pairs?
-- How can profile, genome, gene, and abundance data be queried without managing
-  thousands of loose files?
-
-MetaTrawl addresses these problems with a mutable DuckDB project store and an
-incremental workflow:
-
-1. Register SRA accessions or local FASTQ paths.
-2. Download SRA reads when needed and screen all reads with Sylph.
-3. Reuse a shared genome and Prodigal cache.
-4. Align reads and profile samples with ZipStrain.
-5. Import profile positions, genome statistics, gene statistics, and Sylph
-   abundance into DuckDB.
-6. Build genome-specific dense or sparse ZipStrain matrices from eligible
-   samples.
-7. Run resumable strain-level comparisons and compute only newly introduced
-   sample pairs.
-
-Many SRA workers can profile samples concurrently while sharing one prepared
-reference cache. Per-sample reads, alignments, concatenated references, and
-intermediate outputs live in scratch space and are deleted after successful
-import. The DuckDB database, genome cache, matrix stores, and comparison
-databases remain durable.
+ZipStrain defines the profile, matrix, ANI, IBS, and gene-comparison semantics.
+MetaTrawl prepares references, runs external tools, writes ZipStrain-compatible
+matrices, schedules comparisons, records provenance, and cleans temporary data.
 
 ## Installation
 
-### Recommended: Bioconda
+### Bioconda
 
-For the complete workflow, Conda is the recommended installation method:
-
-```bash
-conda install bioconda::metatrawl
-```
-
-The Bioconda package installs MetaTrawl together with the external tools used by
-the pipeline, including ZipStrain, Sylph, Bowtie2, Samtools, Prodigal, SRA
-Toolkit, and NCBI Datasets.
-
-Installing into a dedicated environment keeps the workflow isolated:
+Bioconda is the simplest installation for the complete workflow because it also
+installs the external bioinformatics tools:
 
 ```bash
-conda create -n metatrawl bioconda::metatrawl
+conda create -n metatrawl -c conda-forge -c bioconda metatrawl
 conda activate metatrawl
+metatrawl check
 ```
 
 ### PyPI
-
-MetaTrawl is also available from PyPI:
 
 ```bash
 pip install metatrawl
 ```
 
-The PyPI package installs MetaTrawl and its Python dependencies. It does not
-install the external command-line tools required by the complete SRA profiling
-workflow. Use Bioconda unless those tools are already installed independently.
+The PyPI package installs Python dependencies. Sylph, Bowtie2, Samtools,
+Prodigal, SRA Toolkit, and NCBI Datasets must be installed separately when their
+workflow stages are used.
 
-### Docker
+### Containers
 
-The repository Dockerfile installs DiMetaTrawl, ZipStrain, PyTorch, HDF5 support,
-Sylph, Bowtie2, Samtools, Prodigal, SRA Toolkit, and NCBI Datasets. Build the
-portable CPU image from the repository root:
+Published images contain the complete toolchain:
 
 ```bash
-docker build -t metatrawl:latest .
-docker run --rm metatrawl:latest check
+# Portable CPU image
+docker pull parsaghadermazi/metatrawl:1.0.0
+
+# NVIDIA CUDA 12.8 image
+docker pull parsaghadermazi/metatrawl:1.0.0-cuda
 ```
 
-When building on an Apple Silicon Mac for an x86_64 cluster such as Alpine,
-select the target architecture explicitly:
+See [Container usage](docs/containers.md) for project mounts, CUDA checks,
+GPU comparison commands, local builds, and Apptainer use on HPC.
 
-```bash
-docker build --platform linux/amd64 -t metatrawl:latest .
-```
+## Quick Start
 
-Mount a project directory at `/work` to run a workflow:
-
-```bash
-docker run --rm \
-  -v "$PWD:/work" \
-  metatrawl:latest \
-  init --db /work/metatrawl.duckdb
-```
-
-For NVIDIA GPU comparison, build against a PyTorch CUDA wheel index compatible
-with the host driver and launch through the NVIDIA Container Toolkit:
-
-```bash
-docker build \
-  --platform linux/amd64 \
-  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128 \
-  -t metatrawl:cuda .
-
-docker run --rm --gpus all \
-  --entrypoint python \
-  metatrawl:cuda \
-  -c "import torch; print(torch.cuda.is_available())"
-```
-
-The CPU and CUDA images otherwise contain the same MetaTrawl workflow tools.
-
-### Verify The Installation
-
-Check the installed Python packages and external executables:
-
-```bash
-metatrawl test
-```
-
-Use the strict check before starting a long workflow. It exits non-zero when a
-required dependency is unavailable:
-
-```bash
-metatrawl check
-```
-
-### Development Installation
-
-```bash
-pip install -e ".[test]"
-```
-
-This installs the local checkout with the test dependencies. External workflow
-tools must still be available in the active environment.
-
-## Tutorial: SRA IDs To Comparisons
-
-This is the normal MetaTrawl workflow. It starts from SRA run IDs and ends with
-one comparison database per genome.
-
-### 1. Create An Empty Project
+### 1. Create a project
 
 ```bash
 metatrawl init --db metatrawl.duckdb
 ```
 
-This creates the DuckDB project store. The database tracks SRA runs, imported
-profile rows, genome stats, gene stats, Sylph abundance, and matrix/compare
-bookkeeping.
-
-For projects that only need allele-presence comparisons, initialize an
-`allele-mask` database:
-
-```bash
-metatrawl init \
-  --db metatrawl.duckdb \
-  --profile-storage allele-mask \
-  --profile-min-cov 5
-```
-
-ZipStrain profiling is unchanged and still produces its normal full profile.
-During import, MetaTrawl stores only the covered-position and allele-set masks
-needed by bitmask matrices, plus one shared copy of each cached reference
-scaffold. The temporary full profile is deleted only after this transaction
-commits.
-
-The threshold is part of the database contract and cannot be changed later.
-`allele-mask` supports dense or sparse bitmask matrices, popANI, IBS, and
-gene-level popANI. Count matrices, conANI, cosANI, raw A/C/G/T profile queries,
-and count reconstruction require normal `full` storage.
-
-### 2. Register Sample Inputs
-
-For SRA inputs, provide a CSV with the standard `Run` field. Other
-SRA/ENA metadata columns are allowed and ignored by registration:
+Register SRA runs from a metadata CSV containing a `Run` column:
 
 ```csv
-Run,study_accession,bioproject
-SRR000001,SRP000001,PRJNA000001
-SRR000002,SRP000001,PRJNA000001
+Run,study_accession
+SRR000001,SRP000001
+SRR000002,SRP000001
 ```
 
 ```bash
 metatrawl samples add-sra-ids \
   --db metatrawl.duckdb \
-  --input-file sra_samples.csv
+  --input-file samples.csv
 ```
 
-For local reads, use the deterministic columns `sample_id`, `read_1`, and
-`read_2`. Leave `read_2` empty for a single-end sample:
+Local paired or single-end reads can be registered without copying them:
 
 ```csv
 sample_id,read_1,read_2
@@ -272,30 +135,7 @@ metatrawl samples add-reads \
   --input-file local_reads.csv
 ```
 
-Registration validates the local files and stores their absolute paths in
-DuckDB. It does not copy read data. `sync-profile` copies a sample's reads into
-disposable scratch only when that sample starts. The original files are never
-deleted. On a cluster, the registered paths must be visible from the worker
-nodes.
-
-The older `metatrawl runs add/list/delete` commands remain available. Runs
-created by older MetaTrawl versions are interpreted as SRA inputs.
-
-Check the whole project status:
-
-```bash
-metatrawl status --db metatrawl.duckdb
-```
-
-The status output is intentionally small: active runs, completed samples,
-remaining profiles, profile rows, matrices, and compares.
-
-### 3. Profile Remaining Runs And Import Them
-
-Use `sync-profile` for the high-level profile sync. It finds remaining samples,
-downloads SRA reads or stages registered local reads, runs Sylph, prepares the genome cache, aligns reads, runs
-ZipStrain profiling, imports completed outputs into DuckDB, and removes
-per-sample scratch/results after successful import.
+### 2. Profile and import samples
 
 ```bash
 metatrawl sync-profile \
@@ -303,101 +143,14 @@ metatrawl sync-profile \
   --cache-dir cache \
   --scratch-dir scratch \
   --output-dir outputs \
-  --sylph-db /full/path/to/gtdb-r220-c200-dbv1.syldb \
-  --threads 16
+  --sylph-db /path/to/gtdb.syldb \
+  --workflow-config workflow.toml
 ```
 
-`sync-profile` checkpoints each sample independently. If one sample fails,
-successful samples are still imported and cleaned. Failed or incomplete runs stay
-pending, so rerunning the same command retries only remaining work.
+Each completed sample is imported transactionally and then removed from scratch.
+Rerunning the command resumes incomplete samples and skips imported samples.
 
-During profiling, MetaTrawl logs compact lines that work well in terminal and
-cluster logs:
-
-```text
-METATRAWL sample=SRR123 step=sylph status=done genomes=12 elapsed=4.2s
-METATRAWL sample=SRR123 step=cache status=done accessions=10 elapsed=28.9s
-METATRAWL sample=SRR123 step=cleanup status=done removed=scratch/SRR123
-```
-
-Use an absolute `--sylph-db` path when possible. MetaTrawl validates the file
-before launching workers.
-
-#### Profile against a fixed reference
-
-When every sample should be mapped against the same existing reference, provide
-the reference FASTA, its Prodigal-compatible nucleotide gene FASTA, and the STB
-scaffold-to-genome mapping together:
-
-```bash
-metatrawl sync-profile \
-  --db metatrawl.duckdb \
-  --cache-dir cache \
-  --scratch-dir scratch \
-  --output-dir outputs \
-  --reference-genome /references/reference.fna \
-  --reference-genome-genes /references/reference.genes.fna \
-  --reference-stb /references/reference.stb \
-  --threads 16
-```
-
-This mode skips Sylph, NCBI genome downloading, and Prodigal. MetaTrawl stages
-the three inputs into a content-addressed directory under
-`cache/fixed_references/`, prepares the ZipStrain profiling assets, and builds
-the Bowtie2 index once. All sample workers reuse those immutable files. The
-three options are required together; the reference may contain multiple
-scaffolds or genomes as long as the STB maps every scaffold correctly and the
-gene FASTA follows the Prodigal header contract.
-
-Fixed-reference samples have no rows in `sylph_abundance`. Profile positions,
-genome statistics, and gene statistics are imported normally. A later matrix
-build using `--min-sylph-abundance` therefore excludes these samples. The
-reference, gene, and STB content hashes are part of the resume checkpoint, so
-changing any input prevents reuse of BAM/profile checkpoints generated against
-the previous reference.
-
-### 4. Sync Matrix Requirement Files
-
-When genomes are downloaded, MetaTrawl automatically creates per-genome matrix
-requirement files:
-
-```text
-cache/genomes/GCF_xxx.fna
-cache/genes/GCF_xxx.genes.fna
-cache/beds/GCF_xxx.bed
-cache/stb/GCF_xxx.stb
-cache/gene_ranges/GCF_xxx.gene_ranges.tsv
-```
-
-For older caches, or if you want to force-refresh these derived files, run:
-
-```bash
-metatrawl cache sync-matrix-files \
-  --cache-dir cache
-```
-
-For one genome only:
-
-```bash
-metatrawl cache sync-matrix-files \
-  --cache-dir cache \
-  --genome GCF_000269965.1
-```
-
-For legacy ZipStrain-style unified reference files, add `--output-dir`:
-
-```bash
-metatrawl cache sync-matrix-files \
-  --cache-dir cache \
-  --output-dir cache/matrix_reference
-```
-
-That still writes the per-genome files, plus legacy unified files in
-`cache/matrix_reference`.
-
-### 5. Sync Genome Matrices
-
-Build or update one ZipStrain HDF5 matrix per genome represented in the database:
+### 3. Build genome matrices
 
 ```bash
 metatrawl matrix sync-build \
@@ -407,613 +160,120 @@ metatrawl matrix sync-build \
   --stb-dir cache/stb \
   --gene-range-dir cache/gene_ranges \
   --sparse \
-  --min-coverage 1 \
-  --min-breadth 0.2 \
-  --min-ber 0.77 \
-  --min-sylph-abundance 0.001
+  --min-coverage 0.1 \
+  --min-ber 0.7 \
+  --workflow-config workflow.toml
 ```
 
-For each genome:
-
-- if `matrices/<genome>.h5` does not exist, MetaTrawl builds it;
-- if it already exists, MetaTrawl appends eligible samples that are not yet in
-  the HDF5 file;
-- if no new samples are available, the genome is reported as up to date.
-
-New builds checkpoint complete sample batches into
-`matrices/<genome>.h5.tmp`. If a local or Slurm job is cancelled, rerun the same
-command: MetaTrawl validates the checkpoint, discards only an unfinished batch,
-and continues with the remaining samples. The working file is atomically renamed
-to `.h5` after every selected sample has been committed. Do not delete the
-`.h5.tmp` file when resuming a build.
-
-To sync only one genome, add `--genome`:
-
-```bash
-metatrawl matrix sync-build \
-  --db metatrawl.duckdb \
-  --matrix-dir matrices \
-  --genome GCF_000269965.1 \
-  --bed-dir cache/beds \
-  --stb-dir cache/stb \
-  --gene-range-dir cache/gene_ranges \
-  --sparse
-```
-
-The HDF5 matrix file is the durable handle. The old matrix registry is not
-required for normal sync behavior.
-
-### 6. Sync Comparisons
-
-Run resumable comparison for every matrix in `matrices/`:
+### 4. Compare every matrix
 
 ```bash
 metatrawl matrix sync-compare \
   --db metatrawl.duckdb \
   --matrix-dir matrices \
   --compare-dir compares \
-  --calculate all \
+  --calculate ani+gene \
+  --ani-method popani \
   --backend numpy \
-  --memory-limit-gb 16
+  --workflow-config workflow.toml
 ```
 
-This writes one comparison DuckDB per matrix:
+For NVIDIA acceleration, use the CUDA container and set
+`--backend torch-cuda`.
 
-```text
-compares/GCF_xxx.duckdb
-```
-
-Rerunning `sync-compare` is safe. ZipStrain resumes incomplete comparison
-databases and skips completed pairs.
-
-### 7. Sync Genome Views
-
-Prepare self-contained browser-ready artifacts for every completed genome
-comparison:
+### 5. Generate and serve genome views
 
 ```bash
 metatrawl sync-genome-views \
   --db metatrawl.duckdb \
   --compare-dir compares \
-  --view-dir genome_views
-```
-
-By default, a sample is retained when no more than 20% of its comparisons for
-that genome are missing after applying `--min-comp-len`. This genome-relative
-rule scales from small to very large matrices; configure it with
-`--max-null-fraction` or `[genome_view].max_null_fraction`. Use
-`--max-null-samples` only when an explicit absolute limit is desired. DuckDB
-computes connectivity from compact integer sample indices before retained pair
-values are transferred to Python.
-
-Each `genome_views/<genome>/` bundle is a versioned, self-contained web and
-analysis snapshot. A web client starts at `genome_views/catalog.json`, follows
-the genome's `manifest.json`, and then loads only the artifacts needed for the
-current panel:
-
-- `samples.json`: matrix indices, dendrogram leaf order, missing-data fraction,
-  and cluster labels.
-- `sample_stats.json`: typed, column-oriented statistics ready for a browser
-  table; `sample_stats.parquet` preserves the same data for analytical tools.
-- `clusters.json`: reusable clonal and strain assignments, memberships,
-  thresholds, and linkage method.
-- `dendrogram.json`: the SciPy linkage matrix plus explicit tree merges for an
-  interactive dendrogram.
-- `neighbor_network.json`: browser-ready nodes and top-neighbor edges, including
-  ANI and compared-position counts.
-- `similarity_ani.condensed.f32.gz`: the little-endian float32 ANI matrix in
-  SciPy-compatible condensed upper-triangle order.
-- `total_positions.condensed.u64.gz`: the matching condensed uint64 overlap
-  matrix; zero identifies an imputed comparison.
-- `distributions.json`: precomputed ANI, overlap, coverage, breadth, BER, and
-  abundance histograms.
-- `view_data.h5`: the matrices, linkage, ordering, and assignments in a reusable
-  scientific container.
-- `clustermap.png` and `dendrogram.svg`: static previews, not the primary data
-  source for the web interface.
-
-`manifest.json` documents every file's format, media type, size, matrix shape,
-dtype, byte order, and axis ordering. The bundle therefore requires no query
-against the main MetaTrawl or comparison databases at presentation time.
-Rerunning the command skips unchanged bundles, but refreshes them when either
-the comparison or relevant project statistics change. Schema-1 bundles are
-automatically regenerated as schema 2. Use `--genome GCF_xxx` to refresh one
-genome explicitly.
-
-Completed comparison databases from pre-1.0 ZipStrain releases are accepted
-read-only. MetaTrawl detects the legacy `genome_pop_ani` result column
-automatically. If an older database lacks checkpoint or catalog tables,
-MetaTrawl derives completion, samples, and genomes from distinct result rows;
-it still skips a view when an available sample catalog shows that result rows
-are incomplete. No legacy comparison database is modified.
-
-### Explore Genome Views
-
-Start the interactive genome atlas after `sync-genome-views` completes:
-
-```bash
-metatrawl view genomes \
-  --view-dir genome_views
-```
-
-MetaTrawl serves the generated bundles at `http://127.0.0.1:8766` and opens the
-default browser. The viewer provides a searchable genome catalog, summary
-distributions, cluster composition, an interactive ANI heatmap, a scalable
-dendrogram, a filterable sample-neighbor network, and searchable sample
-statistics. It reads only static bundle files and never opens the project or
-comparison DuckDB databases.
-
-On a remote cluster, bind to the compute node without attempting to open its
-browser:
-
-```bash
-metatrawl view genomes \
   --view-dir genome_views \
-  --host 0.0.0.0 \
-  --port 8766 \
-  --no-open
+  --workflow-config workflow.toml
+
+metatrawl view genomes --view-dir genome_views
 ```
 
-Use SSH port forwarding from your workstation:
+Open `http://127.0.0.1:8766`. The viewer reads static artifacts and does not
+open the project or comparison databases.
+
+For the complete walkthrough, including fixed references, threshold behavior,
+manual imports, and progress inspection, read [Getting started](docs/getting-started.md).
+
+## Storage Modes
+
+| Project storage | Keeps | Matrix support | Downstream methods |
+| --- | --- | --- | --- |
+| `full` | Per-position A/C/G/T counts | Bitmask or counts | popANI, conANI, cosANI, IBS, gene ANI, profile queries |
+| `allele-mask` | Covered-position and allele-set masks | Bitmask | popANI, IBS, and gene popANI |
+
+Create an allele-mask project when positional counts will never be needed:
 
 ```bash
-ssh -L 8766:127.0.0.1:8766 user@cluster
-```
-
-For public deployment, the same viewer and bundles can be hosted as static
-files; the local server is not a required production component.
-
-### 8. Inspect Progress
-
-At any point:
-
-```bash
-metatrawl status --db metatrawl.duckdb
-```
-
-To see which SRA runs still need profile imports:
-
-```bash
-metatrawl profiles remaining \
+metatrawl init \
   --db metatrawl.duckdb \
-  --output-file remaining_runs.csv
+  --profile-storage allele-mask \
+  --profile-min-cov 5
 ```
 
-## How Sync Works (The Logic)
+Profiling itself remains unchanged. MetaTrawl converts the completed ZipStrain
+profile during import and preserves genome stats, gene stats, Sylph abundance,
+and provenance normally.
 
-The tutorial above shows *what* to type. This section explains *why* it is safe
-to rerun every command, and how each `sync` decides what work is still
-outstanding. Understanding this is the whole point of MetaTrawl: you never track
-progress by hand, and you never recompute finished work.
-
-### The shared principle
-
-Every `sync` command follows the same three rules:
-
-- **Idempotent.** Running it twice with no new inputs is a no-op. It reports what
-  is already up to date and exits.
-- **Resumable.** If it is interrupted — a crash, a killed job, a cluster
-  preemption — rerunning it continues from the last durable checkpoint rather
-  than starting over.
-- **Incremental.** When you add new SRA runs or local reads, a rerun
-  processes only the new work and leaves finished work untouched.
-
-The source of truth for "what is done" is durable state, never in-memory
-progress: the DuckDB project store (which runs are `complete`), the per-genome
-HDF5 matrix files (which samples they already contain), the comparison DuckDB
-files (which sample pairs are already computed), and the shared genome cache
-(which genomes are already downloaded and annotated). Scratch space is
-disposable; the durable state is authoritative.
-
-### `sync-profile`: profile remaining runs
-
-**Work set.** MetaTrawl profiles the *remaining samples*: every registered input that
-is not soft-deleted and does not yet have a `complete` sample. A run marked
-`failed` stays in this set, so a rerun automatically retries it. A run that
-imported successfully is `complete` and is skipped.
-
-**Per-sample checkpointing.** Each run gets its own scratch directory, and up to
-`sample_workers` runs are profiled concurrently. Samples are independent: one
-failing sample never blocks the others.
-
-**Per-stage resume.** Within a sample, every stage checks for its own valid
-output before running, so an interrupted sample resumes mid-flight:
-
-| Stage | Skips when |
-| --- | --- |
-| SRA download (`prefetch`, `fasterq-dump`) | non-empty FASTQs already exist in scratch |
-| Local-read staging | registered FASTQs have already been copied into scratch |
-| Sylph genome selection | an `accessions.txt` already exists |
-| Reference preparation (shared cache) | the concatenated per-sample reference is already built |
-| Bowtie2 index + alignment | a complete Bowtie2 index and a non-empty BAM already exist |
-| ZipStrain `profile-single` | a complete published output bundle already exists |
-
-With fixed-reference profiling, the Sylph and genome-cache rows do not apply.
-The prepared ZipStrain assets and Bowtie2 index are shared by every sample and
-are reused when their reference/gene/STB content hash is unchanged.
-
-**Commit-then-clean.** When a sample finishes, MetaTrawl imports its ZipStrain
-outputs into DuckDB in the coordinator thread (serially, so there is never more
-than one DuckDB writer), marks the run `complete`, and only then deletes that
-sample's scratch directory and imported output files. If a sample fails, its
-scratch is **retained** as a checkpoint and the run is marked `failed` so the
-next `sync-profile` retries exactly that run.
-
-**Shared cache.** All workers share one genome/Prodigal cache. A genome that one
-sample downloads and annotates is reused by every later sample that needs it,
-across runs and across invocations.
-
-### `cache sync-matrix-files`: derive matrix inputs
-
-Matrix building needs a per-genome BED file, STB file, and gene-range table.
-MetaTrawl writes these automatically when genomes are downloaded, so most users
-never run this command. It exists to (re)derive those files for older caches or
-after a forced refresh, straight from the cached `genomes/` and `genes/` FASTAs.
-It is idempotent — existing derived files are simply rewritten.
-
-### `matrix sync-build`: one ZipStrain matrix per genome
-
-**Genome set.** By default, every genome represented by at least one `complete`
-sample (or just the genomes named with `--genome`).
-
-**Per-genome decision.** For each genome, MetaTrawl looks at `matrices/<genome>.h5`:
-
-- **absent** → build a new ZipStrain matrix from all eligible samples;
-- **present** → compare the filtered genome-stat sample set with the compact
-  required-sample checkpoint stored in HDF5, then append only missing samples;
-- **present, nothing new** → report the genome as up to date.
-
-The matrix keeps committed row order separate from a sorted required-sample
-catalog. Count and digest attributes make repeat status checks constant-size;
-older matrices are upgraded from their existing sample catalog the first time
-they are checked. Under Slurm, MetaTrawl summarizes and checks only one
-worker-sized window of genomes at a time, submits the genomes needing work, and
-continues checking while those jobs run. It does not materialize every
-genome/sample pair or queue every genome before useful work starts.
-
-While an absent matrix is being built, complete sample batches are flushed to a
-durable `.h5.tmp` checkpoint. Repeating the same command after cancellation
-resumes from the committed sample count; only a batch interrupted during its
-write is repeated. The checkpoint becomes the final `.h5` through an atomic
-rename when the build completes.
-
-`export_batch_mb` is the approximate RAM target for one matrix batch. MetaTrawl
-uses the genome length and matrix dtype to estimate how many complete samples fit,
-fetches those samples together from DuckDB, converts them in memory, and appends
-the ordered batch to HDF5 with one commit.
-
-**Eligibility.** A sample is eligible for a genome's matrix when it is `complete`
-and clears the stat thresholds: `--min-coverage`, `--min-breadth`, and
-`--min-ber` (from that genome's ZipStrain genome stats) and `--min-sylph-abundance`
-(from the sample's Sylph abundance for that genome). The thresholds are embedded
-in the HDF5 file's metadata at build time and **reused automatically on append**,
-so every sample added later passes through the same filter as the original build
-— you do not repeat the thresholds when appending.
-
-The HDF5 file is the durable handle; the registry is bookkeeping and is not
-required for sync behavior.
-
-### `matrix sync-compare`: resumable all-vs-all ANI
-
-For every matrix file in `matrix-dir`, MetaTrawl runs ZipStrain's
-`matrix_compare` and writes one comparison DuckDB (`compares/<genome>.duckdb`).
-The comparison itself is resumable at the pair level: ZipStrain reopens an
-incomplete comparison database and skips pairs that are already computed, so
-after `matrix sync-build` appends new samples, a rerun computes only the newly
-introduced sample pairs — not the entire matrix. Rerunning with nothing new to
-compare is a no-op.
-
-### `sync-genome-views`: static browser bundles
-
-For each completed comparison, MetaTrawl writes a self-contained
-`genome_views/<genome>/` bundle (heatmap, dendrogram, clusters, neighbor network,
-distributions, and the raw matrices). A bundle is regenerated when either the
-comparison or the relevant project statistics change, and skipped otherwise;
-older schema-1 bundles are rebuilt as the current schema. Completed pre-1.0
-ZipStrain comparison databases are read read-only and never modified.
-
-### Putting it together
-
-Because all five commands key off durable state, the normal way to grow a project
-is simply to register more SRA runs and rerun the same five commands. Each one
-picks up only its share of the new work:
-
-```bash
-metatrawl runs add --db metatrawl.duckdb SRR000010 SRR000011   # add more samples
-metatrawl sync-profile        --db metatrawl.duckdb ...          # profiles only the new runs
-metatrawl matrix sync-build   --db metatrawl.duckdb ...          # appends only new eligible samples
-metatrawl matrix sync-compare --db metatrawl.duckdb ...          # computes only new sample pairs
-metatrawl sync-genome-views   --db metatrawl.duckdb ...          # refreshes only changed bundles
-```
-
-## Manual Import And Lower-Level Commands
-
-Most users should use `sync-profile`. If an external workflow produced profile
-files, import them directly:
-
-```bash
-metatrawl profiles import \
-  --db metatrawl.duckdb \
-  --run-id SRR000001 \
-  --profile-file outputs/SRR000001.profile.parquet \
-  --genome-stats-file outputs/SRR000001.genome_stats.parquet \
-  --gene-stats-file outputs/SRR000001.gene_stats.parquet \
-  --sylph-abundance-file outputs/SRR000001.sylph.csv \
-  --cache-dir cache
-```
-
-Or import many samples from a manifest:
-
-```bash
-metatrawl profiles add \
-  --db metatrawl.duckdb \
-  --manifest completed_profiles.csv \
-  --cache-dir cache
-```
-
-Manifest columns:
-
-```csv
-run_id,profile_file,genome_stats_file,gene_stats_file,sylph_abundance_file
-SRR000001,/path/profile.parquet,/path/genome_stats.parquet,/path/gene_stats.parquet,/path/sylph.csv
-```
-
-`gene_stats_file` is optional. `--cache-dir` is required only for an
-`allele-mask` database when a referenced genome has not already been stored.
-A run is complete after its selected profile representation, genome stats, and
-Sylph abundance have been imported.
-
-### Compact An Existing Full Database
-
-DuckDB does not return space to the operating system when a large table is
-dropped, so conversion writes a new database and never modifies the source:
-
-```bash
-metatrawl profiles compact-database \
-  --source-db metatrawl.duckdb \
-  --output-db metatrawl.allele-mask.duckdb \
-  --cache-dir cache \
-  --min-cov 5
-```
-
-The migration commits one sample at a time. Rerun the same command to resume
-after interruption. Do not replace the source until every sample reports
-completion and the new database has been validated.
-
-You can still run the lower-level worker command if you want to manage the
-remaining-runs CSV yourself:
-
-```bash
-metatrawl profiles remaining \
-  --db metatrawl.duckdb \
-  --output-file remaining_runs.csv
-
-metatrawl profile-sra \
-  --db metatrawl.duckdb \
-  --remaining-csv remaining_runs.csv \
-  --cache-dir cache \
-  --scratch-dir scratch \
-  --output-dir outputs \
-  --sylph-db /full/path/to/gtdb-r220-c200-dbv1.syldb \
-  --threads 8
-```
-
-## Python Query API
-
-Use a genome view to query one genome across samples, or a sample view to
-query everything stored for one sample:
+## Python API
 
 ```python
-import polars as pl
 from metatrawl import open_database
 
 db = open_database("metatrawl.duckdb")
 
-all_genomes = db.genomes().collect()
-all_samples = db.samples().collect()
-matching_genomes = db.genomes(pattern="996").collect()
+samples = db.samples().collect()
+genomes = db.genomes().collect()
+stats = db.genome("GCF_000001").genome_stats().collect()
 
-genome_stats = db.genome("GCF_000001").genome_stats().collect()
-gene_stats = db.genome("GCF_000001").gene_stats().collect()
-
-sample_genomes = db.sample("SRR123").genome_stats().collect()
-sample_genes = db.sample("SRR123").gene_stats(genome="GCF_000001").collect()
-sample_profile = db.sample("SRR123").profile(genome="GCF_000001").collect()
+db.genome("GCF_000001").profiles().sink_parquet(
+    "GCF_000001.profiles.parquet"
+)
 ```
 
-Every query supports `collect()` for a Polars DataFrame, `lazy()` for
-additional lazy Polars transformations, and `sink_parquet()` for a direct
-DuckDB-to-Parquet export that does not materialize the result in Python:
+Queries can return Polars DataFrames, participate in lazy Polars pipelines, or
+stream directly to Parquet. See the [Python query API](docs/python-api.md).
 
-```python
-query = db.genome("GCF_000001").profiles()
+## Project Layout
 
-query.sink_parquet("GCF_000001.profiles.parquet")
-filtered = query.lazy().filter(pl.col("sample_id").is_in(selected_samples))
-```
+| Path | Purpose | Durable? |
+| --- | --- | --- |
+| `metatrawl.duckdb` | Samples, profiles, stats, abundance, and provenance | Yes |
+| `cache/` | Shared genomes, genes, indexes, and matrix inputs | Yes |
+| `matrices/` | One resumable HDF5 matrix per genome | Yes |
+| `compares/` | One resumable comparison DuckDB per genome | Yes |
+| `genome_views/` | Static browser and analysis bundles | Regenerable |
+| `scratch/`, `outputs/` | Per-sample checkpoints and pending imports | Temporary |
 
-Genome stats, gene stats, Sylph abundance, samples, and genomes remain queryable
-in both storage modes. Position-level `profile()` and `profiles()` queries raise
-a clear error for `allele-mask` databases because real A/C/G/T counts were
-deliberately discarded.
+MetaTrawl only deletes sample scratch and published profile files after the
+corresponding database import commits.
 
-## Controlling concurrency and execution
+## Documentation
 
-`sync-profile` and `profile-sra` accept `--workflow-config` with a TOML or JSON file. This separates the number of samples allowed in flight from the concurrency and CPU allocation of each stage. For example, downloads can remain highly parallel while only one Bowtie index build and two alignments run at once:
+- [Getting started](docs/getting-started.md): complete CLI workflow
+- [Containers](docs/containers.md): CPU, CUDA, Docker, and Apptainer
+- [Sync and resume](docs/sync-and-resume.md): incremental execution model
+- [Workflow configuration](docs/workflow-configuration.md): local and Slurm settings
+- [Python query API](docs/python-api.md): sample and genome queries
+- [Database provenance](docs/database-provenance.md): versioning and compatibility
+
+## Support
+
+Use [GitHub Issues](https://github.com/OlmLab/MetaTrawl/issues) for bug reports
+and feature requests. Include `metatrawl --version`, the relevant workflow
+configuration, and the `METATRAWL` log lines around a failure.
+
+## Development
 
 ```bash
-metatrawl sync-profile \
-  --db metatrawl.duckdb \
-  --cache-dir cache \
-  --scratch-dir scratch \
-  --output-dir outputs \
-  --sylph-db /path/to/gtdb.syldb \
-  --workflow-config examples/workflow.toml
+git clone https://github.com/OlmLab/MetaTrawl.git
+cd MetaTrawl
+pip install -e ".[test]"
+pytest
 ```
 
-Each stage supports `workers`, `threads`, `execution = "local" | "slurm"`, `retries`, `retry_delay_seconds`, and an optional `environment` table. Slurm stages also accept `time`, `memory_gb`, `memory_retry_coefficient`, `time_retry_coefficient`, `partition`, `account`, and arbitrary `extra` `sbatch` options. Both retry coefficients default to `1.0`. MetaTrawl increases memory only after an out-of-memory failure and increases time only after a timeout; preempted jobs retry with unchanged resources. MetaTrawl submits Slurm jobs with `sbatch --wait`; checkpointing, output publication, and scratch cleanup therefore happen only after the job completes. If a stage fails, MetaTrawl retries that stage command or Slurm job according to the stage retry settings before marking the sample failed.
-
-`sync-profile` publishes each completed sample atomically and sends it to one
-dedicated DuckDB writer. Profiling continues while that writer imports bounded
-microbatches; when the queue reaches either its sample or byte limit, submission
-pauses rather than filling scratch. Pending published bundles are rediscovered on
-the next run. MetaTrawl deletes the SRA archive after validated FASTQ creation,
-deletes reads and Bowtie indexes after BAM validation, and deletes the BAM and
-sample reference after publication. Published profile files are deleted only
-after their DuckDB transaction commits.
-
-The configurable stages are `sra_download`, `sylph`, `genome_download`, `prodigal`, `prepare_profile`, `bowtie_build`, `alignment`, `profile`, `matrix_build`, `matrix_compare`, and `genome_view`. Without `--workflow-config`, `--threads` retains the previous profiling behavior.
-
-The same file can configure ZipStrain `profile-single` read filters under `[profile]`: `min_mapq`, `min_baseq`, `min_freq`, `min_read_ani`, and `read_inclusion`. Matrix construction settings belong under `[matrix_build]`: `storage_mode`, `count_dtype`, `min_cov`, `memory_limit_gb`, `export_batch_mb`, and `duckdb_export_threads`. New matrices use compact bitmask storage by default; choose count storage when `conani` or `cosani_<threshold>` is required. An `allele-mask` database rejects count storage and any `min_cov` different from its database contract before creating or resizing a matrix. Comparison settings under `[matrix_compare]` include `calculate`, `ani_method`, `genome`, `backend`, optional `min_cov`, `memory_limit_gb`, and queue/executor controls. When comparison `min_cov` is omitted, ZipStrain uses the build threshold stored in the HDF5 file. `matrix sync-build` can use `[stages.matrix_build]` to submit one build/append job per genome, `matrix sync-compare` can use `[stages.matrix_compare]` to submit one compare job per matrix, and `sync-genome-views` can use `[stages.genome_view]` to submit one artifact job per genome. Explicit CLI values override the matching TOML values.
-
-### Complete TOML template
-
-This copy-ready template configures every pipeline stage. Only alignment uses
-Slurm in this example; all other stages run locally. Change a stage's
-`execution` to `"slurm"` and give it a corresponding Slurm table when needed.
-
-```toml
-# Maximum number of samples progressing through the workflow concurrently.
-sample_workers = 12
-
-[stages.sra_download]
-workers = 6
-threads = 4
-execution = "local" # "local" or "slurm"
-retries = 2
-retry_delay_seconds = 60
-
-[stages.sylph]
-workers = 6
-threads = 2
-execution = "local"
-retries = 2
-retry_delay_seconds = 60
-
-[stages.genome_download]
-workers = 12
-threads = 1
-execution = "local"
-retries = 2
-retry_delay_seconds = 60
-
-[stages.prodigal]
-workers = 2
-threads = 1
-execution = "local"
-retries = 1
-retry_delay_seconds = 30
-
-[stages.prepare_profile]
-workers = 4
-threads = 2
-execution = "local"
-retries = 1
-retry_delay_seconds = 30
-
-[stages.bowtie_build]
-workers = 1
-threads = 12
-execution = "local"
-retries = 1
-retry_delay_seconds = 60
-
-[stages.alignment]
-workers = 2
-threads = 16
-execution = "slurm"
-retries = 3
-retry_delay_seconds = 120
-
-[stages.alignment.slurm]
-time = "04:00:00"
-memory_gb = 64
-memory_retry_coefficient = 1.5
-time_retry_coefficient = 1.25
-partition = "compute"
-account = "project-name"
-
-[stages.profile]
-workers = 2
-threads = 8
-execution = "local"
-retries = 3
-retry_delay_seconds = 120
-
-[stages.matrix_build]
-workers = 4
-threads = 16
-execution = "local"
-retries = 1
-retry_delay_seconds = 60
-
-[stages.matrix_compare]
-workers = 4
-threads = 16
-execution = "local"
-retries = 1
-retry_delay_seconds = 60
-
-[stages.genome_view]
-workers = 4
-threads = 8
-execution = "local"
-retries = 1
-retry_delay_seconds = 60
-
-[profile]
-min_mapq = 0
-min_baseq = 13
-min_freq = 0.0
-min_read_ani = 0.95
-read_inclusion = "paired"
-
-[profile_import]
-# One larger-than-limit sample is always allowed through by itself.
-queue_max_samples = 8
-queue_max_gb = 32
-batch_max_samples = 4
-batch_max_gb = 8
-batch_wait_seconds = 1
-
-[matrix_build]
-storage_mode = "bitmask" # use "counts" for conANI/cosANI
-# count_dtype = "auto"   # valid with storage_mode = "counts"
-min_cov = 5
-memory_limit_gb = 16
-export_batch_mb = 128
-duckdb_export_threads = 1
-
-[matrix_compare]
-calculate = "all"
-ani_method = "popani" # conani and cosani_<threshold> require count matrices
-genome = "all"
-backend = "numpy"
-# min_cov = 5 # normally omit: use the threshold embedded in the matrix
-memory_limit_gb = 32
-anchor_queue_size = 1
-target_queue_size = 2
-result_transfer_batch_size = 512
-loader_executor_kind = "thread"
-writer_executor_kind = "thread"
-
-[genome_view]
-min_comp_len = 10000
-impute_ani = 97.0
-max_null_fraction = 0.20
-# max_null_samples = 500 # optional absolute override
-linkage_method = "average"
-neighbor_k = 20
-clonal_cluster_threshold = 99.93
-strain_cluster_threshold = 99.8
-```
-
-The values above are an example allocation, not universal defaults. Tune
-workers, threads, memory, partition, and account for your machine or cluster.
-MetaTrawl also accepts optional per-stage `environment` and `slurm.extra` tables
-when a real tool or cluster requires them; they are intentionally omitted here
-because the standard pipeline does not require any.
-
-Current ZipStrain profiling receives both `reference.fasta` and `profiling_contract.json`. This preserves the reference-aware profile fields and enables `ref_ani` in imported genome and gene statistics. MetaTrawl follows the ZipStrain 1.x defaults of `min_freq = 0`, `min_read_ani = 0.95`, and `read_inclusion = "paired"`; set `min_read_ani = 0` to disable read-ANI filtering. Genuinely single-end inputs continue to use all mapped reads.
-
-MetaTrawl preserves the expanded ZipStrain 1.x statistics in DuckDB. Genome queries include coverage median and standard deviation, genome length, gap statistics, 5x covered sites, heterogeneity, FUG, mapped reads, population and consensus reference ANI, SNS/SNV counts, presence, and taxonomy when those columns are present in the imported ZipStrain output. Gene queries also retain gene length. Older MetaTrawl databases are migrated in place the next time a writable command opens them.
+MetaTrawl is released under the [MIT License](LICENSE).

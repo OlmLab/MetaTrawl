@@ -29,7 +29,8 @@ RUN printf '%s\n' \
 
 # CPU is the portable default. Override TORCH_INDEX_URL with an official CUDA
 # wheel index, such as cu128, when building an NVIDIA image.
-RUN python -m pip install --upgrade pip setuptools wheel \
+# Keep the base environment consistent with Conda's Python dependency metadata.
+RUN python -m pip install --upgrade pip setuptools wheel 'ruamel.yaml<0.19' \
     && python -m pip install \
         --index-url "${TORCH_INDEX_URL}" \
         "${TORCH_PACKAGE}"
@@ -40,6 +41,7 @@ COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 
 RUN python -m pip install . \
+    && python -m pip check \
     && metatrawl check
 
 WORKDIR /work
