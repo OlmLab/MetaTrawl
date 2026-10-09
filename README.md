@@ -1,7 +1,7 @@
 # MetaTrawl
 
 <p align="center">
-  <img src="assets/metatrawl-concept.svg" alt="MetaTrawl organizes bacterial genomes from large metagenomic collections for strain-level comparison" width="100%">
+  <img src="metatrawl-concept.svg" alt="MetaTrawl organizes bacterial genomes from large metagenomic collections for strain-level comparison" width="100%">
 </p>
 
 <p align="center">
