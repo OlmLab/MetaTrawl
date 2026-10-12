@@ -1,8 +1,9 @@
-FROM continuumio/miniconda3:latest
+FROM continuumio/miniconda3:latest AS toolchain
 
 ARG PYTHON_VERSION=3.12
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 ARG TORCH_PACKAGE=torch
+ARG BWAMEM3_VERSION=0.14.0
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DEFAULT_TIMEOUT=180 \
@@ -20,6 +21,7 @@ RUN printf '%s\n' \
         "python=${PYTHON_VERSION}" \
         pip \
         bowtie2 \
+        "bwa-mem3=${BWAMEM3_VERSION}" \
         ncbi-datasets-cli \
         prodigal \
         samtools \
@@ -35,6 +37,8 @@ RUN python -m pip install --upgrade pip setuptools wheel 'ruamel.yaml<0.19' \
         --index-url "${TORCH_INDEX_URL}" \
         "${TORCH_PACKAGE}"
 
+FROM toolchain AS runtime
+
 WORKDIR /opt/metatrawl
 
 COPY pyproject.toml README.md LICENSE ./
@@ -42,7 +46,9 @@ COPY src ./src
 
 RUN python -m pip install . \
     && python -m pip check \
-    && metatrawl check
+    && metatrawl check \
+    && bwa-mem3 version \
+    && python -c 'from zipstrain.profile_backends import load_backend; assert load_backend("rust_profiler").API_VERSION == 1'
 
 WORKDIR /work
 

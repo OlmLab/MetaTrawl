@@ -152,6 +152,28 @@ reference, gene, and STB content hashes are part of the resume checkpoint, so
 changing any input prevents reuse of BAM/profile checkpoints generated against
 the previous reference.
 
+MetaTrawl 1.1+ installs `zipstrain_rust_profiler` automatically alongside
+ZipStrain 1.2.2+. Add `--backend rust_profiler` to either `sync-profile` example
+above to use it. The worker environment must contain the same installation.
+Alternatively,
+set it in your workflow configuration:
+
+```toml
+[profile]
+backend = "rust_profiler"
+```
+
+Python remains the default. CLI selection overrides the configuration file;
+existing completed samples are not reprofiled just because the backend changes.
+
+Alignment is configured independently. Bowtie2 is the default; after installing
+bwa-mem3 separately in the worker environment, use `--alignment-engine bwa-mem3`
+or `[profile].alignment_engine = "bwa-mem3"`. See
+[alignment engine configuration](workflow-configuration.md#alignment-engines)
+for Slurm resources and compatibility considerations. Switching aligners can
+change mapped reads, so existing scientific contracts and BAM checkpoints are
+not silently reused with a different aligner.
+
 ## 4. Sync matrix requirement files
 
 When genomes are downloaded, MetaTrawl automatically creates per-genome matrix

@@ -8,7 +8,7 @@ configuration values.
 `sync-profile` and `profile-sra` accept `--workflow-config` with a TOML or
 JSON file. This separates the number of samples allowed in flight from the
 concurrency and CPU allocation of each stage. For example, downloads can remain
-highly parallel while only one Bowtie index build and two alignments run at once:
+highly parallel while only one reference index build and two alignments run at once:
 
 ```bash
 metatrawl sync-profile \
@@ -36,7 +36,7 @@ dedicated DuckDB writer. Profiling continues while that writer imports bounded
 microbatches; when the queue reaches either its sample or byte limit, submission
 pauses rather than filling scratch. Pending published bundles are rediscovered on
 the next run. MetaTrawl deletes the SRA archive after validated FASTQ creation,
-deletes reads and Bowtie indexes after BAM validation, and deletes the BAM and
+deletes reads and per-sample aligner indexes after BAM validation, and deletes the BAM and
 sample reference after publication. Published profile files are deleted only
 after their DuckDB transaction commits.
 
@@ -45,8 +45,8 @@ The configurable stages are `sra_download`, `sylph`, `genome_download`,
 `matrix_build`, `matrix_compare`, and `genome_view`. Without
 `--workflow-config`, `--threads` controls the profiling workflow.
 
-The same file configures ZipStrain `profile-single` read filters under
-`[profile]`: `min_mapq`, `min_baseq`, `min_freq`, `min_read_ani`, and
+The same file configures ZipStrain `profile-single` under
+`[profile]`: `backend`, `alignment_engine`, `min_mapq`, `min_baseq`, `min_freq`, `min_read_ani`, and
 `read_inclusion`. Matrix construction settings belong under `[matrix_build]`:
 `storage_mode`, `count_dtype`, `min_cov`, `memory_limit_gb`, `export_batch_mb`,
 and `duckdb_export_threads`. New matrices use compact bitmask storage by default;
@@ -159,6 +159,8 @@ retries = 1
 retry_delay_seconds = 60
 
 [profile]
+backend = "python"
+alignment_engine = "bowtie2"
 min_mapq = 0
 min_baseq = 13
 min_freq = 0.0
@@ -217,6 +219,58 @@ enables `ref_ani` in imported genome and gene statistics. MetaTrawl follows the
 ZipStrain 1.x defaults of `min_freq = 0`, `min_read_ani = 0.95`, and
 `read_inclusion = "paired"`; set `min_read_ani = 0` to disable read-ANI
 filtering. Single-end inputs use all mapped reads.
+
+MetaTrawl 1.1+ installs the Rust profiler plugin automatically and requires
+ZipStrain 1.2.2+. Ensure the same MetaTrawl installation is available in the
+environment used by the `profile` stage (including Slurm workers).
+Set `[profile].backend = "rust_profiler"`, or pass
+`--backend rust_profiler` to `metatrawl sync-profile` or `metatrawl profile-sra`.
+The CLI option overrides the TOML/JSON setting; the default is `python`.
+Other installed ZipStrain entry-point backend names are also accepted.
+
+Backend selection is recorded in execution provenance, but does not change the
+scientific profiling contract. Existing compatible outputs are still reused;
+switching backends does not force already completed samples to be reprofiled.
+This option is independent of `[matrix_compare].backend` and does not change
+stage thread counts or local/Slurm execution policy.
+
+### Alignment engines
+
+Bowtie2 remains the default, with its existing sensitive end-to-end settings.
+To use **bwa-mem3**, install its executable separately and select:
+
+```toml
+[profile]
+alignment_engine = "bwa-mem3"
+```
+
+Alternatively pass `--alignment-engine bwa-mem3` to `sync-profile` or
+`profile-sra`; CLI selection overrides TOML/JSON. MetaTrawl does not install
+bwa-mem3. Its executable must be in the `PATH` of both indexing and alignment
+stages, including Slurm workers. Missing executables produce an actionable
+stage error, not a silent fallback to Bowtie2.
+
+The existing `[stages.bowtie_build]` resource settings control reference indexing
+for **either** engine; `[stages.alignment]` controls mapping. Both honor thread
+counts, execution environments, retries, and Slurm resource settings. bwa-mem3
+uses `index -t N` and `mem -t N` with normal defaults, not `--fast`.
+Both engines retain mapped records (`samtools view -F 4`) and produce validated,
+coordinate-sorted BAMs before ZipStrain profiling. SAM pipeline failures are
+propagated even when sorting itself succeeds.
+
+Aligners can produce different mappings (bwa-mem3 defaults to local alignment).
+Unlike a profiling backend, alignment-engine choice is part of the scientific
+contract. Changing it is rejected for incompatible database imports and BAM
+checkpoints; use a new database/scratch directory for a separate analysis or
+explicitly acknowledge mixed database provenance with
+`--allow-incompatible-profiles`. That flag never makes an old BAM reusable
+with new alignment settings. Existing Bowtie2 contracts and shared reference
+caches retain their identities.
+
+Developers can add adapters by subclassing `metatrawl.alignment.AlignmentEngine`
+and registering a class under the `metatrawl.alignment_engines` entry-point group.
+Adapters define index commands/sidecars, SAM commands, and scientific settings;
+MetaTrawl keeps execution and BAM handoff independent of the chosen tool.
 
 MetaTrawl preserves expanded ZipStrain 1.x statistics in DuckDB. Genome
 queries include coverage median and standard deviation, genome length, gap

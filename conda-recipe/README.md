@@ -1,94 +1,79 @@
-# Conda packaging for MetaTrawl
+# Bioconda recipe
 
-The PyPI package only pins MetaTrawl's *Python* dependencies. MetaTrawl also
-shells out to external bioinformatics executables that pip cannot install. This
-directory holds a single Bioconda recipe (`metatrawl/`) that resolves
-**everything** at `conda install` time:
+MetaTrawl is already available in Bioconda. New releases update the existing
+`recipes/metatrawl/meta.yaml` recipe in
+[`bioconda/bioconda-recipes`](https://github.com/bioconda/bioconda-recipes).
 
-| Layer | Provided by | Comes from |
-|-------|-------------|------------|
-| Python libs (`click`, `duckdb`, `polars`, `rich`) | `metatrawl` run deps | conda-forge |
-| `zipstrain` executable + its libs (incl. `pytorch`, `h5py`) | `zipstrain` | bioconda (already published, 0.10.2) |
-| `sylph`, `samtools`, `bowtie2`, `prodigal` | `metatrawl` run deps | bioconda |
-| `prefetch`, `fasterq-dump` | `sra-tools` | bioconda |
-| `datasets` | `ncbi-datasets-cli` | bioconda |
+The recipe installs the Python package from its PyPI source distribution and
+adds the external workflow tools that pip cannot provide: Sylph, Samtools,
+Bowtie2, Prodigal, SRA Toolkit, and NCBI Datasets.
 
-The required-executable list is taken verbatim from
-`src/metatrawl/healthcheck.py` (`REQUIRED_EXECUTABLES` and `REQUIRED_PACKAGES`).
+MetaTrawl 1.1.1 requires ZipStrain 1.2.2+ and `zipstrain-rust-profiler` as a
+regular runtime dependency. The native plugin has its own architecture-specific
+recipe in `zipstrain-rust-profiler/`; Conda installs it automatically with
+MetaTrawl. Submit that recipe alongside the MetaTrawl update so users do not need
+a second install command. bwa-mem3 remains an optional user-installed aligner;
+the complete MetaTrawl containers include it.
 
-`zipstrain` is already on Bioconda (`bioconda::zipstrain` 0.10.2), so MetaTrawl
-just lists it as a run dependency — only **one** recipe to submit.
+## Release values
 
-The recipe is `noarch: python`, built from the PyPI sdist:
+| Field | Value |
+| --- | --- |
+| Version | `1.1.1` |
+| Build number | `0` |
+| PyPI sdist | `metatrawl-1.1.1.tar.gz` |
+| SHA256 | `11c2b13ef29658457c4c3dfb2517aa30d15d375c2fe92ce8fc8660c5f792f80a` |
 
-- `metatrawl` 0.1.5 — `sha256 3ec0a9d37732d979865b029255a93a214f381d88144864b97055c3c604fba90c`
-  (hash of the locally built sdist; valid if you publish that exact artifact)
-
-## Blockers to clear before submitting
-
-1. **Release MetaTrawl as 0.1.5.** The MIT `LICENSE` and the
-   `license`/`license-files` fields are now in the repo, but the **0.1.3 sdist
-   already on PyPI does not contain `LICENSE`**. Bioconda needs the
-   `license_file` inside the sdist, so a fresh release is required (Poetry):
-   ```bash
-   cd MetaTrawl
-   rm -rf dist
-   poetry build --format sdist                          # already built once; rebuild is fine
-   tar tzf dist/metatrawl-0.1.5.tar.gz | grep LICENSE   # must print a match
-   poetry publish                                       # uploads the existing dist/ artifact
-   shasum -a 256 dist/metatrawl-0.1.5.tar.gz            # must match meta.yaml sha256
-   ```
-   Publish the artifact you hashed; if you rebuild before uploading, refresh the
-   `sha256` in `metatrawl/meta.yaml`.
-2. **Recipe maintainer.** `extra.recipe-maintainers` is set to
-   `parsaghadermarzi` — make sure that's your GitHub handle.
-
-## Submitting to Bioconda
+Verify the release artifact hash against PyPI before submitting the update.
+Do not replace it with the hash of a later locally rebuilt archive:
 
 ```bash
-# Fork + clone bioconda-recipes
-git clone https://github.com/<you>/bioconda-recipes
+curl -fsSL https://pypi.org/pypi/metatrawl/<version>/json |
+  python -c 'import json,sys; d=json.load(sys.stdin); print(next(x["digests"]["sha256"] for x in d["urls"] if x["packagetype"] == "sdist"))'
+```
+
+## Submit the update
+
+Update your fork of `bioconda-recipes`, create a release branch, and replace the
+existing recipe:
+
+```bash
+git clone https://github.com/<github-user>/bioconda-recipes.git
 cd bioconda-recipes
+git remote add upstream https://github.com/bioconda/bioconda-recipes.git
+git fetch upstream
+git checkout master
+git rebase upstream/master
+git checkout -b update-metatrawl-1.1.1
 
-mkdir -p recipes/metatrawl
-cp /path/to/MetaTrawl/conda-recipe/metatrawl/meta.yaml recipes/metatrawl/
-git checkout -b add-metatrawl
-git add recipes/metatrawl && git commit -m "Add metatrawl"
-git push origin add-metatrawl
-# open PR; Bioconda CI lints + builds.
+cp /path/to/MetaTrawl/conda-recipe/metatrawl/meta.yaml \
+  recipes/metatrawl/meta.yaml
+cp -R /path/to/MetaTrawl/conda-recipe/zipstrain-rust-profiler \
+  recipes/zipstrain-rust-profiler
+
+git add recipes/metatrawl/meta.yaml recipes/zipstrain-rust-profiler
+git commit -m "Update metatrawl to 1.1.1"
+git push -u origin update-metatrawl-1.1.1
 ```
 
-### Lint / build locally first (optional)
+Open a pull request from that branch to `bioconda/bioconda-recipes:master`.
+Because MetaTrawl already has a recipe, do not create a second recipe directory.
+Keep `build.number` at `0` for the new upstream version. Increment it only when
+rebuilding the same MetaTrawl version with recipe-only corrections.
 
-Requires a working conda (the one on this machine is a broken pyenv shim).
+## Validate locally
+
+From a `bioconda-recipes` checkout with `bioconda-utils` installed:
 
 ```bash
-conda install -n base -c conda-forge bioconda-utils
-bioconda-utils lint  recipes config.yml --packages metatrawl
-bioconda-utils build recipes config.yml --packages metatrawl
+bioconda-utils lint recipes config.yml --packages metatrawl zipstrain-rust-profiler
+bioconda-utils build recipes config.yml --packages zipstrain-rust-profiler metatrawl
 ```
 
-Or a plain conda-build smoke test outside the bioconda tree:
+After the pull request is merged and the package is published:
 
 ```bash
-conda install -n base -c conda-forge conda-build
-conda build conda-recipe/metatrawl -c conda-forge -c bioconda
-```
-
-## After it lands on Bioconda
-
-```bash
-conda install -c conda-forge -c bioconda metatrawl
-metatrawl test     # runs the health check; every dependency should report OK
-```
-
-## If you'd rather not wait for Bioconda review
-
-The same `meta.yaml` works as-is with `conda build` against a personal
-Anaconda.org channel:
-
-```bash
-conda build conda-recipe/metatrawl -c conda-forge -c bioconda
-anaconda upload $(conda build conda-recipe/metatrawl --output)
-# users: conda install -c <you> -c bioconda -c conda-forge metatrawl
+conda create -n metatrawl-1 -c conda-forge -c bioconda metatrawl=1.1.1
+conda activate metatrawl-1
+metatrawl check
 ```

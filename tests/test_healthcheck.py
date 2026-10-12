@@ -26,8 +26,10 @@ def test_healthcheck_reports_all_requested_dependencies():
         "fasterq-dump",
         "datasets",
         "prodigal",
+        "zipstrain-rust-profiler",
         "torch",
         "h5py",
+        "zipstrain_rust_profiler",
     ]
     assert {check.status for check in checks} == {"ok"}
 

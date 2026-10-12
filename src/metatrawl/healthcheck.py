@@ -35,8 +35,8 @@ class DependencyCheckError(RuntimeError):
 ExecutableProbe = Callable[[str], tuple[bool, str]]
 PackageProbe = Callable[[str, str | None], tuple[bool, str]]
 
-REQUIRED_EXECUTABLES = ("zipstrain", "sylph", "samtools", "bowtie2", "prefetch", "fasterq-dump", "datasets", "prodigal")
-REQUIRED_PACKAGES = (("torch", "torch"), ("h5py", "h5py"))
+REQUIRED_EXECUTABLES = ("zipstrain", "sylph", "samtools", "bowtie2", "prefetch", "fasterq-dump", "datasets", "prodigal", "zipstrain-rust-profiler")
+REQUIRED_PACKAGES = (("torch", "torch"), ("h5py", "h5py"), ("zipstrain_rust_profiler", "zipstrain-rust-profiler"))
 VERSION_PROBES = {
     "datasets": ["--version"],
     "prodigal": ["-v"],

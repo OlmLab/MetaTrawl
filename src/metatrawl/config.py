@@ -6,6 +6,8 @@ from pathlib import Path
 import tomllib
 from typing import Any
 
+from metatrawl.alignment import get_alignment_engine
+
 STAGE_NAMES = (
     "sra_download",
     "sylph",
@@ -95,6 +97,15 @@ class ProfileConfig:
     min_freq: float = 0.0
     min_read_ani: float | None = 0.95
     read_inclusion: str = "paired"
+    backend: str = "python"
+    alignment_engine: str = "bowtie2"
+
+
+def normalize_profile_backend(value: Any) -> str:
+    """Accept ZipStrain's built-in backend or an entry-point plugin name."""
+    if not isinstance(value, str) or not value.strip() or any(char.isspace() for char in value.strip()):
+        raise ValueError("profile.backend must be a non-empty backend name (for example, python or rust_profiler).")
+    return value.strip()
 
 
 @dataclass(frozen=True)
@@ -226,6 +237,8 @@ def _parse(raw: dict[str, Any], *, threads: int, sample_count: int) -> WorkflowC
             "profile.min_read_ani",
         ),
         read_inclusion=read_inclusion,
+        backend=normalize_profile_backend(profile.get("backend", ProfileConfig.backend)),
+        alignment_engine=get_alignment_engine(profile.get("alignment_engine", ProfileConfig.alignment_engine)).name,
     ), profile_import=ProfileImportConfig(
         queue_max_samples=_positive(
             profile_import.get("queue_max_samples", ProfileImportConfig.queue_max_samples),

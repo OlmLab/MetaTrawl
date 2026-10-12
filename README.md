@@ -1,14 +1,14 @@
 # MetaTrawl
 
 <p align="center">
-  <img src="assets/metatrawl-concept.svg" alt="MetaTrawl organizes bacterial genomes from large metagenomic collections for strain-level comparison" width="100%">
+  <img src="https://raw.githubusercontent.com/OlmLab/MetaTrawl/main/assets/metatrawl-concept.svg" alt="MetaTrawl organizes bacterial genomes from large metagenomic collections for strain-level comparison" width="100%">
 </p>
 
 <p align="center">
   <a href="https://pypi.org/project/metatrawl/"><img alt="PyPI" src="https://img.shields.io/pypi/v/metatrawl?style=flat-square"></a>
   <a href="https://pypi.org/project/metatrawl/"><img alt="Python" src="https://img.shields.io/pypi/pyversions/metatrawl?style=flat-square"></a>
   <a href="https://hub.docker.com/r/parsaghadermazi/metatrawl"><img alt="Docker" src="https://img.shields.io/docker/v/parsaghadermazi/metatrawl?sort=semver&style=flat-square&label=docker"></a>
-  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/OlmLab/MetaTrawl?style=flat-square"></a>
+  <a href="https://github.com/OlmLab/MetaTrawl/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/OlmLab/MetaTrawl?style=flat-square"></a>
 </p>
 
 MetaTrawl is a workflow and data layer for large-scale strain analysis of
@@ -80,9 +80,17 @@ metatrawl check
 pip install metatrawl
 ```
 
-The PyPI package installs Python dependencies. Sylph, Bowtie2, Samtools,
-Prodigal, SRA Toolkit, and NCBI Datasets must be installed separately when their
-workflow stages are used.
+The PyPI package installs Python dependencies, ZipStrain 1.2.2+, and its native
+Rust profiler plugin. Python profiling remains the default; select Rust with
+`--backend rust_profiler` or `[profile].backend = "rust_profiler"`.
+Sylph, Bowtie2, Samtools, Prodigal, SRA Toolkit, and NCBI Datasets must be
+installed separately when their workflow stages are used. bwa-mem3 is optional
+and must be installed separately to use `--alignment-engine bwa-mem3` or
+`[profile].alignment_engine = "bwa-mem3"`. Bowtie2 remains the default aligner.
+
+On platforms without a Rust-plugin wheel, pip builds it from source and requires
+a Rust toolchain and native build prerequisites. Conda and the Linux AMD64
+containers provide prebuilt native tools.
 
 ### Containers
 
@@ -90,13 +98,13 @@ Published images contain the complete toolchain:
 
 ```bash
 # Portable CPU image
-docker pull parsaghadermazi/metatrawl:1.0.0
+docker pull parsaghadermazi/metatrawl:1.1.0
 
 # NVIDIA CUDA 12.8 image
-docker pull parsaghadermazi/metatrawl:1.0.0-cuda
+docker pull parsaghadermazi/metatrawl:1.1.0-cuda
 ```
 
-See [Container usage](docs/containers.md) for project mounts, CUDA checks,
+See [Container usage](https://github.com/OlmLab/MetaTrawl/blob/main/docs/containers.md) for project mounts, CUDA checks,
 GPU comparison commands, local builds, and Apptainer use on HPC.
 
 ## Quick Start
@@ -197,7 +205,7 @@ Open `http://127.0.0.1:8766`. The viewer reads static artifacts and does not
 open the project or comparison databases.
 
 For the complete walkthrough, including fixed references, threshold behavior,
-manual imports, and progress inspection, read [Getting started](docs/getting-started.md).
+manual imports, and progress inspection, read [Getting started](https://github.com/OlmLab/MetaTrawl/blob/main/docs/getting-started.md).
 
 ## Storage Modes
 
@@ -236,7 +244,7 @@ db.genome("GCF_000001").profiles().sink_parquet(
 ```
 
 Queries can return Polars DataFrames, participate in lazy Polars pipelines, or
-stream directly to Parquet. See the [Python query API](docs/python-api.md).
+stream directly to Parquet. See the [Python query API](https://github.com/OlmLab/MetaTrawl/blob/main/docs/python-api.md).
 
 ## Project Layout
 
@@ -254,12 +262,12 @@ corresponding database import commits.
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md): complete CLI workflow
-- [Containers](docs/containers.md): CPU, CUDA, Docker, and Apptainer
-- [Sync and resume](docs/sync-and-resume.md): incremental execution model
-- [Workflow configuration](docs/workflow-configuration.md): local and Slurm settings
-- [Python query API](docs/python-api.md): sample and genome queries
-- [Database provenance](docs/database-provenance.md): versioning and compatibility
+- [Getting started](https://github.com/OlmLab/MetaTrawl/blob/main/docs/getting-started.md): complete CLI workflow
+- [Containers](https://github.com/OlmLab/MetaTrawl/blob/main/docs/containers.md): CPU, CUDA, Docker, and Apptainer
+- [Sync and resume](https://github.com/OlmLab/MetaTrawl/blob/main/docs/sync-and-resume.md): incremental execution model
+- [Workflow configuration](https://github.com/OlmLab/MetaTrawl/blob/main/docs/workflow-configuration.md): local and Slurm settings
+- [Python query API](https://github.com/OlmLab/MetaTrawl/blob/main/docs/python-api.md): sample and genome queries
+- [Database provenance](https://github.com/OlmLab/MetaTrawl/blob/main/docs/database-provenance.md): versioning and compatibility
 
 ## Support
 
@@ -276,4 +284,4 @@ pip install -e ".[test]"
 pytest
 ```
 
-MetaTrawl is released under the [MIT License](LICENSE).
+MetaTrawl is released under the [MIT License](https://github.com/OlmLab/MetaTrawl/blob/main/LICENSE).

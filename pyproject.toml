@@ -1,6 +1,6 @@
 [project]
 name = "metatrawl"
-version = "1.0.0"
+version = "1.1.1"
 description = "Mutable registry and workflow bookkeeping for large ZipStrain/SRA profiling projects."
 readme = "README.md"
 license = "MIT"
@@ -17,7 +17,8 @@ dependencies = [
     "rich>=13.0",
     "scipy>=1.16",
     "seaborn>=0.13",
-    "zipstrain>=1.0.1,<2",
+    "zipstrain>=1.2.2,<2",
+    "zipstrain-rust-profiler>=0.1.0,<1",
     "zstandard>=0.23",
 ]
 
@@ -26,12 +27,22 @@ test = [
     "pytest>=8.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/OlmLab/MetaTrawl"
+Documentation = "https://github.com/OlmLab/MetaTrawl#readme"
+Repository = "https://github.com/OlmLab/MetaTrawl"
+Issues = "https://github.com/OlmLab/MetaTrawl/issues"
+
 [project.scripts]
 metatrawl = "metatrawl.cli:cli"
 
 [tool.poetry]
 packages = [{include = "metatrawl", from = "src"}]
-include = [{path = "src/metatrawl/web", format = ["sdist", "wheel"]}]
+include = [
+    {path = "src/metatrawl/web", format = ["sdist", "wheel"]},
+    {path = "docs", format = ["sdist"]},
+    {path = "assets", format = ["sdist"]},
+]
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]

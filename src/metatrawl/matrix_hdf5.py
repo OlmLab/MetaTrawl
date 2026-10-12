@@ -1449,11 +1449,13 @@ def _collect_scaffold_specs_from_bed_and_stb(*, bed_file: Path, stb_file: Path, 
     if not stb_path.is_file():
         raise FileNotFoundError(f"STB file does not exist: {stb_path}")
     bed_spans = (
-        pl.scan_csv(bed_path, separator="\t", has_header=False)
+        pl.scan_csv(
+            bed_path, separator="\t", has_header=False, new_columns=["chrom", "start", "end"]
+        )
         .select(
-            pl.col("column_1").cast(pl.Utf8).alias("chrom"),
-            pl.col("column_2").cast(pl.Int64).alias("start"),
-            pl.col("column_3").cast(pl.Int64).alias("end"),
+            pl.col("chrom").cast(pl.Utf8),
+            pl.col("start").cast(pl.Int64),
+            pl.col("end").cast(pl.Int64),
         )
         .group_by("chrom")
         .agg(pl.col("start").min().alias("min_start"), pl.col("end").max().alias("max_end"))
@@ -1493,8 +1495,10 @@ def _collect_scaffold_specs_from_bed_and_stb(*, bed_file: Path, stb_file: Path, 
 
 def _read_stb_mapping(stb_file: Path) -> pl.DataFrame:
     mapping = (
-        pl.scan_csv(stb_file, separator="\t", has_header=False)
-        .select(pl.col("column_1").cast(pl.Utf8).alias("scaffold"), pl.col("column_2").cast(pl.Utf8).alias("genome"))
+        pl.scan_csv(
+            stb_file, separator="\t", has_header=False, new_columns=["scaffold", "genome"]
+        )
+        .select(pl.col("scaffold").cast(pl.Utf8), pl.col("genome").cast(pl.Utf8))
         .collect(engine="streaming")
     )
     duplicate_scaffolds = mapping.group_by("scaffold").len().filter(pl.col("len") > 1).get_column("scaffold").to_list()
@@ -1550,8 +1554,12 @@ def _collect_gene_range_specs(*, gene_range_table: Path, genome_scaffolds: list[
         raise FileNotFoundError(f"Gene range table does not exist: {gene_range_table}")
     offsets_by_chrom = {offset.chrom: offset for offset in genome_scaffolds}
     frame = (
-        pl.scan_csv(gene_range_table, has_header=False, separator="\t")
-        .rename({"column_1": "gene", "column_2": "scaffold", "column_3": "start", "column_4": "end"})
+        pl.scan_csv(
+            gene_range_table,
+            has_header=False,
+            separator="\t",
+            new_columns=["gene", "scaffold", "start", "end"],
+        )
         .select(pl.col("gene").cast(pl.Utf8), pl.col("scaffold").cast(pl.Utf8), pl.col("start").cast(pl.Int64), pl.col("end").cast(pl.Int64))
         .collect(engine="streaming")
     )

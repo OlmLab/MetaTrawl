@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from dataclasses import replace
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,7 +23,8 @@ from metatrawl import migration
 from metatrawl import provenance
 from metatrawl import viewer
 from metatrawl import workflows
-from metatrawl.config import WorkflowConfig, load_workflow_config
+from metatrawl.config import WorkflowConfig, load_workflow_config, normalize_profile_backend
+from metatrawl.alignment import get_alignment_engine
 from metatrawl.execution import WorkflowRuntime
 from metatrawl.logging import WorkflowLogger
 
@@ -494,6 +496,8 @@ def cache_serve(cache_dir: Path, host: str, port: int) -> None:
 
 
 @cli.command("profile-sra")
+@click.option("--alignment-engine", default=None, help="Alignment engine: bowtie2 (default), bwa-mem3, or an installed adapter. Overrides [profile].alignment_engine.")
+@click.option("--backend", default=None, help="Profiling backend: python or an installed ZipStrain plugin such as rust_profiler. Overrides [profile].backend.")
 @click.option("--allow-incompatible-profiles", is_flag=True, help="Acknowledge unknown legacy scratch checkpoints; recorded in bundle provenance.")
 @click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
 @click.option("--remaining-csv", required=True, type=click.Path(path_type=Path), help="CSV from profiles remaining.")
@@ -520,11 +524,26 @@ def profile_sra(
     reference_stb: Path | None,
     threads: int,
     workflow_config: Path | None,
+    backend: str | None,
+    alignment_engine: str | None,
     allow_incompatible_profiles: bool,
 ) -> None:
     """Run the local SRA profiling lifecycle with scratch cleanup."""
     run_ids = _read_remaining_csv(remaining_csv)
     execution_config = load_workflow_config(workflow_config, threads=threads, sample_count=len(run_ids))
+    if backend is not None or alignment_engine is not None:
+        try:
+            profile = execution_config.profile
+            if backend is not None:
+                profile = replace(profile, backend=normalize_profile_backend(backend))
+            if alignment_engine is not None:
+                profile = replace(profile, alignment_engine=get_alignment_engine(alignment_engine).name)
+            execution_config = replace(
+                execution_config,
+                profile=profile,
+            )
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
     workflows.profile_sra_runs(
         run_ids=run_ids,
         db_file=db_file,
@@ -544,6 +563,8 @@ def profile_sra(
 
 
 @cli.command("sync-profile")
+@click.option("--alignment-engine", default=None, help="Alignment engine: bowtie2 (default), bwa-mem3, or an installed adapter. Overrides [profile].alignment_engine.")
+@click.option("--backend", default=None, help="Profiling backend: python or an installed ZipStrain plugin such as rust_profiler. Overrides [profile].backend.")
 @click.option("--allow-incompatible-profiles", is_flag=True, help="Acknowledge and record unknown or mismatched profiling provenance.")
 @click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
 @click.option("--cache-dir", required=True, type=click.Path(path_type=Path), help="Shared genome cache directory.")
@@ -570,6 +591,8 @@ def sync_profile(
     reference_stb: Path | None,
     threads: int,
     workflow_config: Path | None,
+    backend: str | None,
+    alignment_engine: str | None,
     skip_dependency_check: bool,
     keep_profile_outputs: bool,
     allow_incompatible_profiles: bool,
@@ -579,6 +602,16 @@ def sync_profile(
         with registry.connect(db_file) as conn:
             remaining_count = len(registry.remaining_runs(conn))
         execution_config = load_workflow_config(workflow_config, threads=threads, sample_count=remaining_count)
+        if backend is not None:
+            execution_config = replace(
+                execution_config,
+                profile=replace(execution_config.profile, backend=normalize_profile_backend(backend)),
+            )
+        if alignment_engine is not None:
+            execution_config = replace(
+                execution_config,
+                profile=replace(execution_config.profile, alignment_engine=get_alignment_engine(alignment_engine).name),
+            )
         summary = workflows.sync_remaining_profiles(
             db_file=db_file,
             cache_dir=cache_dir,

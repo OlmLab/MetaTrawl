@@ -23,6 +23,7 @@ import uuid
 import polars as pl
 
 from metatrawl import allele_mask
+from metatrawl.alignment import Bowtie2AlignmentEngine, get_alignment_engine
 from metatrawl import cache
 from metatrawl import db
 from metatrawl import healthcheck
@@ -1157,6 +1158,7 @@ def _prepare_fixed_reference_context(
     cache_dir: Path,
     runtime: WorkflowRuntime,
     logger: WorkflowLogger,
+    alignment_engine: str = "bowtie2",
 ) -> FixedReferenceContext | None:
     """Prepare one content-addressed reference and index shared by all samples."""
     if not _fixed_reference_mode(
@@ -1177,11 +1179,14 @@ def _prepare_fixed_reference_context(
         if not _valid_file(path):
             raise FileNotFoundError(f"Fixed-reference {label} file is missing or empty: {path}")
     source_hashes = {label: _sha256_file(path) for label, path in sources.items()}
-    digest = hashlib.sha256(
-        json.dumps({"sources": source_hashes, "null_model": provenance.zipstrain_defaults()["null_model"]}, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    engine = get_alignment_engine(alignment_engine)
+    cache_settings = {"sources": source_hashes, "null_model": provenance.zipstrain_defaults()["null_model"]}
+    # Keep existing Bowtie2 cache keys; other engines need their own index.
+    if engine.name != "bowtie2":
+        cache_settings["alignment"] = engine.scientific_contract()
+    digest = hashlib.sha256(json.dumps(cache_settings, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     root = Path(cache_dir) / "fixed_references" / digest
-    cached = _fixed_reference_context_from_dir(root, digest)
+    cached = _fixed_reference_context_from_dir(root, digest, alignment_engine=engine.name)
     if cached is not None:
         logger.emit(step="fixed-reference", status="cached", reference_key=digest, path=root)
         return cached
@@ -1234,25 +1239,16 @@ def _prepare_fixed_reference_context(
             logger=logger,
             runtime=runtime,
         )
-        runtime.run(
-            "bowtie_build",
-            [
-                "bowtie2-build",
-                "--threads",
-                str(runtime.threads("bowtie_build")),
-                str(shared_reference),
-                str(shared_reference),
-            ],
-            sample=sample,
-        )
-        if not _bowtie_index_complete(shared_reference):
-            raise RuntimeError(f"Fixed-reference Bowtie2 index is incomplete: {shared_reference}")
+        engine.prepare_index(runtime, shared_reference, sample=sample)
+        if not engine.index_complete(shared_reference):
+            raise RuntimeError(f"Fixed-reference {engine.name} index is incomplete: {shared_reference}")
         (temporary / "manifest.json").write_text(
             json.dumps(
                 {
                     "reference_key": digest,
                     "source_files": {label: str(path) for label, path in sources.items()},
                     "sha256": source_hashes,
+                    "alignment_engine": engine.name,
                 },
                 indent=2,
                 sort_keys=True,
@@ -1261,7 +1257,7 @@ def _prepare_fixed_reference_context(
         )
         (temporary / ".ready").write_text("ready\n")
         if root.exists():
-            cached = _fixed_reference_context_from_dir(root, digest)
+            cached = _fixed_reference_context_from_dir(root, digest, alignment_engine=engine.name)
             if cached is None:
                 raise RuntimeError(f"Fixed-reference cache is incomplete: {root}")
             shutil.rmtree(temporary)
@@ -1270,14 +1266,16 @@ def _prepare_fixed_reference_context(
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
-    prepared = _fixed_reference_context_from_dir(root, digest)
+    prepared = _fixed_reference_context_from_dir(root, digest, alignment_engine=engine.name)
     if prepared is None:
         raise RuntimeError(f"Fixed-reference cache publication failed: {root}")
     logger.emit(step="fixed-reference", status="ready", reference_key=digest, path=root)
     return prepared
 
 
-def _fixed_reference_context_from_dir(root: Path, reference_key: str) -> FixedReferenceContext | None:
+def _fixed_reference_context_from_dir(
+    root: Path, reference_key: str, *, alignment_engine: str = "bowtie2",
+) -> FixedReferenceContext | None:
     assets = root / "profiling_assets"
     reference_fasta = assets / "reference.fasta"
     required = (
@@ -1291,7 +1289,7 @@ def _fixed_reference_context_from_dir(root: Path, reference_key: str) -> FixedRe
         assets / "profiling_contract.json",
         Path(str(reference_fasta) + ".fai"),
     )
-    if not all(_valid_file(path) for path in required) or not _bowtie_index_complete(reference_fasta):
+    if not all(_valid_file(path) for path in required) or not get_alignment_engine(alignment_engine).index_complete(reference_fasta):
         return None
     return FixedReferenceContext(
         reference=cache.PreparedReference(
@@ -1353,6 +1351,7 @@ def profile_sra_runs(
         cache_dir=Path(cache_dir),
         runtime=runtime,
         logger=logger,
+        alignment_engine=workflow_config.profile.alignment_engine,
     )
     cache_manager: cache.GenomeCache | None = None
     if fixed_reference is None:
@@ -1376,7 +1375,8 @@ def profile_sra_runs(
     elif sylph_db is not None:
         logger.emit(step="sylph", status="skipped-fixed-reference", syldb=sylph_db)
     max_workers = max(1, min(len(run_ids), workflow_config.sample_workers))
-    logger.emit(step="profile-sra", status="start", samples=len(run_ids), workers=max_workers, db=db_file)
+    logger.emit(step="profile-sra", status="start", samples=len(run_ids), workers=max_workers,
+                backend=workflow_config.profile.backend, alignment_engine=workflow_config.profile.alignment_engine, db=db_file)
     failures: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         pending_run_ids = iter(run_ids)
@@ -1476,6 +1476,11 @@ def sync_remaining_profiles(
     if check_dependencies:
         logger.emit(step="dependency-check", status="start")
         required_executables = healthcheck.REQUIRED_EXECUTABLES
+        selected_engine = workflow_config.profile.alignment_engine if workflow_config is not None else "bowtie2"
+        if selected_engine != "bowtie2":
+            # The adapter checks its executable in the actual local/Slurm stage
+            # environment. Optional aligners need not exist on the coordinator.
+            required_executables = tuple(command for command in required_executables if command != "bowtie2")
         if fixed_reference_mode:
             skipped = {"sylph", "datasets", "prodigal"}
             required_executables = tuple(command for command in required_executables if command not in skipped)
@@ -2022,6 +2027,7 @@ def _run_alignment_and_profile(
 ) -> None:
     runtime = runtime or _DirectRuntime(threads or 1)
     profile_config = profile_config or ProfileConfig()
+    engine = get_alignment_engine(profile_config.alignment_engine)
     scientific_contract = provenance.profiling_contract(profile_config)
     if reference.stb_file is None:
         raise ValueError(f"sample={run_id} step=profile missing STB file from cache reference preparation")
@@ -2105,24 +2111,13 @@ def _run_alignment_and_profile(
     if not _valid_file(bam_file):
         fastqs = _sample_fastqs(sample_scratch)
         read_layout = _write_read_layout(sample_scratch, fastqs)
-        if not _bowtie_index_complete(reference.reference_fasta):
-            logger.emit(sample=run_id, step="bowtie2-build", status="start")
-            bowtie_threads = runtime.threads("bowtie_build")
-            runtime.run(
-                "bowtie_build",
-                [
-                    "bowtie2-build",
-                    "--threads",
-                    str(bowtie_threads),
-                    str(reference.reference_fasta),
-                    str(reference.reference_fasta),
-                ],
-                sample=run_id,
-            )
-            logger.emit(sample=run_id, step="bowtie2-build", status="done")
+        if not engine.index_complete(reference.reference_fasta):
+            logger.emit(sample=run_id, step=f"{engine.name}-build", status="start", alignment_engine=engine.name)
+            engine.prepare_index(runtime, reference.reference_fasta, sample=run_id)
+            logger.emit(sample=run_id, step=f"{engine.name}-build", status="done", alignment_engine=engine.name)
         else:
-            logger.emit(sample=run_id, step="bowtie2-build", status="cached")
-        logger.emit(sample=run_id, step="align", status="start", bam=bam_file)
+            logger.emit(sample=run_id, step=f"{engine.name}-build", status="cached", alignment_engine=engine.name)
+        logger.emit(sample=run_id, step="align", status="start", alignment_engine=engine.name, bam=bam_file)
         temporary_bam = bam_file.with_suffix(".bam.tmp")
         temporary_bam.unlink(missing_ok=True)
         runtime.run_shell(
@@ -2132,6 +2127,7 @@ def _run_alignment_and_profile(
                 fastqs=fastqs,
                 threads=runtime.threads("alignment"),
                 bam_file=temporary_bam,
+                alignment_engine=engine.name,
             ),
             sample=run_id,
         )
@@ -2171,7 +2167,7 @@ def _run_alignment_and_profile(
         reads_dir.rmdir()
     reference_is_sample_scratch = reference.reference_fasta.resolve().is_relative_to(sample_scratch.resolve())
     if reference_is_sample_scratch:
-        for index_file in _bowtie_index_paths(reference.reference_fasta):
+        for index_file in engine.cleanup_paths(reference.reference_fasta):
             released += _remove_path(index_file)
     logger.emit(
         sample=run_id,
@@ -2186,7 +2182,7 @@ def _run_alignment_and_profile(
         require_sylph=fixed_reference is None,
         reference_key=fixed_reference.reference_key if fixed_reference is not None else None,
     ):
-        logger.emit(sample=run_id, step="profile", status="start")
+        logger.emit(sample=run_id, step="profile", status="start", backend=profile_config.backend)
         profile_command = [
             "zipstrain",
             "utilities",
@@ -2219,6 +2215,9 @@ def _run_alignment_and_profile(
             str(profile_work),
         ]
         profile_command.extend(["--min-read-ani", str(scientific_contract["profile"]["min_read_ani"])])
+        # Omitting the built-in default also supports older ZipStrain installs.
+        if profile_config.backend != "python":
+            profile_command.extend(["--backend", profile_config.backend])
         runtime.run(
             "profile",
             profile_command,
@@ -2229,6 +2228,8 @@ def _run_alignment_and_profile(
             profile_file=output_dir / f"{run_id}.profile.parquet", sample_id=run_id,
             contract=scientific_contract, references=references,
             details={"software": provenance.package_versions(), "software_scope": "coordinator",
+                     "profile_backend": profile_config.backend,
+                     "alignment_engine": engine.name,
                      "legacy_checkpoint_acknowledged": legacy_checkpoint,
                      "input": {"type": sample_input.input_type,
                                "sample_id": sample_input.sample_id,
@@ -2287,19 +2288,11 @@ def _validate_bam(bam_file: Path, *, run_id: str) -> None:
 
 
 def _bowtie_index_paths(reference_fasta: Path) -> list[Path]:
-    suffixes = ("1", "2", "3", "4", "rev.1", "rev.2")
-    return [
-        Path(f"{reference_fasta}.{suffix}.{extension}")
-        for extension in ("bt2", "bt2l")
-        for suffix in suffixes
-    ]
+    return Bowtie2AlignmentEngine().index_paths(reference_fasta)
 
 
 def _bowtie_index_complete(reference_fasta: Path) -> bool:
-    paths = _bowtie_index_paths(reference_fasta)
-    small = paths[:6]
-    large = paths[6:]
-    return all(_valid_file(path) for path in small) or all(_valid_file(path) for path in large)
+    return Bowtie2AlignmentEngine().index_complete(reference_fasta)
 
 
 def _profile_bundle_ready_marker(output_dir: Path, run_id: str) -> Path:
@@ -2407,18 +2400,11 @@ def _ensure_reference_fai(*, profile_work: Path, run_id: str, logger: WorkflowLo
     return fai_file
 
 
-def _build_alignment_command(*, reference_fasta: Path, fastqs: list[Path], threads: int, bam_file: Path) -> str:
-    quoted_reference = shlex.quote(str(reference_fasta))
-    quoted_threads = shlex.quote(str(threads))
-    if len(fastqs) == 2:
-        read_args = f"-1 {shlex.quote(str(fastqs[0]))} -2 {shlex.quote(str(fastqs[1]))}"
-    else:
-        read_args = f"-U {shlex.quote(','.join(str(path) for path in fastqs))}"
-    return (
-        f"bowtie2 -x {quoted_reference} {read_args} --threads {quoted_threads} "
-        f"| samtools view -bS -F 4 - "
-        f"| samtools sort -@ {quoted_threads} -o {shlex.quote(str(bam_file))} -"
-    )
+def _build_alignment_command(
+    *, reference_fasta: Path, fastqs: list[Path], threads: int, bam_file: Path,
+    alignment_engine: str = "bowtie2",
+) -> str:
+    return get_alignment_engine(alignment_engine).bam_command(reference_fasta, fastqs, threads, bam_file)
 
 
 def _run_alignment_shell(*, command: str, sample: str) -> None:

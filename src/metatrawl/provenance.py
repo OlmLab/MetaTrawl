@@ -14,6 +14,8 @@ from pathlib import Path
 import time
 import uuid
 
+from metatrawl.alignment import get_alignment_engine
+
 SCHEMA_VERSION = 1
 MANIFEST_VERSION = 1
 
@@ -108,13 +110,15 @@ def zipstrain_defaults() -> dict:
 
 def profiling_contract(config) -> dict:
     values = asdict(config)
+    # Backend choice is operational; scientific filters and hashes stay stable.
+    values.pop("backend", None)
+    engine = get_alignment_engine(values.pop("alignment_engine", "bowtie2"))
     defaults = zipstrain_defaults()
     if values["min_read_ani"] is None:
         values["min_read_ani"] = defaults["min_read_ani"]
     return {"contract_version": 1, "profile": values,
             "null_model": defaults["null_model"],
-            "alignment": {"aligner": "bowtie2", "preset": "default-sensitive-end-to-end",
-                          "samtools_exclude_flags": 4},
+            "alignment": engine.scientific_contract(),
             "single_end_read_inclusion": "all-mapped"}
 
 
