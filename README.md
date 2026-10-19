@@ -90,10 +90,10 @@ Published images contain the complete toolchain:
 
 ```bash
 # Portable CPU image
-docker pull parsaghadermazi/metatrawl:1.0.0
+docker pull parsaghadermazi/metatrawl:1.1.2
 
 # NVIDIA CUDA 12.8 image
-docker pull parsaghadermazi/metatrawl:1.0.0-cuda
+docker pull parsaghadermazi/metatrawl:1.1.2-cuda
 ```
 
 See [Container usage](docs/containers.md) for project mounts, CUDA checks,
@@ -149,6 +149,19 @@ metatrawl sync-profile \
 
 Each completed sample is imported transactionally and then removed from scratch.
 Rerunning the command resumes incomplete samples and skips imported samples.
+
+Optional null-model settings belong in the workflow configuration:
+
+```toml
+[profile.null_model]
+error_rate = 0.001
+p_threshold = 0.000001
+```
+
+Omit this table to keep the installed ZipStrain defaults. CLI overrides such as
+`--null-model-error-rate 0.001` are also available. Effective values are recorded
+and checked against existing profiles and checkpoints; see
+[Workflow configuration](docs/workflow-configuration.md#null-model-settings).
 
 ### 3. Build genome matrices
 

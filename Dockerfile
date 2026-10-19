@@ -44,7 +44,7 @@ WORKDIR /opt/metatrawl
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 
-RUN python -m pip install . \
+RUN python -m pip install . 'polars>=1.34,<2' \
     && python -m pip check \
     && metatrawl check \
     && bwa-mem3 version \

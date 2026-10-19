@@ -12,6 +12,33 @@ def _nonempty(path: Path) -> bool:
     return path.is_file() and path.stat().st_size > 0
 
 
+def split_alignment_reads(reads: list[Path]) -> tuple[list[Path], list[Path]]:
+    """Separate an SRA split-3 pair from its orphan reads without dropping files.
+
+    One or two inputs retain the existing single/paired interface. Three inputs
+    must be an unambiguous ``sample_1``, ``sample_2``, ``sample`` FASTQ set.
+    """
+    if len(reads) in (1, 2):
+        return reads, []
+    by_stem: dict[str, Path] = {}
+    for path in reads:
+        for suffix in (".fastq.gz", ".fq.gz", ".fastq", ".fq"):
+            if path.name.lower().endswith(suffix):
+                by_stem[path.name[:-len(suffix)]] = path
+                break
+    if len(reads) == 3 and len(by_stem) == 3:
+        for stem in by_stem:
+            if stem.endswith("_1"):
+                root = stem[:-2]
+                if root in by_stem and root + "_2" in by_stem:
+                    return [by_stem[stem], by_stem[root + "_2"]], [by_stem[root]]
+    raise ValueError(
+        "Ambiguous FASTQ inputs: expected one single-end file, two paired-end files, "
+        "or a matching sample_1/sample_2/sample split-3 set; found: "
+        + ", ".join(str(path) for path in reads)
+    )
+
+
 def _require_commands(commands: tuple[str, ...], *, engine: str) -> str:
     """Check the actual execution environment, including a Slurm worker's PATH."""
     checks = []
@@ -70,12 +97,26 @@ class AlignmentEngine(ABC):
         """Keep only mapped records, sort, and propagate any pipeline failure."""
         if threads < 1 or not reads:
             raise ValueError("Alignment requires positive threads and at least one FASTQ file.")
-        align = self.alignment_command(reference, reads, threads)
+        primary, orphans = split_alignment_reads(reads)
+        align = self.alignment_command(reference, primary, threads)
+        sam_stream = shlex.join(align)
+        if orphans:
+            orphan_align = self.alignment_command(reference, orphans, threads)
+            # Retain the pair's reference header; stream orphan records without a
+            # second header. Explicitly stop if the first aligner fails.
+            sam_stream = (
+                "{ " + sam_stream + " || exit $?; "
+                + shlex.join(orphan_align) + " | samtools view -S -; }"
+            )
+        temporary_template = shlex.quote(str(bam_file.parent / ".metatrawl-align.XXXXXX"))
         script = (
             _require_commands((align[0], "samtools"), engine=self.name)
-            + "; " + shlex.join(align)
+            + f"; alignment_tmp=$(mktemp -d {temporary_template}) || exit $?; "
+            + "trap 'rm -rf -- \"$alignment_tmp\"' EXIT; "
+            + sam_stream
             + " | samtools view -bS -F 4 -"
-            + f" | samtools sort -@ {threads} -o {shlex.quote(str(bam_file))} -"
+            + f" | samtools sort -@ {threads} -o {shlex.quote(str(bam_file))}"
+            + ' -T "$alignment_tmp/sort" -'
         )
         return "bash -o pipefail -c " + shlex.quote(script)
 

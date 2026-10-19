@@ -23,7 +23,7 @@ import uuid
 import polars as pl
 
 from metatrawl import allele_mask
-from metatrawl.alignment import Bowtie2AlignmentEngine, get_alignment_engine
+from metatrawl.alignment import Bowtie2AlignmentEngine, get_alignment_engine, split_alignment_reads
 from metatrawl import cache
 from metatrawl import db
 from metatrawl import healthcheck
@@ -32,6 +32,7 @@ from metatrawl import provenance
 from metatrawl.config import MatrixCompareConfig, ProfileConfig, ProfileImportConfig, WorkflowConfig
 from metatrawl.execution import WorkflowRuntime
 from metatrawl.logging import ThrottledMatrixLogger, WorkflowLogger
+from metatrawl.sylph import numeric_column, read_sylph_table
 
 
 ACCESSION_PATTERN = re.compile(r"\b((?:GC[AF])_\d+(?:\.\d+)?)", re.IGNORECASE)
@@ -1159,6 +1160,7 @@ def _prepare_fixed_reference_context(
     runtime: WorkflowRuntime,
     logger: WorkflowLogger,
     alignment_engine: str = "bowtie2",
+    profile_config: ProfileConfig | None = None,
 ) -> FixedReferenceContext | None:
     """Prepare one content-addressed reference and index shared by all samples."""
     if not _fixed_reference_mode(
@@ -1180,7 +1182,7 @@ def _prepare_fixed_reference_context(
             raise FileNotFoundError(f"Fixed-reference {label} file is missing or empty: {path}")
     source_hashes = {label: _sha256_file(path) for label, path in sources.items()}
     engine = get_alignment_engine(alignment_engine)
-    cache_settings = {"sources": source_hashes, "null_model": provenance.zipstrain_defaults()["null_model"]}
+    cache_settings = {"sources": source_hashes, "null_model": provenance.null_model_settings(profile_config)}
     # Keep existing Bowtie2 cache keys; other engines need their own index.
     if engine.name != "bowtie2":
         cache_settings["alignment"] = engine.scientific_contract()
@@ -1210,7 +1212,7 @@ def _prepare_fixed_reference_context(
                 "zipstrain",
                 "utilities",
                 "prepare_profiling",
-                    *provenance.null_model_options(),
+                *provenance.null_model_options(profile_config),
                 "--reference-fasta",
                 str(staged_reference),
                 "--gene-fasta",
@@ -1352,6 +1354,7 @@ def profile_sra_runs(
         runtime=runtime,
         logger=logger,
         alignment_engine=workflow_config.profile.alignment_engine,
+        profile_config=workflow_config.profile,
     )
     cache_manager: cache.GenomeCache | None = None
     if fixed_reference is None:
@@ -1726,18 +1729,32 @@ def _profile_one_sra_run(
                 sra_dir.mkdir(parents=True, exist_ok=True)
                 runtime.run(
                     "sra_download",
-                    ["prefetch", "--output-directory", str(sra_dir), run_id],
+                    ["prefetch", "--max-size", "u", "--output-directory", str(sra_dir), run_id],
                     sample=run_id,
                 )
             else:
                 logger.emit(sample=run_id, step="prefetch", status="cached", file=sra_archive)
+            if not _valid_file(sra_archive):
+                raise RuntimeError(
+                    f"sample={run_id} step=download prefetch completed but the expected SRA archive "
+                    f"is missing or empty: {sra_archive}. Check the prefetch output and stage "
+                    "working directory; rerun sync-profile to retry the download."
+                )
             runtime.run(
                 "sra_download",
-                ["fasterq-dump", str(sra_archive), "--outdir", str(reads_dir), "--threads", str(download_threads)],
+                _fasterq_command(
+                    sample_scratch=sample_scratch, sra_archive=sra_archive, threads=download_threads,
+                ),
                 sample=run_id,
             )
-            fastqs = _sample_fastqs(sample_scratch)
+            conversion_dir = sample_scratch / ".fasterq"
+            fastqs = _sample_fastqs(conversion_dir)
+            for fastq in fastqs:
+                fastq.replace(reads_dir / fastq.name)
+            fastqs = [reads_dir / fastq.name for fastq in fastqs]
             _write_read_layout(sample_scratch, fastqs)
+            (sample_scratch / "fastq_conversion.pending").unlink()
+            shutil.rmtree(conversion_dir)
             removed_bytes = _remove_path(sra_dir)
             logger.emit(
                 sample=run_id,
@@ -1846,6 +1863,19 @@ def _valid_file(path: Path) -> bool:
     return path.is_file() and path.stat().st_size > 0
 
 
+def _fasterq_command(*, sample_scratch: Path, sra_archive: Path, threads: int) -> list[str]:
+    """Keep incomplete conversions out of reusable FASTQs, including on retry."""
+    conversion_dir = sample_scratch / ".fasterq"
+    conversion_dir.mkdir(exist_ok=True)
+    temp_dir = conversion_dir / "tmp"
+    temp_dir.mkdir(exist_ok=True)
+    (sample_scratch / "fastq_conversion.pending").touch()
+    return [
+        "fasterq-dump", str(sra_archive), "--outdir", str(conversion_dir),
+        "--threads", str(threads), "--force", "--temp", str(temp_dir),
+    ]
+
+
 def _checkpoint_fixed_reference(
     sample_scratch: Path,
     reference_key: str,
@@ -1894,7 +1924,8 @@ def _read_layout(sample_scratch: Path) -> str | None:
 
 
 def _write_read_layout(sample_scratch: Path, fastqs: list[Path]) -> str:
-    layout = "paired" if len(fastqs) == 2 else "single"
+    primary, _orphans = split_alignment_reads(fastqs)
+    layout = "paired" if len(primary) == 2 else "single"
     path = sample_scratch / "read_layout.txt"
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     temporary.write_text(layout + "\n")
@@ -2080,7 +2111,7 @@ def _run_alignment_and_profile(
                     "zipstrain",
                     "utilities",
                     "prepare_profiling",
-                    *provenance.null_model_options(),
+                    *provenance.null_model_options(profile_config),
                     "--reference-fasta",
                     str(reference.reference_fasta),
                     "--gene-fasta",
@@ -2092,6 +2123,8 @@ def _run_alignment_and_profile(
                 ],
                 sample=run_id,
             )
+            if _valid_file(profile_work / "null_model.parquet"):
+                _record_null_model_settings(profile_work, profile_config)
             logger.emit(sample=run_id, step="prepare-profile", status="done")
         else:
             logger.emit(sample=run_id, step="prepare-profile", status="cached")
@@ -2100,6 +2133,7 @@ def _run_alignment_and_profile(
             run_id=run_id,
             logger=logger,
             runtime=runtime,
+            profile_config=profile_config,
         )
         _ensure_reference_fai(profile_work=profile_work, run_id=run_id, logger=logger, runtime=runtime)
         bed_file = profile_work / "genomes_bed_file.bed"
@@ -2117,7 +2151,8 @@ def _run_alignment_and_profile(
             logger.emit(sample=run_id, step=f"{engine.name}-build", status="done", alignment_engine=engine.name)
         else:
             logger.emit(sample=run_id, step=f"{engine.name}-build", status="cached", alignment_engine=engine.name)
-        logger.emit(sample=run_id, step="align", status="start", alignment_engine=engine.name, bam=bam_file)
+        logger.emit(sample=run_id, step="align", status="start", alignment_engine=engine.name,
+                    read_layout=read_layout, fastq_files=len(fastqs), bam=bam_file)
         temporary_bam = bam_file.with_suffix(".bam.tmp")
         temporary_bam.unlink(missing_ok=True)
         runtime.run_shell(
@@ -2270,10 +2305,18 @@ def _run_alignment_and_profile(
 
 
 def _sample_fastqs(sample_scratch: Path, *, required: bool = True) -> list[Path]:
+    # A failed conversion can leave perfectly non-empty but truncated FASTQs.
+    if (sample_scratch / "fastq_conversion.pending").exists():
+        if required:
+            raise RuntimeError(f"Incomplete FASTQ conversion in {sample_scratch}; resume the download stage.")
+        return []
     fastqs: list[Path] = []
     for pattern in ("*.fastq", "*.fq", "*.fastq.gz", "*.fq.gz"):
         fastqs.extend(sorted(sample_scratch.rglob(pattern)))
-    fastqs = [path for path in fastqs if _valid_file(path)]
+    fastqs = [
+        path for path in fastqs
+        if _valid_file(path) and ".fasterq" not in path.relative_to(sample_scratch).parts[:-1]
+    ]
     if required and not fastqs:
         raise FileNotFoundError(f"step=align found no FASTQ files in {sample_scratch}")
     return fastqs
@@ -2360,23 +2403,54 @@ def _published_profile_bundle_complete(
     return payload.get("reference_key") == reference_key
 
 
-def _ensure_null_model(*, profile_work: Path, run_id: str, logger: WorkflowLogger, runtime: WorkflowRuntime) -> Path:
+def _record_null_model_settings(profile_work: Path, profile_config: ProfileConfig | None) -> None:
+    marker = profile_work / "null_model_settings.json"
+    temporary = marker.with_name(f".{marker.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(provenance.canonical(provenance.null_model_settings(profile_config)) + "\n")
+    temporary.replace(marker)
+
+
+def _ensure_null_model(
+    *, profile_work: Path, run_id: str, logger: WorkflowLogger,
+    runtime: WorkflowRuntime, profile_config: ProfileConfig | None = None,
+) -> Path:
     null_model = profile_work / "null_model.parquet"
-    if null_model.exists():
+    settings = provenance.null_model_settings(profile_config)
+    marker = profile_work / "null_model_settings.json"
+    if _valid_file(null_model):
+        if marker.exists():
+            if json.loads(marker.read_text()) != settings:
+                raise ValueError(f"sample={run_id} cached null-model settings differ; use a new scratch directory.")
+        elif settings != provenance.zipstrain_defaults()["null_model"]:
+            raise ValueError(
+                f"sample={run_id} cannot verify custom null-model parameters for {null_model}; "
+                "use a new scratch directory rather than relabelling cached assets."
+            )
         return null_model
-    logger.emit(sample=run_id, step="null-model", status="start", output=null_model)
+    logger.emit(sample=run_id, step="null-model", status="start", output=null_model, **settings)
     runtime.run(
         "prepare_profile",
         [
             "zipstrain",
             "utilities",
             "build-null-model",
-            *provenance.null_model_options(),
+            *provenance.null_model_options(profile_config),
             "--output-file",
             str(null_model),
         ],
         sample=run_id,
     )
+    if not _valid_file(null_model):
+        raise RuntimeError(f"sample={run_id} step=null-model missing or empty output: {null_model}")
+    # Older prepare routes omit the model; keep their asset contract consistent.
+    contract_file = profile_work / "profiling_contract.json"
+    if contract_file.exists():
+        contract = json.loads(contract_file.read_text())
+        contract["null_model_hash"] = provenance.sha256_file(null_model)
+        temporary = contract_file.with_name(f".{contract_file.name}.{uuid.uuid4().hex}.tmp")
+        temporary.write_text(json.dumps(contract, sort_keys=True) + "\n")
+        temporary.replace(contract_file)
+    _record_null_model_settings(profile_work, profile_config)
     logger.emit(sample=run_id, step="null-model", status="done", output=null_model)
     return null_model
 
@@ -2420,9 +2494,29 @@ def _publish_profile_outputs(*, run_id: str, profile_work: Path, output_dir: Pat
         profile_work / f"{run_id}_genome_stats.parquet": output_dir / f"{run_id}.genome_stats.parquet",
         profile_work / f"{run_id}_gene_stats.parquet": output_dir / f"{run_id}.gene_stats.parquet",
     }
-    missing = [str(source) for source in outputs if not source.exists()]
+    missing = [str(source) for source in outputs if not _valid_file(source)]
     if missing:
-        raise FileNotFoundError(f"sample={run_id} step=profile missing expected ZipStrain outputs: {', '.join(missing)}")
+        detail = ""
+        profile_file = profile_work / f"{run_id}_profile.parquet"
+        if _valid_file(profile_file) and not _valid_file(profile_work / f"{run_id}_genome_stats.parquet"):
+            try:
+                import pyarrow.parquet as pq
+                rows = pq.ParquetFile(profile_file).metadata.num_rows
+                if rows == 0:
+                    detail = " The profile has zero rows; check whether any reads survived the configured filters."
+                else:
+                    detail = (
+                        f" The profile contains {rows} rows, but genome stats are absent. "
+                        "Check the profile job's samtools/read-location logs; empty or failed "
+                        "read-location extraction can be silently skipped by older ZipStrain versions."
+                    )
+            except (OSError, ValueError):
+                detail = f" The profile parquet may be incomplete or unreadable: {profile_file}."
+        raise FileNotFoundError(
+            f"sample={run_id} step=profile missing expected ZipStrain outputs: {', '.join(missing)}."
+            f"{detail} No bundle was published. The BAM and profiling workspace are retained; "
+            "do not remove them or fabricate stats. Fix the underlying error before resuming."
+        )
     for source, destination in outputs.items():
         _atomic_publish(source, destination)
 
@@ -2512,12 +2606,7 @@ def extract_accessions_from_sylph_table(sylph_output: Path) -> list[str]:
 
 
 def _read_sylph_table(path: Path) -> pl.DataFrame:
-    suffix = path.suffix.lower()
-    if suffix == ".parquet":
-        return pl.read_parquet(path)
-    if suffix in {".tsv", ".txt"}:
-        return pl.read_csv(path, separator="\t")
-    return pl.read_csv(path)
+    return read_sylph_table(path)
 
 
 def _filter_nonzero_abundance_rows(table: pl.DataFrame) -> pl.DataFrame:
@@ -2526,14 +2615,15 @@ def _filter_nonzero_abundance_rows(table: pl.DataFrame) -> pl.DataFrame:
         for name, dtype in table.schema.items()
         if dtype.is_numeric()
     ]
-    if not numeric_cols:
-        return table
-    preferred = _first_matching_column(numeric_cols, SYLPH_ABUNDANCE_COLUMNS)
+    preferred = _first_matching_column(table.columns, SYLPH_ABUNDANCE_COLUMNS)
     if preferred is not None:
         cols_to_check = [preferred]
     else:
-        abundance_like = [name for name in numeric_cols if ("abund" in name.lower()) or ("cov" in name.lower())]
+        abundance_like = [name for name in table.columns if ("abund" in name.lower()) or ("cov" in name.lower())]
         cols_to_check = abundance_like if abundance_like else numeric_cols
+    if not cols_to_check:
+        return table
+    table = table.with_columns([numeric_column(table, name) for name in cols_to_check])
     return table.filter(
         pl.any_horizontal([pl.col(name).cast(pl.Float64, strict=False).fill_null(0.0) > 0.0 for name in cols_to_check])
     )

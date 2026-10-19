@@ -62,6 +62,11 @@ sequences, scaffold names/lengths, and Prodigal gene identities/coordinates are
 fingerprinted per genome, so the same genome name cannot silently change meaning.
 Null-model file identities are also checked when available.
 
+Optional `[profile.null_model]` fields and `--null-model-*` CLI overrides are
+resolved against the installed ZipStrain defaults before the contract is
+recorded. Unset overrides preserve existing default contract identities.
+Model changes are scientific changes, unlike RAM or Slurm walltime changes.
+
 After profiling, outputs include a sidecar such as:
 
 ```text

@@ -1037,11 +1037,16 @@ def test_profile_sra_deletes_temporary_reference_files_after_success(tmp_path: P
     scratch_dir = tmp_path / "scratch"
 
     def fake_run(cmd: list[str], **kwargs):
+        if cmd[0] == "prefetch":
+            archive = scratch_dir / "SRR1" / "sra" / "SRR1" / "SRR1.sra"
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            archive.write_text("archive")
         if cmd[0] == "fasterq-dump":
             sample_dir = scratch_dir / "SRR1"
             sample_dir.mkdir(parents=True, exist_ok=True)
             (sample_dir / "accessions.txt").write_text("GCF_1\n")
-            (sample_dir / "SRR1.fastq").write_text("@r1\nACGT\n+\n!!!!\n")
+            reads_dir = Path(cmd[cmd.index("--outdir") + 1])
+            (reads_dir / "SRR1.fastq").write_text("@r1\nACGT\n+\n!!!!\n")
         return subprocess.CompletedProcess(cmd, 0)
 
     class FakeGenomeCache:
@@ -1425,6 +1430,10 @@ def test_profile_sra_uses_per_sample_accessions_dir(tmp_path: Path, monkeypatch)
     prepared_accessions: list[list[str]] = []
 
     def fake_run(cmd: list[str], **kwargs):
+        if cmd[0] == "prefetch":
+            archive = scratch_dir / "SRR1" / "sra" / "SRR1" / "SRR1.sra"
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            archive.write_text("archive")
         if cmd[0] == "fasterq-dump":
             reads_dir = Path(cmd[cmd.index("--outdir") + 1])
             reads_dir.mkdir(parents=True, exist_ok=True)
@@ -1470,12 +1479,16 @@ def test_profile_sra_runs_sylph_and_extracts_accessions(tmp_path: Path, monkeypa
 
     def fake_subprocess_run(cmd, check, capture_output=False, text=False, stdout=None, stderr=None, **kwargs):
         if cmd[0] == "prefetch":
+            archive = scratch_dir / "SRR1" / "sra" / "SRR1" / "SRR1.sra"
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            archive.write_text("archive")
             return subprocess.CompletedProcess(cmd, 0)
         if cmd[0] == "fasterq-dump":
             sample_dir = scratch_dir / "SRR1"
             sample_dir.mkdir(parents=True, exist_ok=True)
-            (sample_dir / "SRR1_1.fastq").write_text("@r1\nACGT\n+\n!!!!\n")
-            (sample_dir / "SRR1_2.fastq").write_text("@r2\nTGCA\n+\n!!!!\n")
+            reads_dir = Path(cmd[cmd.index("--outdir") + 1])
+            (reads_dir / "SRR1_1.fastq").write_text("@r1\nACGT\n+\n!!!!\n")
+            (reads_dir / "SRR1_2.fastq").write_text("@r2\nTGCA\n+\n!!!!\n")
             return subprocess.CompletedProcess(cmd, 0)
         if cmd[:2] == ["sylph", "profile"]:
             stdout.write("Genome_file\tTaxonomic_abundance\n/path/GCF_000001.1_genomic.fna\t1.5\n/path/GCF_000002.1_genomic.fna\t0\n")
@@ -2011,6 +2024,8 @@ def test_profile_sra_scopes_prefetch_to_sample_scratch_and_retains_failed_work(t
     prefetch = next(call for call in calls if call[0] == "prefetch")
     assert prefetch == [
         "prefetch",
+        "--max-size",
+        "u",
         "--output-directory",
         str(scratch_dir / "SRR1" / "sra"),
         "SRR1",
@@ -2018,6 +2033,78 @@ def test_profile_sra_scopes_prefetch_to_sample_scratch_and_retains_failed_work(t
     assert "SRR1" in failures
     assert (scratch_dir / "SRR1" / "reads" / "SRR1.fastq").exists()
     assert not (scratch_dir / "SRR1" / "sra").exists()
+
+
+@pytest.mark.parametrize("archive_contents", [None, ""], ids=["missing", "empty"])
+def test_profile_sra_rejects_missing_archive_before_conversion(tmp_path: Path, monkeypatch, archive_contents) -> None:
+    scratch_dir = tmp_path / "scratch"
+    archive = scratch_dir / "SRR1" / "sra" / "SRR1" / "SRR1.sra"
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        assert cmd[0] == "prefetch", "Conversion must not run without a non-empty archive"
+        assert cmd[cmd.index("--max-size") + 1] == "u"
+        if archive_contents is not None:
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            archive.write_text(archive_contents)
+        return subprocess.CompletedProcess(cmd, 0, stdout="Download skipped", stderr="")
+
+    monkeypatch.setattr(workflows.subprocess, "run", fake_run)
+    failures = workflows.profile_sra_runs(
+        run_ids=["SRR1"], db_file=tmp_path / "metatrawl.duckdb",
+        cache_dir=tmp_path / "cache", scratch_dir=scratch_dir,
+        raise_on_error=False, logger=WorkflowLogger(),
+    )
+    assert len(calls) == 1
+    assert "sample=SRR1 step=download" in failures["SRR1"]
+    assert "missing or empty" in failures["SRR1"]
+    assert str(archive) in failures["SRR1"]
+    assert "rerun sync-profile" in failures["SRR1"]
+    assert (scratch_dir / "SRR1").is_dir()
+
+
+@pytest.mark.parametrize("cached_archive", [False, True], ids=["fresh-download", "cached-download"])
+def test_profile_sra_reuses_archive_after_failed_conversion(tmp_path: Path, monkeypatch, cached_archive) -> None:
+    scratch_dir = tmp_path / "scratch"
+    archive = scratch_dir / "SRR1" / "sra" / "SRR1" / "SRR1.sra"
+    if cached_archive:
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        archive.write_text("archive")
+    calls = []
+    conversions = 0
+
+    def fake_run(cmd, **kwargs):
+        nonlocal conversions
+        calls.append(cmd)
+        if cmd[0] == "prefetch":
+            assert cmd[cmd.index("--max-size") + 1] == "u"
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            archive.write_text("archive")
+        elif cmd[0] == "fasterq-dump":
+            assert Path(cmd[1]) == archive
+            assert archive.read_text() == "archive"
+            conversions += 1
+            if conversions == 1:
+                raise subprocess.CalledProcessError(3, cmd, stderr="conversion interrupted")
+            reads_dir = Path(cmd[cmd.index("--outdir") + 1])
+            (reads_dir / "SRR1.fastq").write_text("@r1\nACGT\n+\n!!!!\n")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(workflows.subprocess, "run", fake_run)
+    kwargs = dict(
+        run_ids=["SRR1"], db_file=tmp_path / "metatrawl.duckdb",
+        cache_dir=tmp_path / "cache", scratch_dir=scratch_dir,
+        raise_on_error=False, logger=WorkflowLogger(),
+    )
+    failures = workflows.profile_sra_runs(**kwargs)
+    assert "conversion interrupted" in failures["SRR1"]
+    assert archive.is_file()
+    workflows.profile_sra_runs(**kwargs)
+    assert sum(cmd[0] == "prefetch" for cmd in calls) == (0 if cached_archive else 1)
+    assert conversions == 2
+    assert (scratch_dir / "SRR1" / "reads" / "SRR1.fastq").is_file()
+    assert not archive.parent.parent.exists()
 
 
 def test_profile_sra_reuses_downloaded_reads_on_retry(tmp_path: Path, monkeypatch) -> None:

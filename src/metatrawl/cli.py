@@ -495,7 +495,32 @@ def cache_serve(cache_dir: Path, host: str, port: int) -> None:
     ThreadingHTTPServer((host, port), Handler).serve_forever()
 
 
+def _null_model_cli_options(command):
+    """Share optional producer settings across both profiling entry points."""
+    for name, value_type, description in (
+        ("error-rate", float, "Sequencing error rate, strictly between 0 and 1."),
+        ("max-total-reads", int, "Maximum per-position coverage used to build the null model."),
+        ("p-threshold", float, "Poisson significance threshold, strictly between 0 and 1."),
+        ("type", click.Choice(["poisson"]), "Null-model distribution."),
+    ):
+        command = click.option(
+            f"--null-model-{name}", default=None, type=value_type,
+            help=f"{description} Overrides [profile.null_model]; otherwise use ZipStrain's default.",
+        )(command)
+    return command
+
+
+def _override_null_model(config, error_rate, max_total_reads, p_threshold, model_type):
+    values = {
+        "error_rate": error_rate, "max_total_reads": max_total_reads,
+        "p_threshold": p_threshold, "model_type": model_type,
+    }
+    overrides = {key: value for key, value in values.items() if value is not None}
+    return replace(config, profile=replace(config.profile, null_model=replace(config.profile.null_model, **overrides)))
+
+
 @cli.command("profile-sra")
+@_null_model_cli_options
 @click.option("--alignment-engine", default=None, help="Alignment engine: bowtie2 (default), bwa-mem3, or an installed adapter. Overrides [profile].alignment_engine.")
 @click.option("--backend", default=None, help="Profiling backend: python or an installed ZipStrain plugin such as rust_profiler. Overrides [profile].backend.")
 @click.option("--allow-incompatible-profiles", is_flag=True, help="Acknowledge unknown legacy scratch checkpoints; recorded in bundle provenance.")
@@ -527,10 +552,21 @@ def profile_sra(
     backend: str | None,
     alignment_engine: str | None,
     allow_incompatible_profiles: bool,
+    null_model_error_rate: float | None,
+    null_model_max_total_reads: int | None,
+    null_model_p_threshold: float | None,
+    null_model_type: str | None,
 ) -> None:
     """Run the local SRA profiling lifecycle with scratch cleanup."""
     run_ids = _read_remaining_csv(remaining_csv)
-    execution_config = load_workflow_config(workflow_config, threads=threads, sample_count=len(run_ids))
+    try:
+        execution_config = load_workflow_config(workflow_config, threads=threads, sample_count=len(run_ids))
+        execution_config = _override_null_model(
+            execution_config, null_model_error_rate, null_model_max_total_reads,
+            null_model_p_threshold, null_model_type,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        raise click.ClickException(str(exc)) from exc
     if backend is not None or alignment_engine is not None:
         try:
             profile = execution_config.profile
@@ -563,6 +599,7 @@ def profile_sra(
 
 
 @cli.command("sync-profile")
+@_null_model_cli_options
 @click.option("--alignment-engine", default=None, help="Alignment engine: bowtie2 (default), bwa-mem3, or an installed adapter. Overrides [profile].alignment_engine.")
 @click.option("--backend", default=None, help="Profiling backend: python or an installed ZipStrain plugin such as rust_profiler. Overrides [profile].backend.")
 @click.option("--allow-incompatible-profiles", is_flag=True, help="Acknowledge and record unknown or mismatched profiling provenance.")
@@ -596,12 +633,20 @@ def sync_profile(
     skip_dependency_check: bool,
     keep_profile_outputs: bool,
     allow_incompatible_profiles: bool,
+    null_model_error_rate: float | None,
+    null_model_max_total_reads: int | None,
+    null_model_p_threshold: float | None,
+    null_model_type: str | None,
 ) -> None:
     """Profile all remaining runs and import completed outputs into DuckDB."""
     try:
         with registry.connect(db_file) as conn:
             remaining_count = len(registry.remaining_runs(conn))
         execution_config = load_workflow_config(workflow_config, threads=threads, sample_count=remaining_count)
+        execution_config = _override_null_model(
+            execution_config, null_model_error_rate, null_model_max_total_reads,
+            null_model_p_threshold, null_model_type,
+        )
         if backend is not None:
             execution_config = replace(
                 execution_config,

@@ -15,6 +15,7 @@ import time
 import uuid
 
 from metatrawl.alignment import get_alignment_engine
+from metatrawl.config import NullModelConfig
 
 SCHEMA_VERSION = 1
 MANIFEST_VERSION = 1
@@ -110,6 +111,7 @@ def zipstrain_defaults() -> dict:
 
 def profiling_contract(config) -> dict:
     values = asdict(config)
+    values.pop("null_model", None)
     # Backend choice is operational; scientific filters and hashes stay stable.
     values.pop("backend", None)
     engine = get_alignment_engine(values.pop("alignment_engine", "bowtie2"))
@@ -117,7 +119,7 @@ def profiling_contract(config) -> dict:
     if values["min_read_ani"] is None:
         values["min_read_ani"] = defaults["min_read_ani"]
     return {"contract_version": 1, "profile": values,
-            "null_model": defaults["null_model"],
+            "null_model": null_model_settings(config),
             "alignment": engine.scientific_contract(),
             "single_end_read_inclusion": "all-mapped"}
 
@@ -142,6 +144,7 @@ def validate_contract(contract: dict) -> None:
     model = contract["null_model"]
     if not isinstance(model, dict) or not {"error_rate", "max_total_reads", "p_threshold", "model_type"} <= model.keys():
         raise ValueError("Incomplete null-model settings in profiling contract.")
+    NullModelConfig(**{key: model[key] for key in ("error_rate", "max_total_reads", "p_threshold", "model_type")})
     if not isinstance(contract["alignment"], dict):
         raise ValueError("Invalid alignment settings in profiling contract.")
     canonical(contract)
@@ -341,8 +344,17 @@ def write_manifest(*, profile_file, sample_id, contract, references, details, st
     temporary.replace(target)
 
 
-def null_model_options() -> list[str]:
-    values = zipstrain_defaults()["null_model"]
+def null_model_settings(config=None) -> dict:
+    """Resolve effective values without changing historical default contracts."""
+    values = dict(zipstrain_defaults()["null_model"])
+    if config is not None:
+        values.update({key: value for key, value in asdict(config.null_model).items() if value is not None})
+    NullModelConfig(**values)
+    return values
+
+
+def null_model_options(config=None) -> list[str]:
+    values = null_model_settings(config)
     return ["--error-rate", str(values["error_rate"]), "--max-total-reads", str(values["max_total_reads"]),
             "--p-threshold", str(values["p_threshold"]), "--model-type", values["model_type"]]
 

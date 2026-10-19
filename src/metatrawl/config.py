@@ -2,6 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 import json
+import math
 from pathlib import Path
 import tomllib
 from typing import Any
@@ -91,6 +92,28 @@ class GenomeViewConfig:
     strain_cluster_threshold: float | None = None
 
 @dataclass(frozen=True)
+class NullModelConfig:
+    """Optional overrides; unset fields inherit installed ZipStrain defaults."""
+
+    error_rate: float | None = None
+    max_total_reads: int | None = None
+    p_threshold: float | None = None
+    model_type: str | None = None
+
+    def __post_init__(self) -> None:
+        for key in ("error_rate", "p_threshold"):
+            value = getattr(self, key)
+            if value is not None and (
+                type(value) not in (int, float) or not math.isfinite(value) or not 0 < value < 1
+            ):
+                raise ValueError(f"profile.null_model.{key} must be finite and strictly between 0 and 1.")
+        if self.max_total_reads is not None and (type(self.max_total_reads) is not int or self.max_total_reads <= 0):
+            raise ValueError("profile.null_model.max_total_reads must be a positive integer.")
+        if self.model_type is not None and self.model_type != "poisson":
+            raise ValueError("profile.null_model.model_type must be 'poisson'.")
+
+
+@dataclass(frozen=True)
 class ProfileConfig:
     min_mapq: int = 0
     min_baseq: int = 13
@@ -99,6 +122,7 @@ class ProfileConfig:
     read_inclusion: str = "paired"
     backend: str = "python"
     alignment_engine: str = "bowtie2"
+    null_model: NullModelConfig = field(default_factory=NullModelConfig)
 
 
 def normalize_profile_backend(value: Any) -> str:
@@ -222,6 +246,12 @@ def _parse(raw: dict[str, Any], *, threads: int, sample_count: int) -> WorkflowC
     profile = raw.get("profile", {})
     if not isinstance(profile, dict):
         raise ValueError("profile must be a table/object.")
+    null_model = profile.get("null_model", {})
+    if not isinstance(null_model, dict):
+        raise ValueError("profile.null_model must be a table/object.")
+    unknown_model_keys = set(null_model) - {"error_rate", "max_total_reads", "p_threshold", "model_type"}
+    if unknown_model_keys:
+        raise ValueError(f"Unknown profile.null_model settings: {', '.join(sorted(unknown_model_keys))}")
     profile_import = raw.get("profile_import", {})
     if not isinstance(profile_import, dict):
         raise ValueError("profile_import must be a table/object.")
@@ -239,6 +269,7 @@ def _parse(raw: dict[str, Any], *, threads: int, sample_count: int) -> WorkflowC
         read_inclusion=read_inclusion,
         backend=normalize_profile_backend(profile.get("backend", ProfileConfig.backend)),
         alignment_engine=get_alignment_engine(profile.get("alignment_engine", ProfileConfig.alignment_engine)).name,
+        null_model=NullModelConfig(**null_model),
     ), profile_import=ProfileImportConfig(
         queue_max_samples=_positive(
             profile_import.get("queue_max_samples", ProfileImportConfig.queue_max_samples),

@@ -4,6 +4,8 @@ from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+import itertools
+import gzip
 import random
 import shlex
 import shutil
@@ -46,7 +48,7 @@ def test_engine_commands_and_threads(name, paired):
     assert argv[:4] == ["bash", "-o", "pipefail", "-c"]
     assert shlex.join(expected) in argv[4]
     assert "samtools view -bS -F 4 -" in argv[4]
-    assert "samtools sort -@ 9 -o sample.bam.tmp -" in argv[4]
+    assert 'samtools sort -@ 9 -o sample.bam.tmp -T "$alignment_tmp/sort" -' in argv[4]
 
 
 @pytest.mark.parametrize("name", ["bowtie2", "bwa-mem3"])
@@ -57,7 +59,7 @@ def test_alignment_quotes_paths(name):
     bam = Path("odd path's/result.bam.tmp")
     script = shlex.split(engine.bam_command(ref, reads, 2, bam))[4]
     assert shlex.join(engine.alignment_command(ref, reads, 2)) in script
-    assert f"-o {shlex.quote(str(bam))} -" in script
+    assert f"-o {shlex.quote(str(bam))} -T " in script
 
 
 @pytest.mark.parametrize("large", [False, True])
@@ -276,7 +278,8 @@ def test_fixed_reference_indexes_cached_separately_by_engine(tmp_path):
 
 @pytest.mark.parametrize("name", ["bowtie2", "bwa-mem3"])
 @pytest.mark.parametrize("execution", ["local", "slurm"])
-def test_worker_engine_selection_cleanup_and_profile_handoff(tmp_path, monkeypatch, name, execution):
+@pytest.mark.parametrize("layout", ["single", "paired", "mixed"])
+def test_worker_engine_selection_cleanup_and_profile_handoff(tmp_path, monkeypatch, name, execution, layout):
     sample = tmp_path / "scratch" / "S1"
     work = sample / "zipstrain_profile"
     ref_dir = sample / "reference"
@@ -289,9 +292,15 @@ def test_worker_engine_selection_cleanup_and_profile_handoff(tmp_path, monkeypat
     for filename in ("genomes_bed_file.bed", "gene_range_table.tsv", "null_model.parquet", "reference.fasta"):
         (work / filename).write_text("fixture")
     (work / "profiling_contract.json").write_text("{}")
-    (sample / "S1_1.fastq.gz").write_text("fixture")
-    (sample / "S1_2.fastq.gz").write_text("fixture")
-    profile = replace(ProfileConfig(), alignment_engine=name, backend="rust_profiler", min_freq=0.02)
+    if layout != "single":
+        (sample / "S1_1.fastq.gz").write_text("fixture")
+        (sample / "S1_2.fastq.gz").write_text("fixture")
+    if layout != "paired":
+        (sample / "S1.fastq.gz").write_text("fixture")
+    if layout == "mixed":
+        (sample / "read_layout.txt").write_text("single\n")
+    profile = replace(ProfileConfig(), alignment_engine=name, backend="rust_profiler", min_freq=0.02,
+                      read_inclusion="proper-pairs")
     (sample / "profiling_settings.json").write_text(provenance.canonical(provenance.profiling_contract(profile)))
     monkeypatch.setattr(workflows, "_ensure_reference_fai", lambda **kwargs: None)
     monkeypatch.setattr(workflows, "_validate_bam", lambda *args, **kwargs: None)
@@ -330,9 +339,13 @@ def test_worker_engine_selection_cleanup_and_profile_handoff(tmp_path, monkeypat
     profile_command = shlex.split(calls[-1]) if isinstance(calls[-1], str) else calls[-1]
     assert profile_command[profile_command.index("--backend") + 1] == "rust_profiler"
     assert profile_command[profile_command.index("--max-concurrency") + 1] == "6"
+    assert profile_command[profile_command.index("--read-inclusion") + 1] == (
+        "all-mapped" if layout == "single" else "proper-pairs"
+    )
     assert "--alignment-engine" not in profile_command
     manifest = json.loads(provenance.manifest_path(outputs / "S1.profile.parquet").read_text())
     assert manifest["details"]["alignment_engine"] == name
+    assert manifest["details"]["read_layout"] == ("single" if layout == "single" else "paired")
     assert manifest["contract"]["alignment"]["aligner"] == name
     assert (outputs / ".S1.bundle.ready").exists()
     assert not (sample / "S1.bam").exists()
@@ -359,8 +372,8 @@ def test_adapter_entry_point_protocol(monkeypatch):
 
 
 @pytest.mark.parametrize("name", ["bowtie2", "bwa-mem3"])
-@pytest.mark.parametrize("paired", [False, True])
-def test_native_alignment_to_sorted_bam_when_installed(tmp_path, name, paired):
+@pytest.mark.parametrize("layout", ["single", "paired", "mixed", "mixed-gz"])
+def test_native_alignment_to_sorted_bam_when_installed(tmp_path, name, layout):
     engine = alignment.get_alignment_engine(name)
     required = {engine.index_command(Path("ref"), 1)[0], name, "samtools"}
     if any(shutil.which(command) is None for command in required):
@@ -368,15 +381,33 @@ def test_native_alignment_to_sorted_bam_when_installed(tmp_path, name, paired):
     sequence = "".join(random.Random(7).choices("ACGT", k=3000))
     ref = tmp_path / "reference.fna"
     ref.write_text(f">chr\n{sequence}\n")
-    reads = [tmp_path / "reads 1.fq"]
+    paired = layout != "single"
+    suffix = ".fq.gz" if layout == "mixed-gz" else ".fq"
+    reads = [tmp_path / ("sample data_1" + suffix if paired else "sample data" + suffix)]
     if paired:
-        reads.append(tmp_path / "reads 2.fq")
+        reads.append(tmp_path / ("sample data_2" + suffix))
     for index, path in enumerate(reads):
         records = []
         for number, start in enumerate((400, 100, 700)):
             read = sequence[start:start + 100] if index == 0 else sequence[start + 150:start + 250].translate(str.maketrans("ACGT", "TGCA"))[::-1]
             records.append(f"@read{number}\n{read}\n+\n{'I' * len(read)}\n")
-        path.write_text("".join(records))
+        if layout == "mixed-gz":
+            with gzip.open(path, "wt") as handle:
+                handle.write("".join(records))
+        else:
+            path.write_text("".join(records))
+    if layout.startswith("mixed"):
+        orphan_file = tmp_path / ("sample data" + suffix)
+        orphan_records = "".join(
+            f"@orphan{index}\n{sequence[start:start + 100]}\n+\n{'I' * 100}\n"
+            for index, start in enumerate((1200, 1500))
+        )
+        if layout == "mixed-gz":
+            with gzip.open(orphan_file, "wt") as handle:
+                handle.write(orphan_records)
+        else:
+            orphan_file.write_text(orphan_records)
+        reads.insert(0, orphan_file)
     config = WorkflowConfig.legacy(threads=2, sample_count=1)
     runtime = WorkflowRuntime(config, state_dir=tmp_path / "state", logger=WorkflowLogger())
     engine.prepare_index(runtime, ref, sample="native")
@@ -387,7 +418,87 @@ def test_native_alignment_to_sorted_bam_when_installed(tmp_path, name, paired):
     header = subprocess.check_output(["samtools", "view", "-H", str(bam)], text=True)
     assert "SO:coordinate" in header
     rows = subprocess.check_output(["samtools", "view", str(bam)], text=True).splitlines()
-    assert len(rows) == 3 * (2 if paired else 1)
+    assert len(rows) == 3 * (2 if paired else 1) + (2 if layout.startswith("mixed") else 0)
     positions = [int(row.split("\t")[3]) for row in rows]
     assert positions == sorted(positions)
     assert all(not int(row.split("\t")[1]) & 4 for row in rows)
+    if layout.startswith("mixed"):
+        paired_rows = [row for row in rows if int(row.split("\t")[1]) & 1]
+        orphan_rows = [row for row in rows if not int(row.split("\t")[1]) & 1]
+        assert len(paired_rows) == 6
+        assert {row.split("\t")[0] for row in orphan_rows} == {"orphan0", "orphan1"}
+        assert header.count("@SQ") == 1
+    assert not list(tmp_path.glob(".metatrawl-align.*"))
+
+
+@pytest.mark.parametrize("suffix", [".fastq", ".fq", ".fastq.gz", ".fq.gz"])
+def test_split3_input_order_and_layout(tmp_path, suffix):
+    pair = [tmp_path / ("SRR1_1" + suffix), tmp_path / ("SRR1_2" + suffix)]
+    orphan = tmp_path / ("SRR1" + suffix)
+    for order in itertools.permutations([*pair, orphan]):
+        assert alignment.split_alignment_reads(list(order)) == (pair, [orphan])
+        (tmp_path / "read_layout.txt").write_text("single\n")
+        assert workflows._write_read_layout(tmp_path, list(order)) == "paired"
+        assert (tmp_path / "read_layout.txt").read_text() == "paired\n"
+        for name in ("bowtie2", "bwa-mem3"):
+            engine = alignment.get_alignment_engine(name)
+            script = shlex.split(engine.bam_command(Path("ref"), list(order), 2, tmp_path / "out.bam"))[4]
+            assert shlex.join(engine.alignment_command(Path("ref"), pair, 2)) in script
+            assert shlex.join(engine.alignment_command(Path("ref"), [orphan], 2)) in script
+            assert script.count("samtools sort") == 1
+
+
+@pytest.mark.parametrize("names", [
+    [], ["a.fq", "b.fq", "c.fq"],
+    ["S1_1.fq", "S2_2.fq", "S1.fq"],
+    ["one/S1_1.fq", "two/S1_1.fq", "S1_2.fq"],
+    ["S1.fq", "S1_1.fq", "S1_2.fq", "extra.fq"],
+])
+def test_ambiguous_fastqs_are_rejected_without_dropping_reads(names):
+    with pytest.raises(ValueError, match="Ambiguous FASTQ inputs"):
+        alignment.split_alignment_reads([Path(name) for name in names])
+
+
+@pytest.mark.parametrize("name", ["bowtie2", "bwa-mem3"])
+@pytest.mark.parametrize("failure", ["paired", "orphan", "sort"])
+def test_mixed_pipeline_failure_propagates_and_cleans_only_own_temps(tmp_path, name, failure):
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    calls = tmp_path / "calls"
+    sort_prefixes = tmp_path / "sort-prefixes"
+    (tools / name).write_text(
+        '#!/bin/sh\n'
+        f'printf "%s\\n" "$*" >> {shlex.quote(str(calls))}\n'
+        'kind=paired\nfor arg; do case "$arg" in */sample.fastq) kind=orphan;; esac; done\n'
+        f'if [ "$kind" = {failure} ]; then exit 23; fi\n'
+        'printf "@HD\\tVN:1.6\\n"\n'
+    )
+    (tools / "samtools").write_text(
+        '#!/bin/sh\nif [ "$1" = view ]; then cat; exit 0; fi\n'
+        'while [ "$#" -gt 0 ]; do\n'
+        'case "$1" in -o) shift; output=$1;; -T) shift; prefix=$1;; esac\nshift\ndone\n'
+        f'printf "%s\\n" "$prefix" >> {shlex.quote(str(sort_prefixes))}\n'
+        'printf chunk > "${prefix}.0000.bam"\ncat >/dev/null\nprintf partial > "$output"\n'
+        + ('exit 31\n' if failure == "sort" else 'exit 0\n')
+    )
+    for path in tools.iterdir():
+        path.chmod(0o755)
+    reads = [tmp_path / name for name in ("sample.fastq", "sample_2.fastq", "sample_1.fastq")]
+    for path in reads:
+        path.write_text("keep reads")
+    legacy_temp = tmp_path / "out.bam.tmp.tmp.0000.bam"
+    legacy_temp.write_text("keep unrelated old chunk")
+    config = WorkflowConfig.legacy(threads=2, sample_count=1)
+    config = replace(config, stages={**config.stages, "alignment": replace(
+        config.stage("alignment"), environment={"PATH": f"{tools}:/usr/bin:/bin"},
+        retries=1, retry_delay_seconds=0)})
+    runtime = WorkflowRuntime(config, state_dir=tmp_path, logger=WorkflowLogger())
+    command = alignment.get_alignment_engine(name).bam_command(Path("ref"), reads, 2, tmp_path / "out.bam")
+    with pytest.raises(RuntimeError, match="command failed"):
+        runtime.run_shell("alignment", command, sample="S1")
+    assert len(calls.read_text().splitlines()) == (2 if failure == "paired" else 4)
+    prefixes = sort_prefixes.read_text().splitlines()
+    assert len(prefixes) == len(set(prefixes)) == 2
+    assert not list(tmp_path.glob(".metatrawl-align.*"))
+    assert legacy_temp.read_text() == "keep unrelated old chunk"
+    assert all(path.read_text() == "keep reads" for path in reads)

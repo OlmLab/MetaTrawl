@@ -167,6 +167,13 @@ min_freq = 0.0
 min_read_ani = 0.95
 read_inclusion = "paired"
 
+[profile.null_model]
+# Optional overrides; omitted fields use installed ZipStrain defaults.
+# error_rate = 0.001
+# max_total_reads = 50000
+# p_threshold = 0.000001
+# model_type = "poisson"
+
 [profile_import]
 # One larger-than-limit sample is always allowed through by itself.
 queue_max_samples = 8
@@ -233,6 +240,37 @@ scientific profiling contract. Existing compatible outputs are still reused;
 switching backends does not force already completed samples to be reprofiled.
 This option is independent of `[matrix_compare].backend` and does not change
 stage thread counts or local/Slurm execution policy.
+
+### Null-model settings
+
+Use `[profile.null_model]` in TOML, or the equivalent nested JSON object, to
+override ZipStrain's sequencing-error model without changing profiling code:
+
+```toml
+[profile.null_model]
+error_rate = 0.001
+max_total_reads = 50000
+p_threshold = 0.000001
+model_type = "poisson"
+```
+
+These example values match ZipStrain 1.2.2. Omit any field to inherit its value
+from the installed ZipStrain version. `error_rate` and `p_threshold` must be
+finite and strictly between 0 and 1; `max_total_reads` is a positive integer
+coverage ceiling, not a limit on total reads in a sample. Only `poisson` is
+currently supported.
+
+Both `sync-profile` and `profile-sra` accept the corresponding CLI options:
+`--null-model-error-rate`, `--null-model-max-total-reads`,
+`--null-model-p-threshold`, and `--null-model-type`. Each supplied option
+overrides only its corresponding TOML/JSON field. The same values reach
+per-sample preparation, fallback model generation, and fixed-reference assets.
+
+Effective values are part of the scientific contract and fixed-reference cache
+key. Leaving all overrides unset preserves existing default contracts/cache
+identities. Changing the model does not silently reuse or relabel old profiles,
+models, or BAM checkpoints; follow the database-provenance guards and use new
+scratch for changed scientific settings.
 
 ### Alignment engines
 

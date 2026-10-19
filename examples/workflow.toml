@@ -60,6 +60,13 @@ min_freq = 0.0
 min_read_ani = 0.95
 read_inclusion = "paired"
 
+[profile.null_model]
+# Omit fields to inherit the installed ZipStrain defaults.
+# error_rate = 0.001
+# max_total_reads = 50000
+# p_threshold = 0.000001
+# model_type = "poisson"
+
 [matrix_build]
 storage_mode = "bitmask"
 min_cov = 5

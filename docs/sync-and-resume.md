@@ -47,6 +47,42 @@ output before running, so an interrupted sample resumes mid-flight:
 | ZipStrain `profile-single` | a complete published output bundle already exists |
 
 With fixed-reference profiling, the Sylph and genome-cache rows do not apply.
+SRA downloads use `prefetch --max-size u`, so accessions larger than its default
+20 GB limit are allowed. MetaTrawl requires a non-empty downloaded archive before
+starting `fasterq-dump`; a missing or empty archive fails at the download step
+without submitting conversion retries. Rerunning `sync-profile` retries the
+download. A retained archive is reused if conversion failed. Ensure enough
+scratch space for the archive, FASTQs, and conversion temporary files.
+
+New SRA conversions write to an isolated `.fasterq/` directory under that
+sample's scratch, including their temporary files. A pending marker prevents
+partially written FASTQs from being reused after interruption. Only successful
+conversion publishes the reads and clears the marker; retries overwrite only
+the isolated conversion outputs. Existing unmarked read checkpoints remain
+usable; this does not retrospectively validate older FASTQs.
+
+Sylph diagnostic fields such as `Eff_lambda` can legitimately contain `HIGH`
+or `LOW`. Accession extraction and abundance import preserve those values as
+text, convert only required numeric fields, and remove exact repeated headers
+with a warning. Other malformed abundance values are errors, not silently
+discarded rows. Input tables are never rewritten by these readers.
+
+If ZipStrain exits without a complete, non-empty set of output files, MetaTrawl
+does not publish a ready bundle or mark the sample imported. When genome stats
+are missing, it reports whether the profile has zero rows or whether the
+read-location extraction needs investigation. The row count is read from the
+Parquet footer, not by loading the profile. The BAM and workspace are retained.
+MetaTrawl never invents genome stats or relaxes read filters to force success;
+empty-input/read-location failures in older ZipStrain require diagnosis there.
+
+When SRA conversion produces `sample_1.fastq`, `sample_2.fastq`, and
+`sample.fastq`, MetaTrawl aligns the first two as a pair and the third as
+unpaired reads, then streams all alignments through one coordinate sort. This
+works with Bowtie2 and bwa-mem3, including compressed FASTQs. The sample remains
+paired-end: the configured read-inclusion policy is respected, so `proper-pairs`
+still excludes unpaired alignments from profiling. Sorting uses a unique
+temporary directory for each attempt and cleans it on normal exit or failure.
+
 The prepared ZipStrain assets and Bowtie2 index are shared by every sample and
 are reused when their reference/gene/STB content hash is unchanged.
 

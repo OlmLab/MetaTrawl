@@ -15,6 +15,8 @@ def test_rust_profiler_is_a_regular_dependency():
     assert "1.2.2" in dependencies["zipstrain"].specifier
     assert "1.2.1" not in dependencies["zipstrain"].specifier
     assert "0.1.0" in dependencies["zipstrain-rust-profiler"].specifier
+    assert "1.34" in dependencies["polars"].specifier
+    assert "2.0.0" not in dependencies["polars"].specifier
     assert "bwa-mem3" not in dependencies
     assert "rust" not in project["optional-dependencies"]
 

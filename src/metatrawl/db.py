@@ -1841,11 +1841,15 @@ def _insert_registered_frame(
 
 
 def _insert_sylph_abundance(conn: duckdb.DuckDBPyConnection, *, sample_id: str, abundance_file: Path) -> None:
-    df = _read_table(abundance_file)
+    from metatrawl.sylph import numeric_column, read_sylph_table
+
+    df = read_sylph_table(abundance_file)
     semantic_genome_col = _first_existing(df, ["genome", "genome_name"])
     genome_col = semantic_genome_col or _first_existing(df, ["reference", "Genome_file", "name"])
     accession_col = _first_existing(df, ["accession", "genome", "genome_name", "reference", "Genome_file", "name"])
     abundance_col = _first_existing(df, ["abundance", "relative_abundance", "Taxonomic_abundance", "ANI"])
+    if abundance_col:
+        df = df.with_columns(numeric_column(df, abundance_col))
     if genome_col is None and accession_col is None:
         raise ValueError("sylph_abundance_file missing a genome/accession column")
     source_col = accession_col or genome_col
@@ -1868,7 +1872,7 @@ def _insert_sylph_abundance(conn: duckdb.DuckDBPyConnection, *, sample_id: str, 
     )
     if df["accession"].null_count():
         bad_values = (
-            _read_table(abundance_file)
+            read_sylph_table(abundance_file)
             .filter(canonical_accession.is_null())
             .get_column(source_col)
             .cast(pl.Utf8)
