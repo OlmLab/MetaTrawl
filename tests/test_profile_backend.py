@@ -26,7 +26,7 @@ def test_backend_config_accepts_zipstrain_plugin_names(tmp_path, suffix, backend
     )
     config = load_workflow_config(config_file, threads=4, sample_count=2)
     assert config.profile.backend == backend
-    assert config.profile.min_freq == 0.0
+    assert config.profile.min_freq == 0.05
     assert config.matrix_compare.backend is None
 
 

@@ -112,7 +112,7 @@ def test_json_config_is_supported(tmp_path: Path) -> None:
     assert config.sample_workers == 2
     assert config.stage("alignment").workers == 1
     assert config.stage("alignment").threads == 8
-    assert config.profile.min_freq == 0.0
+    assert config.profile.min_freq == 0.05
     assert config.profile.min_read_ani == 0.95
     assert config.profile.read_inclusion == "paired"
     assert config.matrix_compare.min_cov is None
