@@ -163,7 +163,7 @@ backend = "python"
 alignment_engine = "bowtie2"
 min_mapq = 0
 min_baseq = 13
-min_freq = 0.0
+min_freq = 0.05
 min_read_ani = 0.95
 read_inclusion = "paired"
 

@@ -113,11 +113,18 @@ class NullModelConfig:
             raise ValueError("profile.null_model.model_type must be 'poisson'.")
 
 
+#: Default minimum within-position allele frequency passed to ZipStrain
+#: profiling (``[profile] min_freq``). Alleles below this fraction of the
+#: position depth are dropped after null-model filtering. The previous default,
+#: 0.0, kept every allele that passed the null model.
+PROFILE_MIN_FREQ_DEFAULT = 0.05
+
+
 @dataclass(frozen=True)
 class ProfileConfig:
     min_mapq: int = 0
     min_baseq: int = 13
-    min_freq: float = 0.0
+    min_freq: float = PROFILE_MIN_FREQ_DEFAULT
     min_read_ani: float | None = 0.95
     read_inclusion: str = "paired"
     backend: str = "python"
