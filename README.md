@@ -90,10 +90,10 @@ Published images contain the complete toolchain:
 
 ```bash
 # Portable CPU image
-docker pull parsaghadermazi/metatrawl:1.1.2
+docker pull parsaghadermazi/metatrawl:1.1.5
 
 # NVIDIA CUDA 12.8 image
-docker pull parsaghadermazi/metatrawl:1.1.2-cuda
+docker pull parsaghadermazi/metatrawl:1.1.5-cuda
 ```
 
 See [Container usage](docs/containers.md) for project mounts, CUDA checks,
@@ -185,7 +185,7 @@ metatrawl matrix sync-compare \
   --db metatrawl.duckdb \
   --matrix-dir matrices \
   --compare-dir compares \
-  --calculate ani+gene \
+  --calculate genome_ani+gene_ani \
   --ani-method popani \
   --backend numpy \
   --workflow-config workflow.toml
@@ -193,6 +193,12 @@ metatrawl matrix sync-compare \
 
 For NVIDIA acceleration, use the CUDA container and set
 `--backend torch-cuda`.
+
+With MetaTrawl 1.4.0 (ZipStrain 1.3.0+), use
+`--compare-kernel block --calculate genome_ani` for genome-level popANI or
+conANI only. Gene ANI and maximum identical stretch (IBS) require the default
+`anchor` kernel. The old names `gemm` and `pairwise` remain valid aliases.
+The kernel can also be set in `[matrix_compare].compare_kernel` in TOML/JSON.
 
 ### 5. Generate and serve genome views
 

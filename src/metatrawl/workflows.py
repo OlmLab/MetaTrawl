@@ -29,7 +29,14 @@ from metatrawl import db
 from metatrawl import healthcheck
 from metatrawl import matrix_hdf5
 from metatrawl import provenance
-from metatrawl.config import MatrixCompareConfig, ProfileConfig, ProfileImportConfig, WorkflowConfig
+from metatrawl.config import (
+    MATRIX_COMPARE_KERNEL_DEFAULT,
+    MatrixCompareConfig,
+    ProfileConfig,
+    ProfileImportConfig,
+    WorkflowConfig,
+    normalize_matrix_compare_kernel,
+)
 from metatrawl.execution import WorkflowRuntime
 from metatrawl.logging import ThrottledMatrixLogger, WorkflowLogger
 from metatrawl.sylph import numeric_column, read_sylph_table
@@ -667,10 +674,14 @@ def sync_compare_matrices(
     ani_method: str = "popani",
     memory_limit_gb: float = 16.0,
     compare_config: MatrixCompareConfig | None = None,
+    compare_kernel: str | None = None,
     logger: WorkflowLogger | None = None,
 ) -> MatrixSyncCompareSummary:
     """Run resumable compare for every HDF5 matrix file in a directory."""
     logger = logger or WorkflowLogger()
+    selected_kernel = resolve_compare_kernel(
+        compare_kernel, compare_config=compare_config, calculate=calculate, ani_method=ani_method,
+    )
     matrix_files = discover_matrix_files(matrix_dir)
     compare_dir = Path(compare_dir)
     compare_dir.mkdir(parents=True, exist_ok=True)
@@ -692,6 +703,7 @@ def sync_compare_matrices(
                 ani_method=ani_method,
                 memory_limit_gb=memory_limit_gb,
                 compare_config=compare_config,
+                compare_kernel=selected_kernel,
                 logger=logger,
             )
             compared += 1
@@ -789,6 +801,44 @@ def resolve_matrix_file(conn, *, matrix_id: str | None = None, matrix_file: Path
     return store.matrix_file, store.matrix_id
 
 
+def resolve_compare_kernel(
+    compare_kernel: str | None,
+    *,
+    compare_config: MatrixCompareConfig | None,
+    calculate: str,
+    ani_method: str,
+) -> str:
+    """Resolve the kernel and reject unsupported block combinations before dispatch."""
+    if compare_kernel is None and compare_config is not None:
+        compare_kernel = compare_config.compare_kernel
+    kernel = normalize_matrix_compare_kernel(
+        MATRIX_COMPARE_KERNEL_DEFAULT if compare_kernel is None else compare_kernel
+    )
+    if kernel == "block":
+        from zipstrain.matrix_pairs import parse_matrix_ani_method, parse_matrix_calculations
+
+        if parse_matrix_calculations(calculate) != ("ani",):
+            raise ValueError(
+                "The block kernel requires --calculate genome_ani; gene ANI and "
+                "maximum identical stretch require --compare-kernel anchor."
+            )
+        if parse_matrix_ani_method(ani_method)[0] not in ("popani", "conani"):
+            raise ValueError(
+                "The block kernel supports only popani or conani; use "
+                "--compare-kernel anchor for other ANI methods."
+            )
+    return kernel
+
+
+def _matrix_compare_kwargs(*, compare_kernel, compare_config, calculate, ani_method):
+    values = compare_config.kwargs() if compare_config is not None else {}
+    kernel = resolve_compare_kernel(
+        compare_kernel, compare_config=compare_config, calculate=calculate, ani_method=ani_method,
+    )
+    values["compare_kernel"] = kernel
+    return kernel, values
+
+
 def compare_matrix_from_registry(
     conn,
     *,
@@ -800,6 +850,8 @@ def compare_matrix_from_registry(
     min_cov: int | None = None,
     ani_method: str = "popani",
     memory_limit_gb: float = 16.0,
+    compare_kernel: str | None = None,
+    compare_config: MatrixCompareConfig | None = None,
     logger: WorkflowLogger | None = None,
 ) -> str:
     """Run ZipStrain matrix compare for a registered matrix store."""
@@ -812,7 +864,11 @@ def compare_matrix_from_registry(
 
     from zipstrain import matrix_pairs as mp
 
-    logger.emit(step="matrix-compare", status="start", matrix_id=matrix_id, calculate=calculate)
+    selected_kernel, compare_kwargs = _matrix_compare_kwargs(
+        compare_kernel=compare_kernel, compare_config=compare_config,
+        calculate=calculate, ani_method=ani_method,
+    )
+    logger.emit(step="matrix-compare", status="start", matrix_id=matrix_id, calculate=calculate, compare_kernel=selected_kernel)
     mp.matrix_compare(
         matrix_db_file=store.matrix_file,
         output_file=output_file,
@@ -822,6 +878,7 @@ def compare_matrix_from_registry(
         memory_limit_gb=memory_limit_gb,
         backend=backend,
         calculate=calculate,
+        **compare_kwargs,
     )
     compare_id = output_file.stem
     db.register_matrix_compare(
@@ -848,6 +905,7 @@ def compare_matrix_file(
     memory_limit_gb: float = 16.0,
     matrix_id: str | None = None,
     compare_config: MatrixCompareConfig | None = None,
+    compare_kernel: str | None = None,
     register: bool = True,
     logger: WorkflowLogger | None = None,
 ) -> str:
@@ -859,8 +917,11 @@ def compare_matrix_file(
 
     from zipstrain import matrix_pairs as mp
 
-    logger.emit(step="matrix-compare", status="start", matrix=context.matrix_file, calculate=calculate)
-    compare_kwargs = compare_config.kwargs() if compare_config is not None else {}
+    selected_kernel, compare_kwargs = _matrix_compare_kwargs(
+        compare_kernel=compare_kernel, compare_config=compare_config,
+        calculate=calculate, ani_method=ani_method,
+    )
+    logger.emit(step="matrix-compare", status="start", matrix=context.matrix_file, calculate=calculate, compare_kernel=selected_kernel)
     mp.matrix_compare(
         matrix_db_file=context.matrix_file,
         output_file=output_file,

@@ -76,6 +76,7 @@ duckdb_export_threads = 1
 
 [matrix_compare]
 calculate = "all"
+compare_kernel = "anchor" # block requires calculate = "genome_ani" and popani/conani
 ani_method = "popani"
 memory_limit_gb = 32
 anchor_queue_size = 1

@@ -39,16 +39,19 @@ RUN python -m pip install --upgrade pip setuptools wheel 'ruamel.yaml<0.19' \
 
 FROM toolchain AS runtime
 
+ARG ZIPSTRAIN_PACKAGE="zipstrain>=1.3.0,<2"
+
 WORKDIR /opt/metatrawl
 
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 
-RUN python -m pip install . 'polars>=1.34,<2' \
+RUN python -m pip install . 'polars>=1.34,<2' "${ZIPSTRAIN_PACKAGE}" \
     && python -m pip check \
     && metatrawl check \
     && bwa-mem3 version \
-    && python -c 'from zipstrain.profile_backends import load_backend; assert load_backend("rust_profiler").API_VERSION == 1'
+    && python -c 'from zipstrain.profile_backends import load_backend; assert load_backend("rust_profiler").API_VERSION == 1' \
+    && python -c 'from zipstrain import matrix_pairs as mp; assert {"anchor", "block"} <= set(mp.MATRIX_COMPARE_KERNELS)'
 
 WORKDIR /work
 

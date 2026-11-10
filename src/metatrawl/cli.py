@@ -23,7 +23,7 @@ from metatrawl import migration
 from metatrawl import provenance
 from metatrawl import viewer
 from metatrawl import workflows
-from metatrawl.config import WorkflowConfig, load_workflow_config, normalize_profile_backend
+from metatrawl.config import MATRIX_COMPARE_KERNEL_CHOICES, WorkflowConfig, load_workflow_config, normalize_profile_backend
 from metatrawl.alignment import get_alignment_engine
 from metatrawl.execution import WorkflowRuntime
 from metatrawl.logging import WorkflowLogger
@@ -1033,30 +1033,49 @@ def _resolve_matrix_compare_options(
     min_cov: int | None,
     ani_method: str | None,
     memory_limit_gb: float | None,
-) -> tuple[str, str, str, int | None, str, float]:
+    compare_kernel: str | None = None,
+) -> tuple[str, str, str, int | None, str, float, str]:
     """Resolve matrix compare options with CLI values overriding TOML values."""
     matrix_config = execution_config.matrix_compare
+    resolved_calculate = calculate or matrix_config.calculate or "all"
+    resolved_ani_method = ani_method or matrix_config.ani_method or "popani"
+    resolved_kernel = workflows.resolve_compare_kernel(
+        compare_kernel, compare_config=matrix_config, calculate=resolved_calculate,
+        ani_method=resolved_ani_method,
+    )
     resolved_memory_limit_gb = (
         memory_limit_gb
         if memory_limit_gb is not None
         else matrix_config.memory_limit_gb or 16.0
     )
     return (
-        calculate or matrix_config.calculate or "all",
+        resolved_calculate,
         genome or matrix_config.genome or "all",
         backend or matrix_config.backend or "numpy",
         min_cov if min_cov is not None else matrix_config.min_cov,
-        ani_method or matrix_config.ani_method or "popani",
+        resolved_ani_method,
         resolved_memory_limit_gb,
+        resolved_kernel,
     )
 
 
+_MATRIX_KERNEL_HELP = (
+    "Comparison algorithm; overrides workflow configuration. 'anchor' (default) supports all metrics. "
+    "'block' requires --calculate genome_ani and popani/conani. Legacy aliases: pairwise, gemm."
+)
+_MATRIX_CALCULATE_HELP = (
+    "Metrics: genome_ani, gene_ani, max_identical_stretch, or all. "
+    "Combine with '+'. Overrides workflow configuration."
+)
+
+
 @matrix_group.command("compare")
+@click.option("--compare-kernel", type=click.Choice(MATRIX_COMPARE_KERNEL_CHOICES), default=None, metavar="[anchor|block]", help=_MATRIX_KERNEL_HELP)
 @click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
 @click.option("--matrix-id", help="Registered matrix ID.")
 @click.option("--matrix-file", type=click.Path(path_type=Path), help="Registered matrix HDF5 file.")
 @click.option("--output-file", required=True, type=click.Path(path_type=Path), help="Output ZipStrain compare DuckDB.")
-@click.option("--calculate", default=None, help="Metrics to calculate; overrides workflow configuration.")
+@click.option("--calculate", default=None, help=_MATRIX_CALCULATE_HELP)
 @click.option("--genome", default=None, help="Optional compare genome scope; overrides workflow configuration.")
 @click.option("--backend", default=None, help="ZipStrain matrix backend; overrides workflow configuration.")
 @click.option("--min-cov", type=click.IntRange(min=1), default=None, help="Minimum comparison coverage; overrides workflow configuration.")
@@ -1064,7 +1083,7 @@ def _resolve_matrix_compare_options(
 @click.option("--memory-limit-gb", type=float, default=None, help="Comparison memory limit; overrides workflow configuration.")
 @click.option("--workflow-config", type=click.Path(path_type=Path), help="TOML/JSON ZipStrain queue/executor controls.")
 @click.option("--no-register", is_flag=True, hidden=True, help="Do not write compare metadata back to the MetaTrawl registry.")
-def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | None, output_file: Path, calculate: str | None, genome: str | None, backend: str | None, min_cov: int | None, ani_method: str | None, memory_limit_gb: float | None, workflow_config: Path | None, no_register: bool) -> None:
+def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | None, output_file: Path, calculate: str | None, genome: str | None, backend: str | None, min_cov: int | None, ani_method: str | None, memory_limit_gb: float | None, workflow_config: Path | None, no_register: bool, compare_kernel: str | None) -> None:
     """Compare a registered matrix store."""
     try:
         connect = registry.connect_read_only if no_register else registry.connect
@@ -1075,7 +1094,7 @@ def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | Non
                 matrix_file=matrix_file,
             )
             execution_config = load_workflow_config(workflow_config, threads=1, sample_count=1)
-            resolved_calculate, resolved_genome, resolved_backend, resolved_min_cov, resolved_ani_method, resolved_memory_limit_gb = (
+            resolved_calculate, resolved_genome, resolved_backend, resolved_min_cov, resolved_ani_method, resolved_memory_limit_gb, resolved_kernel = (
                 _resolve_matrix_compare_options(
                     execution_config,
                     calculate=calculate,
@@ -1084,6 +1103,7 @@ def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | Non
                     min_cov=min_cov,
                     ani_method=ani_method,
                     memory_limit_gb=memory_limit_gb,
+                    compare_kernel=compare_kernel,
                 )
             )
             compare_id = workflows.compare_matrix_file(
@@ -1098,6 +1118,7 @@ def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | Non
                 ani_method=resolved_ani_method,
                 memory_limit_gb=resolved_memory_limit_gb,
                 compare_config=execution_config.matrix_compare,
+                compare_kernel=resolved_kernel,
                 register=not no_register,
                 logger=WorkflowLogger(),
             )
@@ -1107,10 +1128,11 @@ def matrix_compare(db_file: Path, matrix_id: str | None, matrix_file: Path | Non
 
 
 @matrix_group.command("sync-compare")
+@click.option("--compare-kernel", type=click.Choice(MATRIX_COMPARE_KERNEL_CHOICES), default=None, metavar="[anchor|block]", help=_MATRIX_KERNEL_HELP)
 @click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
 @click.option("--matrix-dir", required=True, type=click.Path(path_type=Path), help="Directory containing per-genome HDF5 matrices.")
 @click.option("--compare-dir", required=True, type=click.Path(path_type=Path), help="Directory for per-genome compare DuckDB files.")
-@click.option("--calculate", default=None, help="Metrics to calculate; overrides workflow configuration.")
+@click.option("--calculate", default=None, help=_MATRIX_CALCULATE_HELP)
 @click.option("--genome", default=None, help="Optional compare genome scope; overrides workflow configuration.")
 @click.option("--backend", default=None, help="ZipStrain matrix backend; overrides workflow configuration.")
 @click.option("--min-cov", type=click.IntRange(min=1), default=None, help="Minimum comparison coverage; overrides workflow configuration.")
@@ -1128,11 +1150,12 @@ def matrix_sync_compare(
     ani_method: str | None,
     memory_limit_gb: float | None,
     workflow_config: Path | None,
+    compare_kernel: str | None,
 ) -> None:
     """Run resumable compare for every matrix file in a directory."""
     try:
         execution_config = load_workflow_config(workflow_config, threads=1, sample_count=1)
-        resolved_calculate, resolved_genome, resolved_backend, resolved_min_cov, resolved_ani_method, resolved_memory_limit_gb = (
+        resolved_calculate, resolved_genome, resolved_backend, resolved_min_cov, resolved_ani_method, resolved_memory_limit_gb, resolved_kernel = (
             _resolve_matrix_compare_options(
                 execution_config,
                 calculate=calculate,
@@ -1141,6 +1164,7 @@ def matrix_sync_compare(
                 min_cov=min_cov,
                 ani_method=ani_method,
                 memory_limit_gb=memory_limit_gb,
+                compare_kernel=compare_kernel,
             )
         )
         if workflow_config is not None and _should_dispatch_stage(execution_config, "matrix_compare"):
@@ -1153,6 +1177,7 @@ def matrix_sync_compare(
                 backend=resolved_backend,
                 min_cov=resolved_min_cov,
                 ani_method=resolved_ani_method,
+                compare_kernel=resolved_kernel,
                 memory_limit_gb=resolved_memory_limit_gb,
                 workflow_config=workflow_config,
                 execution_config=execution_config,
@@ -1171,6 +1196,7 @@ def matrix_sync_compare(
                     ani_method=resolved_ani_method,
                     memory_limit_gb=resolved_memory_limit_gb,
                     compare_config=execution_config.matrix_compare,
+                    compare_kernel=resolved_kernel,
                     logger=WorkflowLogger(),
                 )
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
@@ -1410,6 +1436,7 @@ def _dispatch_matrix_sync_compare_jobs(
     backend: str,
     min_cov: int | None,
     ani_method: str,
+    compare_kernel: str,
     memory_limit_gb: float,
     workflow_config: Path,
     execution_config: WorkflowConfig,
@@ -1449,6 +1476,8 @@ def _dispatch_matrix_sync_compare_jobs(
                 backend,
                 "--ani-method",
                 ani_method,
+                "--compare-kernel",
+                compare_kernel,
                 "--memory-limit-gb",
                 str(memory_limit_gb),
                 "--workflow-config",

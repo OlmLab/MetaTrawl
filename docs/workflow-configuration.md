@@ -54,7 +54,7 @@ choose count storage when `conani` or `cosani_<threshold>` is required. An
 `allele-mask` database rejects count storage and any `min_cov` different from its
 database contract before creating or resizing a matrix.
 
-Comparison settings under `[matrix_compare]` include `calculate`, `ani_method`,
+Comparison settings under `[matrix_compare]` include `calculate`, `ani_method`, `compare_kernel`,
 `genome`, `backend`, optional `min_cov`, `memory_limit_gb`, and queue/executor
 controls. When comparison `min_cov` is omitted, ZipStrain uses the build
 threshold stored in the HDF5 file. `matrix sync-build` can use
@@ -192,6 +192,7 @@ duckdb_export_threads = 1
 
 [matrix_compare]
 calculate = "all"
+compare_kernel = "anchor" # use "block" with calculate = "genome_ani" for genome ANI only
 ani_method = "popani" # conani and cosani_<threshold> require count matrices
 genome = "all"
 backend = "numpy"
@@ -227,9 +228,9 @@ ZipStrain 1.x defaults of `min_freq = 0`, `min_read_ani = 0.95`, and
 `read_inclusion = "paired"`; set `min_read_ani = 0` to disable read-ANI
 filtering. Single-end inputs use all mapped reads.
 
-MetaTrawl 1.1+ installs the Rust profiler plugin automatically and requires
-ZipStrain 1.2.2+. Ensure the same MetaTrawl installation is available in the
-environment used by the `profile` stage (including Slurm workers).
+MetaTrawl installs the Rust profiler plugin automatically. MetaTrawl 1.4.0
+requires ZipStrain 1.3.0 or later in the 1.x series. Use the same MetaTrawl
+installation for the `profile` stage, including Slurm workers.
 Set `[profile].backend = "rust_profiler"`, or pass
 `--backend rust_profiler` to `metatrawl sync-profile` or `metatrawl profile-sra`.
 The CLI option overrides the TOML/JSON setting; the default is `python`.
@@ -254,7 +255,7 @@ p_threshold = 0.000001
 model_type = "poisson"
 ```
 
-These example values match ZipStrain 1.2.2. Omit any field to inherit its value
+These example values match ZipStrain 1.3.0. Omit any field to inherit its value
 from the installed ZipStrain version. `error_rate` and `p_threshold` must be
 finite and strictly between 0 and 1; `max_total_reads` is a positive integer
 coverage ceiling, not a limit on total reads in a sample. Only `poisson` is
@@ -271,6 +272,29 @@ key. Leaving all overrides unset preserves existing default contracts/cache
 identities. Changing the model does not silently reuse or relabel old profiles,
 models, or BAM checkpoints; follow the database-provenance guards and use new
 scratch for changed scientific settings.
+
+### Matrix comparison kernels
+
+Both `metatrawl matrix compare` and `metatrawl matrix sync-compare` accept
+`--compare-kernel anchor|block`. The CLI value overrides
+`[matrix_compare].compare_kernel`, including in generated per-genome Slurm jobs.
+The default is `anchor`, which supports all metrics. The old names `pairwise`
+and `gemm` remain accepted aliases for `anchor` and `block`, respectively.
+
+```toml
+[matrix_compare]
+compare_kernel = "block"
+calculate = "genome_ani"
+ani_method = "popani"
+```
+
+The block kernel computes genome-level popANI or conANI; conANI still requires
+count matrices. Requests for `all`, `max_identical_stretch`, `gene_ani`, or
+cosANI with `block` are rejected before dispatch, never silently downgraded.
+ZipStrain's block kernel ignores anchor/target queue sizes, transfer batches,
+and loader/writer executors; backend and memory controls still apply.
+Legacy metric names (`ani`, `ibs`, `gene`) still work. The renamed options do
+not change the matrix format or the comparison database's resume contract.
 
 ### Alignment engines
 

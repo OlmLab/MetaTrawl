@@ -24,6 +24,17 @@ STAGE_NAMES = (
 )
 READ_INCLUSION_CHOICES = ("proper-pairs", "paired", "all-mapped")
 LINKAGE_METHOD_CHOICES = ("single", "complete", "average", "weighted")
+MATRIX_COMPARE_KERNEL_DEFAULT = "anchor"
+MATRIX_COMPARE_KERNEL_ALIASES = {"pairwise": "anchor", "gemm": "block"}
+MATRIX_COMPARE_KERNEL_CHOICES = ("anchor", "block", *MATRIX_COMPARE_KERNEL_ALIASES)
+
+
+def normalize_matrix_compare_kernel(value: str) -> str:
+    """Resolve legacy kernel names before invoking ZipStrain or Slurm."""
+    if value not in MATRIX_COMPARE_KERNEL_CHOICES:
+        raise ValueError("matrix_compare.compare_kernel must be 'anchor' or 'block' "
+                         "('pairwise' and 'gemm' remain accepted aliases).")
+    return MATRIX_COMPARE_KERNEL_ALIASES.get(value, value)
 
 @dataclass(frozen=True)
 class SlurmConfig:
@@ -68,9 +79,15 @@ class MatrixCompareConfig:
     result_transfer_batch_size: int | None = None
     loader_executor_kind: str | None = None
     writer_executor_kind: str | None = None
+    compare_kernel: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.compare_kernel is not None:
+            object.__setattr__(self, "compare_kernel", normalize_matrix_compare_kernel(self.compare_kernel))
 
     def kwargs(self) -> dict[str, Any]:
         values = {
+            "compare_kernel": self.compare_kernel,
             "anchor_queue_size": self.anchor_queue_size,
             "target_queue_size": self.target_queue_size,
             "result_transfer_batch_size": self.result_transfer_batch_size,
@@ -304,6 +321,7 @@ def _parse(raw: dict[str, Any], *, threads: int, sample_count: int) -> WorkflowC
         backend=_optional_string(compare.get("backend")),
         min_cov=_optional_positive(compare.get("min_cov"), "matrix_compare.min_cov"),
         ani_method=_optional_string(compare.get("ani_method")),
+        compare_kernel=_choice(compare.get("compare_kernel"), "matrix_compare.compare_kernel", MATRIX_COMPARE_KERNEL_CHOICES),
         memory_limit_gb=_optional_positive_float(compare.get("memory_limit_gb"), "matrix_compare.memory_limit_gb"),
         anchor_queue_size=_optional_positive(compare.get("anchor_queue_size"), "matrix_compare.anchor_queue_size"),
         target_queue_size=_optional_positive(compare.get("target_queue_size"), "matrix_compare.target_queue_size"),

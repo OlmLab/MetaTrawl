@@ -83,14 +83,13 @@ class DecodedSparseProfileBlock:
     masks: np.ndarray
 
 
-class AlleleMaskWriteCache:
-    """Reference state reused across every sample one importer writes.
+class ReferenceSegmentCache:
+    """Reuse decoded reference scaffolds with a bound on cached bases.
 
     Reference segments are immutable once ``ensure_reference_genome`` has written
     them, so decoding them per sample repeats the same zstd decompress, checksum,
-    and nibble unpack for every scaffold of every genome. One importer process
-    holds them instead, bounded by total decoded bases so a wide genome set
-    cannot grow the cache without limit.
+    and nibble unpack for every scaffold. The cache is bounded by total decoded
+    bases so a wide genome set cannot grow it without limit.
     """
 
     def __init__(self, *, max_cached_bases: int = REFERENCE_CACHE_MAX_BASES) -> None:
@@ -99,19 +98,10 @@ class AlleleMaskWriteCache:
         self.max_cached_bases = max_cached_bases
         self._segments: OrderedDict[tuple[str, str], ReferenceSegment] = OrderedDict()
         self._cached_bases = 0
-        self._ensured_genomes: set[str] = set()
-
-    def ensure_genome(self, conn, *, genome: str, cache_dir: Path | None) -> None:
-        """Write a genome's reference scaffolds once per importer, not per sample."""
-        if genome in self._ensured_genomes:
-            return
-        ensure_reference_genome(conn, genome=genome, cache_dir=cache_dir)
-        self._ensured_genomes.add(genome)
 
     def clear(self) -> None:
-        """Discard IDs and references that may have been rolled back."""
+        """Discard cached references."""
         self._segments.clear()
-        self._ensured_genomes.clear()
         self._cached_bases = 0
 
     def segment(self, conn, *, genome: str, chrom: str) -> ReferenceSegment:
@@ -128,6 +118,26 @@ class AlleleMaskWriteCache:
             _evicted_key, evicted = self._segments.popitem(last=False)
             self._cached_bases -= evicted.span
         return segment
+
+
+class AlleleMaskWriteCache(ReferenceSegmentCache):
+    """Also track which reference genomes this importer has already prepared."""
+
+    def __init__(self, *, max_cached_bases: int = REFERENCE_CACHE_MAX_BASES) -> None:
+        super().__init__(max_cached_bases=max_cached_bases)
+        self._ensured_genomes: set[str] = set()
+
+    def ensure_genome(self, conn, *, genome: str, cache_dir: Path | None) -> None:
+        """Write a genome's reference scaffolds once per importer, not per sample."""
+        if genome in self._ensured_genomes:
+            return
+        ensure_reference_genome(conn, genome=genome, cache_dir=cache_dir)
+        self._ensured_genomes.add(genome)
+
+    def clear(self) -> None:
+        """Discard IDs and references that may have been rolled back."""
+        super().clear()
+        self._ensured_genomes.clear()
 
 
 def store_profile_parquet(
@@ -666,15 +676,10 @@ def _decode_sparse_profile_row(
     payload_hash: str,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Decode one compressed row directly into covered coordinates and values."""
-    span = int(reference_segment.span)
-    presence_packed = _decompress(presence_blob, expected_size=(span + 7) // 8)
-    deviation_packed = _decompress(deviation_blob, expected_size=(span + 1) // 2)
-    if sha256(presence_packed + deviation_packed).hexdigest() != str(payload_hash):
-        raise ValueError(
-            f"Allele-mask payload checksum mismatch for "
-            f"{sample_id}/{genome}/{reference_segment.chrom}."
-        )
-    presence = unpack_presence(presence_packed, span)
+    label = f"{sample_id}/{genome}/{reference_segment.chrom}"
+    presence, deviation_packed = _unpack_profile_payload(
+        reference_segment.span, presence_blob, deviation_blob, payload_hash, label
+    )
     positions = np.flatnonzero(presence).astype(np.int64, copy=False)
     if positions.size != int(covered_positions):
         raise ValueError(
@@ -689,6 +694,43 @@ def _decode_sparse_profile_row(
             f"{sample_id}/{genome}/{reference_segment.chrom}."
         )
     return positions, values.astype(np.uint8, copy=False)
+
+
+def decode_profile_snps(
+    reference: ReferenceSegment,
+    presence_blob: bytes,
+    deviation_blob: bytes,
+    covered_positions: int,
+    payload_hash: str,
+    *,
+    sample_id: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return one-based variant positions, reference masks, and observed masks."""
+    label = f"{sample_id}/{reference.genome}/{reference.chrom}"
+    presence, packed = _unpack_profile_payload(
+        reference.span, presence_blob, deviation_blob, payload_hash, label
+    )
+    if np.count_nonzero(presence) != covered_positions:
+        raise ValueError(f"Allele-mask covered-position count mismatch for {label}.")
+    # A nonzero XOR is the only possible difference from a known reference.
+    # Do not expand covered reference-matching sites into coordinate arrays.
+    deviation = unpack_nibbles(packed, reference.span)
+    offsets = np.flatnonzero(presence & (deviation != 0) & (reference.masks != 0))
+    ref = reference.masks[offsets]
+    observed = ref ^ deviation[offsets]
+    if np.any(observed == 0):
+        raise ValueError(f"Allele-mask payload decoded an empty covered allele set for {label}.")
+    return offsets + reference.start_pos, ref, observed
+
+
+def _unpack_profile_payload(
+    span: int, presence_blob: bytes, deviation_blob: bytes, payload_hash: str, label: str
+) -> tuple[np.ndarray, bytes]:
+    presence = _decompress(presence_blob, expected_size=(span + 7) // 8)
+    deviation = _decompress(deviation_blob, expected_size=(span + 1) // 2)
+    if sha256(presence + deviation).hexdigest() != str(payload_hash):
+        raise ValueError(f"Allele-mask payload checksum mismatch for {label}.")
+    return unpack_presence(presence, span), deviation
 
 
 def _load_reference_segments(conn, *, genome: str) -> dict[int, ReferenceSegment]:

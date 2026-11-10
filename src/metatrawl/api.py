@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Integral
 from pathlib import Path
 from typing import Any
 
@@ -11,10 +12,15 @@ import polars as pl
 
 from metatrawl import db as registry
 from metatrawl import provenance
+from metatrawl._snps import AlleleMaskSnpQuery, full_profile_sql
 
 
 class ProfileCountsUnavailableError(RuntimeError):
     """Raised when a query needs counts discarded by allele-mask storage."""
+
+
+class ProfileReferenceUnavailableError(RuntimeError):
+    """Raised when a legacy profile table has no reference-base column."""
 
 
 class MetaTrawlDatabase:
@@ -37,6 +43,21 @@ class MetaTrawlDatabase:
     def sample(self, sample_id: str) -> SampleView:
         """Return a view of all stored data for one sample."""
         return SampleView(self.path, _required_text(sample_id, "sample_id"))
+
+    def snps(
+        self,
+        *,
+        sample_id: str | None = None,
+        genome: str | None = None,
+        chrom: str | None = None,
+        min_cov: int | None = None,
+    ) -> Query | AlleleMaskSnpQuery:
+        """Query sample-level SNPs relative to the reference for a sample or genome.
+
+        Full profiles default to 5x adjusted coverage. Allele-mask profiles
+        use their fixed import threshold and do not provide counts or frequencies.
+        """
+        return _snp_query(self.path, sample_id=sample_id, genome=genome, chrom=chrom, min_cov=min_cov)
 
     def genomes(self, pattern: str | None = None) -> Query:
         """Return profiled genomes, optionally filtered by a regular expression.
@@ -135,6 +156,16 @@ class GenomeView:
     db_path: Path
     genome: str
 
+    def snps(
+        self,
+        sample_id: str | None = None,
+        *,
+        chrom: str | None = None,
+        min_cov: int | None = None,
+    ) -> Query | AlleleMaskSnpQuery:
+        """Query reference SNPs for this genome, optionally in one sample."""
+        return _snp_query(self.db_path, sample_id=sample_id, genome=self.genome, chrom=chrom, min_cov=min_cov)
+
     def genome_stats(self) -> Query:
         """Return genome statistics across samples."""
         return Query(
@@ -199,6 +230,16 @@ class SampleView:
 
     db_path: Path
     sample_id: str
+
+    def snps(
+        self,
+        genome: str | None = None,
+        *,
+        chrom: str | None = None,
+        min_cov: int | None = None,
+    ) -> Query | AlleleMaskSnpQuery:
+        """Query reference SNPs for this sample, optionally in one genome."""
+        return _snp_query(self.db_path, sample_id=self.sample_id, genome=genome, chrom=chrom, min_cov=min_cov)
 
     def genome_stats(self, genome: str | None = None) -> Query:
         """Return genome statistics stored for this sample."""
@@ -288,9 +329,61 @@ def _require_full_profile_storage(db_path: Path) -> None:
     if storage.mode == "allele-mask":
         raise ProfileCountsUnavailableError(
             "This database uses allele-mask profile storage and does not retain "
-            "A/C/G/T counts. Genome and gene statistics remain queryable; build "
+            "A/C/G/T counts. Use snps() for variants without counts. Build "
             "a bitmask matrix for popANI comparisons."
         )
+
+
+def _snp_query(
+    db_path: Path,
+    *,
+    sample_id: str | None,
+    genome: str | None,
+    chrom: str | None,
+    min_cov: int | None,
+) -> Query | AlleleMaskSnpQuery:
+    if sample_id is None and genome is None:
+        raise ValueError("snps() requires a sample_id or genome to scope the query")
+    if min_cov is not None and (
+        isinstance(min_cov, bool) or not isinstance(min_cov, Integral) or min_cov < 1
+    ):
+        raise ValueError("min_cov must be a positive integer")
+    scope = {
+        key: _required_text(value, key)
+        for key, value in (("sample_id", sample_id), ("genome", genome), ("chrom", chrom))
+        if value is not None
+    }
+    with duckdb.connect(str(db_path), read_only=True) as conn:
+        provenance.check_schema(conn)
+        storage = registry.profile_storage_config(conn)
+        if storage.mode == "full":
+            columns = conn.execute("DESCRIBE profile_positions").fetchall()
+            if not any(column[0] == "ref_base_bitmask" for column in columns):
+                raise ProfileReferenceUnavailableError(
+                    "This profile table has no reference bases. SNP queries in full "
+                    "mode need profiles generated with a reference FASTA."
+                )
+
+    parameters = tuple(scope.values())
+    if storage.mode == "allele-mask":
+        if min_cov is not None and min_cov != storage.min_cov:
+            raise ValueError(
+                f"This allele-mask database uses fixed min_cov={storage.min_cov}; "
+                "read counts were discarded, so the coverage threshold cannot change."
+            )
+        where = " AND ".join(
+            f"{'b' if key == 'sample_id' else 's'}.{key} = ?" for key in scope
+        )
+        return AlleleMaskSnpQuery(db_path, f"""
+            SELECT b.sample_id, s.genome, s.chrom, b.presence, b.deviation,
+                   b.covered_positions, b.payload_hash
+            FROM allele_mask_profile_blocks b
+            JOIN allele_mask_reference_segments s USING (segment_id)
+            WHERE {where}
+        """, parameters)
+
+    where = " AND ".join(f"{key} = ?" for key in scope)
+    return Query(db_path, full_profile_sql(where), (*parameters, 5 if min_cov is None else int(min_cov)))
 
 
 def _required_text(value: str, name: str) -> str:

@@ -5,7 +5,7 @@ channels:
 dependencies:
   - python >=3.12
   # ZipStrain profiler + the external executables MetaTrawl shells out to
-  - zipstrain >=1.0.1,<2
+  - zipstrain >=1.3.0,<2
   - sylph
   - samtools
   - bowtie2
