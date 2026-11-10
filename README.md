@@ -90,10 +90,10 @@ Published images contain the complete toolchain:
 
 ```bash
 # Portable CPU image
-docker pull parsaghadermazi/metatrawl:1.1.5
+docker pull parsaghadermazi/metatrawl:1.4.0
 
 # NVIDIA CUDA 12.8 image
-docker pull parsaghadermazi/metatrawl:1.1.5-cuda
+docker pull parsaghadermazi/metatrawl:1.4.0-cuda
 ```
 
 See [Container usage](docs/containers.md) for project mounts, CUDA checks,
