@@ -22,6 +22,7 @@ from test_provenance import bundle
 def test_mixed_sylph_fields_and_repeated_headers_roundtrip(tmp_path, extension, capsys):
     path = tmp_path / f"sample.{extension}"
     table = pl.DataFrame({
+        "Sample_file": ["reads.fq", "Sample_file", "reads.fq", "reads.fq"],
         "Genome_file": ["GCF_1.1.fna", "Genome_file", "GCA_2.1.fna", "GCF_3.1.fna"],
         "Taxonomic_abundance": ["2.5", "Taxonomic_abundance", "0.0", "7.5"],
         "Eff_lambda": ["0.2", "Eff_lambda", "LOW", "HIGH"],
@@ -40,6 +41,21 @@ def test_mixed_sylph_fields_and_repeated_headers_roundtrip(tmp_path, extension, 
         ]
     assert path.read_bytes() == before
     assert "repeated-header-skipped" in capsys.readouterr().err
+
+
+def test_multi_sample_sylph_table_is_rejected_before_use(tmp_path):
+    path = tmp_path / "sample.tsv"
+    path.write_text(
+        "Sample_file\tGenome_file\tTaxonomic_abundance\n"
+        "SRR1_1.fastq\tGCF_1.1.fna\t100\n"
+        "SRR1_2.fastq\tGCA_2.1.fna\t100\n"
+    )
+    with pytest.raises(ValueError, match=r"multiple Sample_file values: .*sample.tsv"):
+        workflows.extract_accessions_from_sylph_table(path)
+    with db.connect(tmp_path / "project.duckdb") as conn:
+        with pytest.raises(ValueError, match="one Sylph profile per sample"):
+            db._insert_sylph_abundance(conn, sample_id="SRR1", abundance_file=path)
+        assert conn.execute("SELECT count(*) FROM sylph_abundance").fetchone() == (0,)
 
 
 def test_high_after_schema_inference_window_is_valid(tmp_path):

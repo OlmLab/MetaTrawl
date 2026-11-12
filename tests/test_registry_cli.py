@@ -1470,12 +1470,14 @@ def test_profile_sra_uses_per_sample_accessions_dir(tmp_path: Path, monkeypatch)
     assert not (scratch_dir / "SRR1").exists()
 
 
-def test_profile_sra_runs_sylph_and_extracts_accessions(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("split3", [False, True])
+def test_profile_sra_runs_sylph_and_extracts_accessions(tmp_path: Path, monkeypatch, capsys, split3) -> None:
     scratch_dir = tmp_path / "scratch"
     output_dir = tmp_path / "outputs"
     sylph_db = tmp_path / "gtdb.syldb"
     sylph_db.write_text("fake syldb")
     prepared_accessions: list[list[str]] = []
+    aligned_fastqs: list[str] = []
 
     def fake_subprocess_run(cmd, check, capture_output=False, text=False, stdout=None, stderr=None, **kwargs):
         if cmd[0] == "prefetch":
@@ -1489,8 +1491,13 @@ def test_profile_sra_runs_sylph_and_extracts_accessions(tmp_path: Path, monkeypa
             reads_dir = Path(cmd[cmd.index("--outdir") + 1])
             (reads_dir / "SRR1_1.fastq").write_text("@r1\nACGT\n+\n!!!!\n")
             (reads_dir / "SRR1_2.fastq").write_text("@r2\nTGCA\n+\n!!!!\n")
+            if split3:
+                (reads_dir / "SRR1.fastq").write_text("@singleton\nACGT\n+\n!!!!\n")
             return subprocess.CompletedProcess(cmd, 0)
         if cmd[:2] == ["sylph", "profile"]:
+            reads_dir = scratch_dir / "SRR1" / "reads"
+            assert cmd[3:7] == ["-1", str(reads_dir / "SRR1_1.fastq"), "-2", str(reads_dir / "SRR1_2.fastq")]
+            assert cmd[7] == "-t"
             stdout.write("Genome_file\tTaxonomic_abundance\n/path/GCF_000001.1_genomic.fna\t1.5\n/path/GCF_000002.1_genomic.fna\t0\n")
             return subprocess.CompletedProcess(cmd, 0)
         raise AssertionError(f"unexpected command: {cmd}")
@@ -1511,7 +1518,10 @@ def test_profile_sra_runs_sylph_and_extracts_accessions(tmp_path: Path, monkeypa
 
     monkeypatch.setattr(workflows.subprocess, "run", fake_subprocess_run)
     monkeypatch.setattr(workflows.cache, "GenomeCache", FakeGenomeCache)
-    monkeypatch.setattr(workflows, "_run_alignment_and_profile", lambda **kwargs: None)
+    def fake_alignment(**kwargs):
+        aligned_fastqs.extend(path.name for path in workflows._sample_fastqs(kwargs["sample_scratch"]))
+
+    monkeypatch.setattr(workflows, "_run_alignment_and_profile", fake_alignment)
 
     workflows.profile_sra_runs(
         run_ids=["SRR1"],
@@ -1524,6 +1534,8 @@ def test_profile_sra_runs_sylph_and_extracts_accessions(tmp_path: Path, monkeypa
     )
 
     assert prepared_accessions == [["GCF_000001.1"]]
+    assert set(aligned_fastqs) == {"SRR1_1.fastq", "SRR1_2.fastq"} | ({"SRR1.fastq"} if split3 else set())
+    assert ("status=orphan-fastq-skipped" in capsys.readouterr().err) == split3
     assert (output_dir / "SRR1.sylph.tsv").read_text().startswith("Genome_file")
     assert not (scratch_dir / "SRR1").exists()
 

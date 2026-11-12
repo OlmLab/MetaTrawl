@@ -93,6 +93,11 @@ downloads SRA reads or stages registered local reads, runs Sylph, prepares
 the genome cache, aligns reads, runs ZipStrain profiling, imports completed outputs into DuckDB, and removes
 per-sample scratch/results after successful import.
 
+For an SRA run with R1, R2, and an unpaired FASTQ, Sylph profiles R1/R2
+together. MetaTrawl logs that the unpaired FASTQ is skipped for Sylph and
+keeps it for alignment. Existing abundance rows are not rewritten. Imports
+reject Sylph files containing more than one `Sample_file`.
+
 ```bash
 metatrawl sync-profile \
   --db metatrawl.duckdb \

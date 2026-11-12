@@ -1876,6 +1876,7 @@ def _profile_one_sra_run(
                 run_id=run_id,
                 runtime=runtime,
                 output_file=sylph_output,
+                logger=logger,
             )
             accessions = extract_accessions_from_sylph_table(sylph_output)
             if not accessions:
@@ -2615,10 +2616,17 @@ def _atomic_copy(source: Path, destination: Path) -> None:
 
 def _run_sylph_profile(
     *, sylph_db: Path, sample_scratch: Path, run_id: str,
-    runtime: WorkflowRuntime | _DirectRuntime | None = None, threads: int | None = None, output_file: Path
+    runtime: WorkflowRuntime | _DirectRuntime | None = None, threads: int | None = None, output_file: Path,
+    logger: WorkflowLogger | None = None,
 ) -> None:
+    """Profile one sample, keeping any split-3 singletons for alignment only."""
     runtime = runtime or _DirectRuntime(threads or 1)
-    fastqs = _sample_fastqs(sample_scratch)
+    fastqs, orphans = split_alignment_reads(_sample_fastqs(sample_scratch))
+    if orphans:
+        (logger or WorkflowLogger()).emit(
+            sample=run_id, step="sylph", status="orphan-fastq-skipped",
+            file=orphans[0], reason="singletons retained for alignment",
+        )
     if len(fastqs) == 2:
         cmd = ["sylph", "profile", str(sylph_db), "-1", str(fastqs[0]), "-2", str(fastqs[1]), "-t", str(runtime.threads("sylph"))]
     else:

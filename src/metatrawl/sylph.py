@@ -8,7 +8,7 @@ from metatrawl.logging import WorkflowLogger
 
 
 def read_sylph_table(path: Path) -> pl.DataFrame:
-    """Preserve mixed-type fields and remove only exact repeated header rows.
+    """Read one sample, preserving mixed types and removing exact repeated headers.
 
     Sylph legitimately emits HIGH/LOW in Eff_lambda. Numeric validation belongs
     to consumers of abundance/coverage, not to unrelated diagnostic columns.
@@ -28,6 +28,12 @@ def read_sylph_table(path: Path) -> pl.DataFrame:
     skipped = table.height - cleaned.height
     if skipped:
         WorkflowLogger().emit(step="sylph-table", status="repeated-header-skipped", path=path, rows=skipped)
+    if "Sample_file" in cleaned.columns and cleaned["Sample_file"].drop_nulls().n_unique() > 1:
+        raise ValueError(
+            f"Sylph table contains multiple Sample_file values: {path}. "
+            "MetaTrawl expects one Sylph profile per sample. Regenerate the abundance file "
+            "with a single FASTQ or with R1/R2 passed together as -1 and -2."
+        )
     return cleaned
 
 

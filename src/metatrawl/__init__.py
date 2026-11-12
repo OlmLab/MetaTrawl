@@ -8,7 +8,7 @@ from metatrawl.api import MetaTrawlDatabase, Query, open_database
 try:
     __version__ = version("metatrawl")
 except PackageNotFoundError:
-    __version__ = "1.4.0"
+    __version__ = "1.4.1"
 
 
 __all__ = ["MetaTrawlDatabase", "Query", "open_database"]
