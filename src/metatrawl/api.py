@@ -40,6 +40,38 @@ class MetaTrawlDatabase:
         with duckdb.connect(str(self.path), read_only=True) as conn:
             return provenance.describe(conn)
 
+    def pair(self, sample_1: str, sample_2: str, *, genome: str, min_cov: int | None = None,
+             ani_method: str = "popani", allow_unknown_provenance: bool = False):
+        """Analyze two stored samples for one genome, without a comparison DB."""
+        from metatrawl.pair_api import PairView
+        if min_cov is not None and (isinstance(min_cov, bool) or not isinstance(min_cov, Integral) or min_cov < 1):
+            raise ValueError("min_cov must be a positive integer")
+        return PairView(self.path, _required_text(sample_1, "sample_1"), _required_text(sample_2, "sample_2"),
+                        _required_text(genome, "genome"), min_cov, ani_method, allow_unknown_provenance)
+
+    def genes(self, *, genome: str | None = None) -> Query:
+        """Query the shared V2 gene catalog, including annotation names and strand."""
+        where = "" if genome is None else "WHERE genome = ?"
+        return Query(self.path, f"SELECT * FROM gene_catalog {where}",
+                     () if genome is None else (_required_text(genome, "genome"),))
+
+    def codon_counts(self, *, sample_id: str | None = None, genome: str | None = None) -> Query:
+        """Query retained read-phased codons; absent evidence produces zero rows."""
+        if sample_id is None and genome is None:
+            raise ValueError("codon_counts requires a sample_id or genome")
+        conditions, params = [], []
+        if sample_id is not None:
+            conditions.append("c.sample_id = ?")
+            params.append(_required_text(sample_id, "sample_id"))
+        if genome is not None:
+            conditions.append("g.genome = ?")
+            params.append(_required_text(genome, "genome"))
+        return Query(self.path, f"""
+            SELECT c.sample_id, c.gene_id, c.codon_index, c.codon, c.count
+            FROM codon_counts c JOIN gene_catalog g USING(gene_id)
+            WHERE {' AND '.join(conditions)}
+        """, tuple(params))
+
     def sample(self, sample_id: str) -> SampleView:
         """Return a view of all stored data for one sample."""
         return SampleView(self.path, _required_text(sample_id, "sample_id"))
@@ -156,6 +188,10 @@ class GenomeView:
     db_path: Path
     genome: str
 
+    def codon_counts(self, sample_id: str | None = None) -> Query:
+        """Query observed codons for this genome across samples or for one sample."""
+        return MetaTrawlDatabase(self.db_path).codon_counts(sample_id=sample_id, genome=self.genome)
+
     def snps(
         self,
         sample_id: str | None = None,
@@ -230,6 +266,10 @@ class SampleView:
 
     db_path: Path
     sample_id: str
+
+    def codon_counts(self, genome: str | None = None) -> Query:
+        """Query read-phased codons retained for this sample."""
+        return MetaTrawlDatabase(self.db_path).codon_counts(sample_id=self.sample_id, genome=genome)
 
     def snps(
         self,

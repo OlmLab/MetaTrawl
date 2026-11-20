@@ -4,6 +4,7 @@ from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+import polars as pl
 import itertools
 import gzip
 import random
@@ -150,7 +151,8 @@ def test_cli_engine_precedence(tmp_path, monkeypatch, command, configured, overr
 
 def test_default_contract_unchanged_and_bwa_import_requires_acknowledgement(tmp_path):
     default = provenance.profiling_contract(ProfileConfig())
-    assert set(default["profile"]) == {"min_mapq", "min_baseq", "min_freq", "min_read_ani", "read_inclusion"}
+    assert set(default["profile"]) == {"min_mapq", "min_baseq", "min_freq", "min_read_ani", "read_inclusion",
+                                      "collect_codons", "allele_integration"}
     assert default["alignment"] == {
         "aligner": "bowtie2", "preset": "default-sensitive-end-to-end", "samtools_exclude_flags": 4,
     }
@@ -245,7 +247,7 @@ def test_fixed_reference_indexes_cached_separately_by_engine(tmp_path):
             if command[0] == "zipstrain":
                 output = Path(command[command.index("--output-dir") + 1])
                 output.mkdir()
-                for name in ("reference.fasta", "genomes_bed_file.bed", "gene_range_table.tsv", "null_model.parquet", "profiling_contract.json"):
+                for name in ("reference.fasta", "genomes_bed_file.bed", "gene_info.parquet", "reference_codons.parquet", "null_model.parquet", "profiling_contract.json"):
                     (output / name).write_text("fixture")
             elif command[:2] == ["samtools", "faidx"]:
                 Path(f"{command[2]}.fai").write_text("fixture")
@@ -270,7 +272,7 @@ def test_fixed_reference_indexes_cached_separately_by_engine(tmp_path):
         contexts.append(first)
     assert contexts[0].reference_key != contexts[1].reference_key
     original = {"sources": {label: provenance.sha256_file(path) for label, path in {"reference": ref, "genes": genes, "stb": stb}.items()},
-                "null_model": provenance.zipstrain_defaults()["null_model"]}
+                "null_model": provenance.zipstrain_defaults()["null_model"], "profile_generation": 2}
     assert contexts[0].reference_key == hashlib.sha256(provenance.canonical(original).encode()).hexdigest()
     assert sum(command[0] == "bowtie2-build" for command in calls) == 1
     assert sum(command[:2] == ["bwa-mem3", "index"] for command in calls) == 1
@@ -289,7 +291,7 @@ def test_worker_engine_selection_cleanup_and_profile_handoff(tmp_path, monkeypat
     ref.write_text(">chr\nACGT\n")
     genes.write_text(">chr_1 # 1 # 4 # 1 # ID=1\nACGT\n")
     stb.write_text("chr\tgenome\n")
-    for filename in ("genomes_bed_file.bed", "gene_range_table.tsv", "null_model.parquet", "reference.fasta"):
+    for filename in ("genomes_bed_file.bed", "gene_info.parquet", "reference_codons.parquet", "null_model.parquet", "reference.fasta"):
         (work / filename).write_text("fixture")
     (work / "profiling_contract.json").write_text("{}")
     if layout != "single":
@@ -317,7 +319,7 @@ def test_worker_engine_selection_cleanup_and_profile_handoff(tmp_path, monkeypat
             (sample / "S1.bam.tmp").write_text("bam")
         elif "profile-single" in rendered:
             for suffix in ("profile", "genome_stats", "gene_stats"):
-                (work / f"S1_{suffix}.parquet").write_text("fixture")
+                pl.DataFrame({"fixture": [1]}).write_parquet(work / f"S1_{suffix}.parquet")
         else:
             engine = alignment.get_alignment_engine(name)
             paths = engine.index_paths(ref)[:6] if name == "bowtie2" else engine.index_paths(ref)

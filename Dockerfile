@@ -39,14 +39,14 @@ RUN python -m pip install --upgrade pip setuptools wheel 'ruamel.yaml<0.19' \
 
 FROM toolchain AS runtime
 
-ARG ZIPSTRAIN_PACKAGE="zipstrain>=1.3.0,<2"
+ARG ZIPSTRAIN_PACKAGE="zipstrain>=2.0.0,<3"
 
 WORKDIR /opt/metatrawl
 
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 
-RUN python -m pip install . 'polars>=1.34,<2' "${ZIPSTRAIN_PACKAGE}" \
+RUN python -m pip install . 'polars>=1.36.1,<3' "${ZIPSTRAIN_PACKAGE}" \
     && python -m pip check \
     && metatrawl check \
     && bwa-mem3 version \

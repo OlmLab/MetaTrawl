@@ -7,6 +7,13 @@ Two copies can subsequently diverge.
 
 ## Existing databases
 
+**MetaTrawl 2 writes schema v2 only.** Schema-v1 databases remain readable,
+but writable opens are rejected before any changes. Keep the original
+MetaTrawl 1.x environment for v1 project writes and start a new database for
+ZipStrain 2 profiling. See [Schema v2](schema-v2.md). The metadata-adoption
+instructions below apply to databases that have no version metadata yet,
+not to automatic conversion of schema v1 to v2.
+
 Existing databases remain readable without migration. The first writable open
 adds small provenance tables and labels registered samples `legacy-unknown`.
 It does not infer old parameters from current defaults, scan profile positions,
@@ -80,6 +87,11 @@ this does not independently attest the software installed inside a different
 Slurm stage environment. Package-version differences alone do not reject data;
 contract and reference differences do. Future known semantic incompatibilities
 require updating the contract policy.
+
+V2 contracts explicitly include the profile generation, `collect_codons`, and
+`allele_integration`. The importer also authenticates ZipStrain's v2 catalog,
+reference-codon hash, and optional read-phased counts. Generation changes are
+scientific changes, not an operational backend switch.
 
 The importer records the manifest in the same transaction as profile/stat rows
 and completion status. Cleanup deletes the sidecar only after a successful commit.

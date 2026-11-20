@@ -1553,14 +1553,18 @@ def _collect_gene_range_specs(*, gene_range_table: Path, genome_scaffolds: list[
     if not gene_range_table.is_file():
         raise FileNotFoundError(f"Gene range table does not exist: {gene_range_table}")
     offsets_by_chrom = {offset.chrom: offset for offset in genome_scaffolds}
-    frame = (
-        pl.scan_csv(
+    if gene_range_table.suffix == ".parquet":
+        from zipstrain.gene_info import read_gene_ranges
+        intervals = read_gene_ranges(gene_range_table)
+    else:
+        intervals = pl.scan_csv(
             gene_range_table,
             has_header=False,
             separator="\t",
             new_columns=["gene", "scaffold", "start", "end"],
         )
-        .select(pl.col("gene").cast(pl.Utf8), pl.col("scaffold").cast(pl.Utf8), pl.col("start").cast(pl.Int64), pl.col("end").cast(pl.Int64))
+    frame = (
+        intervals.select(pl.col("gene").cast(pl.Utf8), pl.col("scaffold").cast(pl.Utf8), pl.col("start").cast(pl.Int64), pl.col("end").cast(pl.Int64))
         .collect(engine="streaming")
     )
     specs: list[GeneRangeSpec] = []

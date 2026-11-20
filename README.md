@@ -21,6 +21,10 @@ It is designed for projects that outgrow collections of loose profile files.
 Samples can be added over time, expensive stages can run locally or through
 Slurm, and every sync command derives its remaining work from durable state.
 
+**MetaTrawl 2.x is based on ZipStrain 2.x.** It creates schema-v2 databases; schema-v1 projects
+remain readable but must use MetaTrawl 1.x for further writes. See the
+[schema-v2 guide](docs/schema-v2.md) before upgrading an existing project.
+
 ## What MetaTrawl Provides
 
 - **One project database.** Profile data, genome and gene statistics, Sylph
@@ -38,6 +42,9 @@ Slurm, and every sync command derives its remaining work from durable state.
 - **Analysis access.** Query the project through Python and Polars or generate
   self-contained genome views with heatmaps, dendrograms, clusters, and neighbor
   networks.
+- **Optional selection evidence.** Retain read-phased codon counts and
+  reference-relative gene dN/dS and pN/pS. Query pairwise selection, mosaic
+  regions, and identical-stretch coordinates through the Python API.
 
 ## Workflow
 
@@ -63,13 +70,19 @@ matrices, schedules comparisons, records provenance, and cleans temporary data.
 
 ## Installation
 
+MetaTrawl 2 requires ZipStrain `>=2.0.0,<3` and its Rust profiler `>=0.2.0,<0.3`.
+
 ### Bioconda
 
 Bioconda is the simplest installation for the complete workflow because it also
 installs the external bioinformatics tools:
 
+The Bioconda 2.0 update also requires updated ZipStrain and Rust-profiler
+recipes. Until those are available, use PyPI or the containers for version 2;
+an unconstrained Conda install may still select MetaTrawl 1.x.
+
 ```bash
-conda create -n metatrawl -c conda-forge -c bioconda metatrawl
+conda create -n metatrawl -c conda-forge -c bioconda metatrawl=2.0.0
 conda activate metatrawl
 metatrawl check
 ```
@@ -77,7 +90,7 @@ metatrawl check
 ### PyPI
 
 ```bash
-pip install metatrawl
+pip install "metatrawl==2.0.0"
 ```
 
 The PyPI package installs Python dependencies. Sylph, Bowtie2, Samtools,
@@ -90,10 +103,10 @@ Published images contain the complete toolchain:
 
 ```bash
 # Portable CPU image
-docker pull parsaghadermazi/metatrawl:1.4.1
+docker pull parsaghadermazi/metatrawl:2.0.0
 
 # NVIDIA CUDA 12.8 image
-docker pull parsaghadermazi/metatrawl:1.4.1-cuda
+docker pull parsaghadermazi/metatrawl:2.0.0-cuda
 ```
 
 See [Container usage](docs/containers.md) for project mounts, CUDA checks,
@@ -194,7 +207,7 @@ metatrawl matrix sync-compare \
 For NVIDIA acceleration, use the CUDA container and set
 `--backend torch-cuda`.
 
-With MetaTrawl 1.4.0 (ZipStrain 1.3.0+), use
+With MetaTrawl 2.x (ZipStrain 2.x), use
 `--compare-kernel block --calculate genome_ani` for genome-level popANI or
 conANI only. Gene ANI and maximum identical stretch (IBS) require the default
 `anchor` kernel. The old names `gemm` and `pairwise` remain valid aliases.
@@ -238,6 +251,19 @@ Profiling itself remains unchanged. MetaTrawl converts the completed ZipStrain
 profile during import and preserves genome stats, gene stats, Sylph abundance,
 and provenance normally.
 
+To retain codon evidence and reference-relative selection, set:
+
+```toml
+[profile]
+collect_codons = true
+allele_integration = "consensus"
+```
+
+This is optional and works in either storage mode. Codons are kept as one
+shared DuckDB table keyed by sample and gene, not inferred from allele masks.
+Without collection, selection fields are null. Pairwise dN/dS and pN/pS are
+API-only; matrix sync still computes genome ANI, gene ANI, and max identical stretch.
+
 ## Python API
 
 ```python
@@ -248,6 +274,10 @@ db = open_database("metatrawl.duckdb")
 samples = db.samples().collect()
 genomes = db.genomes().collect()
 stats = db.genome("GCF_000001").genome_stats().collect()
+pair = db.pair("SRR123", "SRR456", genome="GCF_000001")
+pair.identical_stretches(min_length=100).sink_parquet("stretches.parquet")
+# Requires collect_codons=true for both samples:
+selection = pair.gene_selection().collect()
 
 db.genome("GCF_000001").profiles().sink_parquet(
     "GCF_000001.profiles.parquet"
@@ -279,6 +309,7 @@ corresponding database import commits.
 - [Workflow configuration](docs/workflow-configuration.md): local and Slurm settings
 - [Python query API](docs/python-api.md): sample and genome queries
 - [Database provenance](docs/database-provenance.md): versioning and compatibility
+- [Schema v2](docs/schema-v2.md): ZipStrain 2 catalogs, codons, and upgrade boundaries
 
 ## Support
 

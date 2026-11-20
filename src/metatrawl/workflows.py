@@ -817,7 +817,7 @@ def resolve_compare_kernel(
     if kernel == "block":
         from zipstrain.matrix_pairs import parse_matrix_ani_method, parse_matrix_calculations
 
-        if parse_matrix_calculations(calculate) != ("ani",):
+        if parse_matrix_calculations(normalize_calculations(calculate)) != ("ani",):
             raise ValueError(
                 "The block kernel requires --calculate genome_ani; gene ANI and "
                 "maximum identical stretch require --compare-kernel anchor."
@@ -828,6 +828,20 @@ def resolve_compare_kernel(
                 "--compare-kernel anchor for other ANI methods."
             )
     return kernel
+
+
+def normalize_calculations(calculate: str) -> str:
+    """Translate MetaTrawl 1.x configuration spellings to ZipStrain V2 names."""
+    aliases = {"ani": "genome_ani", "gene": "gene_ani", "ibs": "max_identical_stretch"}
+    value = "+".join(aliases.get(token.strip().lower(), token.strip().lower())
+                     for token in calculate.replace(",", "+").split("+") if token.strip())
+    tokens = set(value.split("+"))
+    if "gene_selection" in tokens:
+        raise ValueError("Matrix sync currently supports genome_ani, gene_ani and max_identical_stretch; "
+                         "use the Python pair.gene_selection() API for dN/dS and pN/pS from retained codons.")
+    if not tokens <= {"all", "genome_ani", "gene_ani", "max_identical_stretch"}:
+        raise ValueError("Unknown matrix calculation; use genome_ani, gene_ani, max_identical_stretch or all")
+    return value
 
 
 def _matrix_compare_kwargs(*, compare_kernel, compare_config, calculate, ani_method):
@@ -877,7 +891,7 @@ def compare_matrix_from_registry(
         genome=genome,
         memory_limit_gb=memory_limit_gb,
         backend=backend,
-        calculate=calculate,
+        calculate=normalize_calculations(calculate),
         **compare_kwargs,
     )
     compare_id = output_file.stem
@@ -930,7 +944,7 @@ def compare_matrix_file(
         genome=genome,
         memory_limit_gb=memory_limit_gb,
         backend=backend,
-        calculate=calculate,
+        calculate=normalize_calculations(calculate),
         **compare_kwargs,
     )
     compare_id = output_file.stem
@@ -1243,8 +1257,9 @@ def _prepare_fixed_reference_context(
             raise FileNotFoundError(f"Fixed-reference {label} file is missing or empty: {path}")
     source_hashes = {label: _sha256_file(path) for label, path in sources.items()}
     engine = get_alignment_engine(alignment_engine)
-    cache_settings = {"sources": source_hashes, "null_model": provenance.null_model_settings(profile_config)}
-    # Keep existing Bowtie2 cache keys; other engines need their own index.
+    cache_settings = {"sources": source_hashes, "null_model": provenance.null_model_settings(profile_config),
+                      "profile_generation": 2}
+    # Reference assets and indices are separate across profile generations/aligners.
     if engine.name != "bowtie2":
         cache_settings["alignment"] = engine.scientific_contract()
     digest = hashlib.sha256(json.dumps(cache_settings, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -1289,7 +1304,8 @@ def _prepare_fixed_reference_context(
         required_assets = (
             shared_reference,
             assets_dir / "genomes_bed_file.bed",
-            assets_dir / "gene_range_table.tsv",
+            assets_dir / "gene_info.parquet",
+            assets_dir / "reference_codons.parquet",
             assets_dir / "null_model.parquet",
             assets_dir / "profiling_contract.json",
         )
@@ -1347,7 +1363,8 @@ def _fixed_reference_context_from_dir(
         root / "reference.stb",
         reference_fasta,
         assets / "genomes_bed_file.bed",
-        assets / "gene_range_table.tsv",
+        assets / "gene_info.parquet",
+        assets / "reference_codons.parquet",
         assets / "null_model.parquet",
         assets / "profiling_contract.json",
         Path(str(reference_fasta) + ".fai"),
@@ -1361,7 +1378,7 @@ def _fixed_reference_context_from_dir(
             stb_file=root / "reference.stb",
         ),
         bed_file=assets / "genomes_bed_file.bed",
-        gene_range_table=assets / "gene_range_table.tsv",
+        gene_range_table=assets / "gene_info.parquet",
         null_model_file=assets / "null_model.parquet",
         profiling_contract_file=assets / "profiling_contract.json",
         reference_key=reference_key,
@@ -1682,6 +1699,9 @@ def discover_profile_bundle(*, output_dir: Path, run_id: str) -> db.ProfileBundl
         genome_stats_file=genome_stats_file,
         gene_stats_file=gene_stats_file,
         sylph_abundance_file=sylph_abundance_file,
+        gene_info_file=_optional_existing_path(output_dir, [f"{run_id}.gene_info.parquet"]),
+        reference_codons_file=_optional_existing_path(output_dir, [f"{run_id}.reference_codons.parquet"]),
+        codon_counts_file=_optional_existing_path(output_dir, [f"{run_id}.codon_counts.parquet"]),
     )
 
 
@@ -1693,6 +1713,9 @@ def cleanup_profile_bundle(bundle: db.ProfileBundle) -> int:
         bundle.genome_stats_file,
         bundle.gene_stats_file,
         bundle.sylph_abundance_file,
+        bundle.gene_info_file,
+        bundle.reference_codons_file,
+        bundle.codon_counts_file,
         bundle.provenance_file or provenance.manifest_path(bundle.profile_file),
     ]
     seen: set[Path] = set()
@@ -1718,6 +1741,9 @@ def _profile_bundle_size(bundle: db.ProfileBundle) -> int:
             bundle.genome_stats_file,
             bundle.gene_stats_file,
             bundle.sylph_abundance_file,
+            bundle.gene_info_file,
+            bundle.reference_codons_file,
+            bundle.codon_counts_file,
         )
         if path is not None
     }
@@ -1744,6 +1770,7 @@ def _profile_one_sra_run(
         output_dir=Path(output_dir),
         require_sylph=fixed_reference is None,
         reference_key=fixed_reference.reference_key if fixed_reference is not None else None,
+        collect_codons=profile_config.collect_codons,
     ):
         logger.emit(
             sample=run_id,
@@ -2162,7 +2189,8 @@ def _run_alignment_and_profile(
     else:
         prepared_outputs = (
             profile_work / "genomes_bed_file.bed",
-            profile_work / "gene_range_table.tsv",
+            profile_work / "gene_info.parquet",
+            profile_work / "reference_codons.parquet",
             profile_work / "profiling_contract.json",
         )
         if not all(_valid_file(path) for path in prepared_outputs):
@@ -2199,7 +2227,7 @@ def _run_alignment_and_profile(
         )
         _ensure_reference_fai(profile_work=profile_work, run_id=run_id, logger=logger, runtime=runtime)
         bed_file = profile_work / "genomes_bed_file.bed"
-        gene_range_table = profile_work / "gene_range_table.tsv"
+        gene_range_table = profile_work / "gene_info.parquet"
         profiling_contract_file = profile_work / "profiling_contract.json"
         profiling_reference_fasta = profile_work / "reference.fasta"
 
@@ -2278,6 +2306,7 @@ def _run_alignment_and_profile(
         output_dir=output_dir,
         require_sylph=fixed_reference is None,
         reference_key=fixed_reference.reference_key if fixed_reference is not None else None,
+        collect_codons=profile_config.collect_codons,
     ):
         logger.emit(sample=run_id, step="profile", status="start", backend=profile_config.backend)
         profile_command = [
@@ -2312,6 +2341,10 @@ def _run_alignment_and_profile(
             str(profile_work),
         ]
         profile_command.extend(["--min-read-ani", str(scientific_contract["profile"]["min_read_ani"])])
+        profile_command.extend(["--threads", str(runtime.threads("profile")),
+                                "--allele-integration", profile_config.allele_integration])
+        if profile_config.collect_codons:
+            profile_command.append("--collect-codons")
         # Omitting the built-in default also supports older ZipStrain installs.
         if profile_config.backend != "python":
             profile_command.extend(["--backend", profile_config.backend])
@@ -2320,7 +2353,10 @@ def _run_alignment_and_profile(
             profile_command,
             sample=run_id,
         )
-        _publish_profile_outputs(run_id=run_id, profile_work=profile_work, output_dir=output_dir)
+        _publish_profile_outputs(
+            run_id=run_id, profile_work=profile_work, output_dir=output_dir,
+            gene_info_file=gene_range_table, collect_codons=profile_config.collect_codons,
+        )
         provenance.write_manifest(
             profile_file=output_dir / f"{run_id}.profile.parquet", sample_id=run_id,
             contract=scientific_contract, references=references,
@@ -2443,6 +2479,7 @@ def _published_profile_bundle_complete(
     output_dir: Path,
     require_sylph: bool = True,
     reference_key: str | None = None,
+    collect_codons: bool = False,
 ) -> bool:
     required = [
         output_dir / f"{run_id}.profile.parquet",
@@ -2452,6 +2489,21 @@ def _published_profile_bundle_complete(
     if require_sylph:
         required.append(output_dir / f"{run_id}.sylph.tsv")
     if not all(_valid_file(path) for path in required):
+        return False
+    if collect_codons and not _valid_file(output_dir / f"{run_id}.codon_counts.parquet"):
+        return False
+    try:
+        import pyarrow.parquet as pq
+        meta = pq.ParquetFile(required[0]).metadata.metadata or {}
+        if meta.get(b"zipstrain_profile_schema") == b"2":
+            if not all(_valid_file(output_dir / f"{run_id}.{name}.parquet")
+                       for name in ("gene_info", "reference_codons")):
+                return False
+            stats_meta = pq.ParquetFile(required[2]).metadata.metadata or {}
+            if stats_meta.get(b"zipstrain_selection_method", b"not_calculated") != b"not_calculated":
+                if not _valid_file(output_dir / f"{run_id}.codon_counts.parquet"):
+                    return False
+    except (OSError, ValueError):
         return False
     if reference_key is None:
         return True
@@ -2550,12 +2602,22 @@ def _run_alignment_shell(*, command: str, sample: str) -> None:
         raise RuntimeError(f"sample={sample} step=align command failed: {command}\n{exc.stderr}") from exc
 
 
-def _publish_profile_outputs(*, run_id: str, profile_work: Path, output_dir: Path) -> None:
+def _publish_profile_outputs(
+    *, run_id: str, profile_work: Path, output_dir: Path,
+    gene_info_file: Path | None = None, collect_codons: bool = False,
+) -> None:
     outputs = {
         profile_work / f"{run_id}_profile.parquet": output_dir / f"{run_id}.profile.parquet",
         profile_work / f"{run_id}_genome_stats.parquet": output_dir / f"{run_id}.genome_stats.parquet",
         profile_work / f"{run_id}_gene_stats.parquet": output_dir / f"{run_id}.gene_stats.parquet",
     }
+    shared_assets: set[Path] = set()
+    if gene_info_file is not None:
+        outputs[gene_info_file] = output_dir / f"{run_id}.gene_info.parquet"
+        outputs[gene_info_file.with_name("reference_codons.parquet")] = output_dir / f"{run_id}.reference_codons.parquet"
+        shared_assets = {gene_info_file, gene_info_file.with_name("reference_codons.parquet")}
+    if collect_codons:
+        outputs[profile_work / f"{run_id}_codon_counts.parquet"] = output_dir / f"{run_id}.codon_counts.parquet"
     missing = [str(source) for source in outputs if not _valid_file(source)]
     if missing:
         detail = ""
@@ -2580,7 +2642,11 @@ def _publish_profile_outputs(*, run_id: str, profile_work: Path, output_dir: Pat
             "do not remove them or fabricate stats. Fix the underlying error before resuming."
         )
     for source, destination in outputs.items():
-        _atomic_publish(source, destination)
+        # Fixed-reference annotations are shared by all sample workers.
+        if source in shared_assets:
+            _atomic_copy(source, destination)
+        else:
+            _atomic_publish(source, destination)
 
 
 def _atomic_publish(source: Path, destination: Path) -> None:

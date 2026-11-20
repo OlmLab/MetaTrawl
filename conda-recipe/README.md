@@ -1,79 +1,63 @@
 # Bioconda recipe
 
-MetaTrawl is already available in Bioconda. New releases update the existing
-`recipes/metatrawl/meta.yaml` recipe in
-[`bioconda/bioconda-recipes`](https://github.com/bioconda/bioconda-recipes).
+MetaTrawl already has a recipe in
+[`bioconda/bioconda-recipes`](https://github.com/bioconda/bioconda-recipes/tree/master/recipes/metatrawl).
+Update that recipe for each PyPI release rather than adding a second package.
 
-The recipe installs the Python package from its PyPI source distribution and
-adds the external workflow tools that pip cannot provide: Sylph, Samtools,
-Bowtie2, Prodigal, SRA Toolkit, and NCBI Datasets.
-
-MetaTrawl 1.1.3 requires ZipStrain 1.2.2+ and `zipstrain-rust-profiler` as a
-regular runtime dependency. The native plugin has its own architecture-specific
-recipe in `zipstrain-rust-profiler/`; Conda installs it automatically with
-MetaTrawl. Submit that recipe alongside the MetaTrawl update so users do not need
-a second install command. bwa-mem3 remains an optional user-installed aligner;
-the complete MetaTrawl containers include it.
-
-## Release values
+## MetaTrawl 2.0.0
 
 | Field | Value |
 | --- | --- |
-| Version | `1.1.3` |
+| Version | `2.0.0` |
 | Build number | `0` |
-| PyPI sdist | `metatrawl-1.1.3.tar.gz` |
-| SHA256 | `52ebb9c114e9e49514177af0c2aad0127aa89a5271628129777c0c0c157b3239` |
+| PyPI sdist | `metatrawl-2.0.0.tar.gz` |
+| SHA256 | `37b595aa3a9670da31d7dc7a9fd6cb23b29ba4270c33e26e650e1a3e9f3f0b05` |
 
-Verify the release artifact hash against PyPI before submitting the update.
-Do not replace it with the hash of a later locally rebuilt archive:
+The runtime requirements must include ZipStrain `>=2.0.0,<3`, its native
+Rust profiler `>=0.2.0,<0.3`, and Polars `>=1.36.1,<3`. Preserve these bounds
+when updating the recipe; changing only the version and archive hash is not
+sufficient for this major release.
+
+The ZipStrain and native-plugin updates must be available first:
+
+- [ZipStrain 2.0.0 update](https://github.com/bioconda/bioconda-recipes/pull/72008)
+- [Rust profiler 0.2.0 update](https://github.com/bioconda/bioconda-recipes/pull/70147)
+
+Until they are merged and published, use PyPI or the MetaTrawl 2 containers.
+The historical plugin recipe included in this directory is not the v2 recipe;
+the plugin's current packaging is maintained with ZipStrain and upstream Bioconda.
+
+## Verify the source artifact
+
+Use the hash published by PyPI, not the hash of a later rebuilt archive:
 
 ```bash
-curl -fsSL https://pypi.org/pypi/metatrawl/<version>/json |
+curl -fsSL https://pypi.org/pypi/metatrawl/2.0.0/json |
   python -c 'import json,sys; d=json.load(sys.stdin); print(next(x["digests"]["sha256"] for x in d["urls"] if x["packagetype"] == "sdist"))'
 ```
 
-## Submit the update
+## Submit and test
 
-Update your fork of `bioconda-recipes`, create a release branch, and replace the
-existing recipe:
+On a branch of your Bioconda fork, replace only
+`recipes/metatrawl/meta.yaml` with `conda-recipe/metatrawl/meta.yaml`, run the
+recipe checks, and open a pull request against `bioconda/bioconda-recipes:master`.
+Use build number `0` for a new upstream version. Increment it only for a
+recipe-only rebuild of the same version.
 
 ```bash
-git clone https://github.com/<github-user>/bioconda-recipes.git
-cd bioconda-recipes
-git remote add upstream https://github.com/bioconda/bioconda-recipes.git
-git fetch upstream
-git checkout master
-git rebase upstream/master
-git checkout -b update-metatrawl-1.1.3
-
-cp /path/to/MetaTrawl/conda-recipe/metatrawl/meta.yaml \
-  recipes/metatrawl/meta.yaml
-cp -R /path/to/MetaTrawl/conda-recipe/zipstrain-rust-profiler \
-  recipes/zipstrain-rust-profiler
-
-git add recipes/metatrawl/meta.yaml recipes/zipstrain-rust-profiler
-git commit -m "Update metatrawl to 1.1.3"
-git push -u origin update-metatrawl-1.1.3
+bioconda-utils lint recipes config.yml --packages metatrawl
+bioconda-utils build recipes config.yml --packages metatrawl
 ```
 
-Open a pull request from that branch to `bioconda/bioconda-recipes:master`.
-Because MetaTrawl already has a recipe, do not create a second recipe directory.
-Keep `build.number` at `0` for the new upstream version. Increment it only when
-rebuilding the same MetaTrawl version with recipe-only corrections.
+The recipe installs from the source distribution without pip dependency
+resolution and declares all runtime dependencies explicitly. Tests cover the
+CLI, schema-v2 initialization, pair API imports, and native backend loading.
+Bioinformatics tools remain Conda runtime dependencies; bwa-mem3 stays optional.
 
-## Validate locally
-
-From a `bioconda-recipes` checkout with `bioconda-utils` installed:
+After the dependencies and MetaTrawl recipe have been published:
 
 ```bash
-bioconda-utils lint recipes config.yml --packages metatrawl zipstrain-rust-profiler
-bioconda-utils build recipes config.yml --packages zipstrain-rust-profiler metatrawl
-```
-
-After the pull request is merged and the package is published:
-
-```bash
-conda create -n metatrawl-1 -c conda-forge -c bioconda metatrawl=1.1.3
-conda activate metatrawl-1
+conda create -n metatrawl-2 -c conda-forge -c bioconda metatrawl=2.0.0
+conda activate metatrawl-2
 metatrawl check
 ```

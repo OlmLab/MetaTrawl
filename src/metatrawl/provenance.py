@@ -17,7 +17,7 @@ import uuid
 from metatrawl.alignment import get_alignment_engine
 from metatrawl.config import NullModelConfig
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MANIFEST_VERSION = 1
 
 
@@ -43,19 +43,21 @@ def table_exists(conn, name: str) -> bool:
     return conn.execute("SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name=?", [name]).fetchone() is not None
 
 
-def check_schema(conn) -> None:
+def check_schema(conn, *, writable: bool = False) -> None:
     """Reject unsupported schemas before any DDL or writable migration."""
     if not table_exists(conn, "database_metadata"):
         return
     rows = conn.execute("SELECT schema_version FROM database_metadata").fetchall()
-    if len(rows) != 1 or rows[0][0] != SCHEMA_VERSION:
-        raise ValueError(f"Unsupported MetaTrawl database schema: {rows!r}; supported={SCHEMA_VERSION}. Use a compatible MetaTrawl release.")
+    supported = (SCHEMA_VERSION,) if writable else (1, SCHEMA_VERSION)
+    if len(rows) != 1 or rows[0][0] not in supported:
+        raise ValueError(f"Unsupported MetaTrawl database schema: {rows!r}; writable schema={SCHEMA_VERSION}. "
+                         "Use MetaTrawl 1.x for schema-v1 writes; use a new v2 database for ZipStrain v2 profiles.")
 
 
 def migrate(conn) -> None:
     """Install provenance metadata once, touching only the sample registry."""
     if table_exists(conn, "database_metadata"):
-        check_schema(conn)
+        check_schema(conn, writable=True)
         return
     conn.execute("BEGIN TRANSACTION")
     try:
@@ -118,21 +120,28 @@ def profiling_contract(config) -> dict:
     defaults = zipstrain_defaults()
     if values["min_read_ani"] is None:
         values["min_read_ani"] = defaults["min_read_ani"]
-    return {"contract_version": 1, "profile": values,
+    return {"contract_version": 2, "profile_generation": 2, "profile": values,
             "null_model": null_model_settings(config),
             "alignment": engine.scientific_contract(),
             "single_end_read_inclusion": "all-mapped"}
 
 
 def validate_contract(contract: dict) -> None:
-    if not isinstance(contract, dict) or contract.get("contract_version") != 1:
-        raise ValueError("Unsupported or missing profiling contract_version (expected 1).")
+    if not isinstance(contract, dict) or contract.get("contract_version") not in (1, 2):
+        raise ValueError("Unsupported or missing profiling contract_version (expected 1 or 2).")
     required = {"min_mapq", "min_baseq", "min_freq", "min_read_ani", "read_inclusion"}
     if not isinstance(contract.get("profile"), dict) or not required <= contract["profile"].keys():
         raise ValueError("Profiling contract must contain all effective profile settings.")
     if not all(key in contract for key in ("null_model", "alignment", "single_end_read_inclusion")):
         raise ValueError("Profiling contract is missing null_model, alignment, or single_end_read_inclusion.")
     profile = contract["profile"]
+    if contract["contract_version"] == 2:
+        if contract.get("profile_generation") != 2:
+            raise ValueError("V2 profiling contracts require profile_generation=2")
+        if type(profile.get("collect_codons")) is not bool:
+            raise ValueError("Invalid profiling contract collect_codons")
+        if profile.get("allele_integration") not in ("consensus", "weighted"):
+            raise ValueError("Invalid profiling contract allele_integration")
     for key in ("min_mapq", "min_baseq"):
         if type(profile[key]) is not int or profile[key] < 0:
             raise ValueError(f"Invalid profiling contract {key}.")

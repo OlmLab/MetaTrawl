@@ -1,11 +1,11 @@
-name: metatrawl
+name: metatrawl-v2
 channels:
   - conda-forge
   - bioconda
 dependencies:
   - python >=3.12
   # ZipStrain profiler + the external executables MetaTrawl shells out to
-  - zipstrain >=1.3.0,<2
+  - zipstrain >=2.0.0,<3
   - sylph
   - samtools
   - bowtie2
@@ -15,9 +15,9 @@ dependencies:
   # MetaTrawl's own Python dependencies (resolved by conda, not pip)
   - click >=8.1
   - duckdb >=1.1
-  - polars >=1.0
+  - polars >=1.36.1,<3
   - rich >=13.0
   - pip
   - pip:
-      # MetaTrawl itself, from PyPI, until the bioconda package lands
-      - metatrawl
+      # Requires the ZipStrain 2.x Bioconda recipe to be available.
+      - metatrawl==2.0.0

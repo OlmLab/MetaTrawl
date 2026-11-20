@@ -142,7 +142,39 @@ CREATE TABLE IF NOT EXISTS gene_stats (
     breadth DOUBLE,
     ber DOUBLE,
     ref_ani DOUBLE,
-    length BIGINT
+    length BIGINT,
+    gene_id UBIGINT,
+    chrom VARCHAR,
+    start BIGINT,
+    "end" BIGINT,
+    "dN" DOUBLE,
+    "dS" DOUBLE,
+    "dN_dS" DOUBLE,
+    "pN" DOUBLE,
+    "pS" DOUBLE,
+    "pN_pS" DOUBLE
+);
+
+CREATE TABLE IF NOT EXISTS gene_catalog (
+    gene_id UBIGINT PRIMARY KEY, gene VARCHAR NOT NULL, genome VARCHAR NOT NULL,
+    chrom VARCHAR NOT NULL, start BIGINT NOT NULL, "end" BIGINT NOT NULL,
+    length BIGINT NOT NULL, strand TINYINT NOT NULL, phase UTINYINT NOT NULL,
+    genetic_code UTINYINT NOT NULL, partial_5p BOOLEAN NOT NULL, partial_3p BOOLEAN NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reference_codons (
+    gene_id UBIGINT NOT NULL, codon_index UINTEGER NOT NULL, reference_codon VARCHAR NOT NULL
+);
+CREATE TABLE IF NOT EXISTS codon_counts (
+    sample_id VARCHAR NOT NULL, gene_id UBIGINT NOT NULL, codon_index UINTEGER NOT NULL,
+    codon VARCHAR NOT NULL, count UBIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS annotation_catalogs (
+    annotation_id VARCHAR PRIMARY KEY, reference_id VARCHAR NOT NULL, metadata_json VARCHAR NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sample_profile_metadata (
+    sample_id VARCHAR PRIMARY KEY, profile_schema VARCHAR NOT NULL,
+    profile_metadata_json VARCHAR NOT NULL, codon_metadata_json VARCHAR,
+    collect_codons BOOLEAN NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sylph_abundance (
@@ -211,6 +243,9 @@ class ProfileBundle:
     sylph_abundance_file: Path | None = None
     gene_stats_file: Path | None = None
     provenance_file: Path | None = None
+    gene_info_file: Path | None = None
+    reference_codons_file: Path | None = None
+    codon_counts_file: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -275,7 +310,7 @@ def connect(
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = duckdb.connect(str(path))
     try:
-        provenance.check_schema(conn)
+        provenance.check_schema(conn, writable=True)
         _apply_connection_settings(conn, memory_limit_gb=memory_limit_gb, threads=threads)
         init_schema(conn)
     except Exception:
@@ -347,7 +382,7 @@ def _apply_connection_settings(
 
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create and lightly migrate registry tables."""
-    provenance.check_schema(conn)
+    provenance.check_schema(conn, writable=True)
     had_legacy_matrix_profiles = _table_exists(conn, "matrix_store_profiles")
     conn.execute(SCHEMA_SQL)
     conn.execute("ALTER TABLE sra_runs ADD COLUMN IF NOT EXISTS status VARCHAR DEFAULT 'added'")
@@ -375,6 +410,11 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("ALTER TABLE genome_stats ADD COLUMN IF NOT EXISTS genome_taxonomy VARCHAR")
     conn.execute("ALTER TABLE gene_stats ADD COLUMN IF NOT EXISTS ref_ani DOUBLE")
     conn.execute("ALTER TABLE gene_stats ADD COLUMN IF NOT EXISTS length BIGINT")
+    for name, dtype in (
+        ("gene_id", "UBIGINT"), ("chrom", "VARCHAR"), ("start", "BIGINT"), ("end", "BIGINT"),
+        *[(name, "DOUBLE") for name in ("dN", "dS", "dN_dS", "pN", "pS", "pN_pS")],
+    ):
+        conn.execute(f'ALTER TABLE gene_stats ADD COLUMN IF NOT EXISTS "{name}" {dtype}')
     conn.execute("ALTER TABLE matrix_stores ADD COLUMN IF NOT EXISTS storage_layout VARCHAR DEFAULT 'dense'")
     conn.execute("ALTER TABLE matrix_stores ADD COLUMN IF NOT EXISTS min_coverage DOUBLE")
     conn.execute("ALTER TABLE matrix_stores ADD COLUMN IF NOT EXISTS min_breadth DOUBLE")
@@ -831,6 +871,10 @@ def _validate_profile_bundle(
         _require_existing_file(bundle.sylph_abundance_file, "sylph_abundance_file")
     if bundle.gene_stats_file is not None:
         _require_existing_file(bundle.gene_stats_file, "gene_stats_file")
+    for name in ("gene_info_file", "reference_codons_file", "codon_counts_file"):
+        value = getattr(bundle, name)
+        if value is not None:
+            _require_existing_file(value, name)
 
 
 def _import_profile_bundle_rows(
@@ -850,6 +894,8 @@ def _import_profile_bundle_rows(
     if existing is not None:
         _delete_existing_profile_rows(conn, sample_id=sample_id)
 
+    from metatrawl.v2_storage import import_evidence
+    import_evidence(conn, bundle)
     if storage.mode == allele_mask.PROFILE_STORAGE_ALLELE_MASK:
         allele_mask.store_profile_parquet(
             conn,
@@ -918,6 +964,8 @@ def _delete_existing_profile_rows(
     conn.execute("DELETE FROM genome_stats WHERE sample_id = ?", [sample_id])
     conn.execute("DELETE FROM gene_stats WHERE sample_id = ?", [sample_id])
     conn.execute("DELETE FROM sylph_abundance WHERE sample_id = ?", [sample_id])
+    conn.execute("DELETE FROM codon_counts WHERE sample_id = ?", [sample_id])
+    conn.execute("DELETE FROM sample_profile_metadata WHERE sample_id = ?", [sample_id])
 
 
 def _rollback_quietly(conn: duckdb.DuckDBPyConnection) -> None:
@@ -1731,12 +1779,20 @@ _GENE_STATS_FIELDS: tuple[tuple[str, list[str], str], ...] = (
     ("ber", ["ber", "BER"], "DOUBLE"),
     ("ref_ani", ["ref_ani", "reference_ani"], "DOUBLE"),
     ("length", ["length", "gene_length"], "BIGINT"),
+    ("gene_id", ["gene_id"], "UBIGINT"),
+    ("chrom", ["chrom"], "VARCHAR"),
+    ("start", ["start"], "BIGINT"),
+    ("end", ["end"], "BIGINT"),
+    *[(name, [name], "DOUBLE") for name in ("dN", "dS", "dN_dS", "pN", "pS", "pN_pS")],
 )
 
 
 def _polars_optional_expr(df: pl.DataFrame, names: list[str], sql_type: str) -> pl.Expr:
     if sql_type == "DOUBLE":
         return _optional_float_expr(df, names)
+    if sql_type == "UBIGINT":
+        name = _first_existing(df, names)
+        return pl.col(name).cast(pl.UInt64) if name else pl.lit(None, dtype=pl.UInt64)
     if sql_type == "BIGINT":
         return _optional_int_expr(df, names)
     return _optional_string_expr(df, names)
@@ -1794,7 +1850,11 @@ def _insert_gene_stats(conn: duckdb.DuckDBPyConnection, *, sample_id: str, stats
                 if genome_col is not None
                 else "CAST(NULL AS VARCHAR) AS genome"
             ),
-            f"CAST({_sql_identifier(gene_col)} AS VARCHAR) AS gene",
+            (
+                "COALESCE((SELECT gene FROM gene_catalog c WHERE c.gene_id = source.gene_id), "
+                "CAST(source.gene_id AS VARCHAR)) AS gene"
+                if gene_col == "gene_id" else f"CAST({_sql_identifier(gene_col)} AS VARCHAR) AS gene"
+            ),
         ] + [
             f"{_optional_sql_expr(schema, names, sql_type)} AS {_sql_identifier(column)}"
             for column, names, sql_type in _GENE_STATS_FIELDS
@@ -1802,7 +1862,7 @@ def _insert_gene_stats(conn: duckdb.DuckDBPyConnection, *, sample_id: str, stats
         conn.execute(
             f"""INSERT INTO gene_stats ({', '.join(_sql_identifier(c) for c in target_columns)})
                 SELECT {', '.join(selects)}
-                FROM read_parquet(?)""",
+                FROM read_parquet(?) AS source""",
             [sample_id, str(stats_file)],
         )
         return

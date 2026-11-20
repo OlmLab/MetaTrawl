@@ -5,17 +5,18 @@ NVIDIA CUDA comparison.
 
 | Image | PyTorch | Intended use |
 | --- | --- | --- |
-| `parsaghadermazi/metatrawl:1.4.1` | CPU | Profiling, matrix building, views, and CPU comparison |
+| `parsaghadermazi/metatrawl:2.0.0` | CPU | Profiling, matrix building, views, and CPU comparison |
 | `parsaghadermazi/metatrawl:latest` | CPU | Latest stable CPU image |
-| `parsaghadermazi/metatrawl:1.4.1-cuda` | CUDA 12.8 | The complete workflow with GPU comparison support |
+| `parsaghadermazi/metatrawl:2.0.0-cuda` | CUDA 12.8 | The complete workflow with GPU comparison support |
 
-All images include MetaTrawl, ZipStrain 1.3.0+, its native Rust profiler,
+The 2.0 images include MetaTrawl 2, ZipStrain 2.x, its native Rust profiler 0.2.x,
 Sylph, Bowtie2, bwa-mem3 0.14.0, Samtools, Prodigal, SRA Toolkit, NCBI Datasets,
 HDF5 support, and their Python dependencies. Python and Bowtie2 remain the
 defaults; installation does not change the selected profiling or alignment engine.
 
-Container builds use Polars 1.x, matching the tested Bioconda dependency range.
-This avoids Polars 2.0 CSV schema changes affecting BED files with extra columns.
+The Dockerfile follows
+ZipStrain 2's supported range (`>=1.36.1,<3`); matrix BED/STB readers use explicit
+column names rather than depending on a Polars-specific default numbering scheme.
 
 To select both native alternatives, add these options to `sync-profile`:
 
@@ -39,8 +40,8 @@ used for comparisons only when a CUDA comparison backend is selected.
 Pull and verify the stable image:
 
 ```bash
-docker pull parsaghadermazi/metatrawl:1.4.1
-docker run --rm parsaghadermazi/metatrawl:1.4.1 check
+docker pull parsaghadermazi/metatrawl:2.0.0
+docker run --rm parsaghadermazi/metatrawl:2.0.0 check
 ```
 
 MetaTrawl uses `/work` as its container working directory. Mount the project
@@ -51,7 +52,7 @@ the host account:
 docker run --rm \
   --user "$(id -u):$(id -g)" \
   -v "$PWD:/work" \
-  parsaghadermazi/metatrawl:1.4.1 \
+  parsaghadermazi/metatrawl:2.0.0 \
   init --db metatrawl.duckdb
 ```
 
@@ -67,11 +68,11 @@ macOS cannot pass an NVIDIA GPU into this Linux container.
 Pull the image and verify that PyTorch can see the GPU:
 
 ```bash
-docker pull parsaghadermazi/metatrawl:1.4.1-cuda
+docker pull parsaghadermazi/metatrawl:2.0.0-cuda
 
 docker run --rm --gpus all \
   --entrypoint python \
-  parsaghadermazi/metatrawl:1.4.1-cuda \
+  parsaghadermazi/metatrawl:2.0.0-cuda \
   -c 'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))'
 ```
 
@@ -81,7 +82,7 @@ Run one CUDA comparison while mounting the current project:
 docker run --rm --gpus all \
   --user "$(id -u):$(id -g)" \
   -v "$PWD:/work" \
-  parsaghadermazi/metatrawl:1.4.1-cuda \
+  parsaghadermazi/metatrawl:2.0.0-cuda \
   matrix compare \
   --db metatrawl.duckdb \
   --matrix-file matrices/GCF_000012825.1.h5 \
@@ -102,7 +103,7 @@ To select one GPU on a multi-GPU host:
 docker run --rm --gpus '"device=1"' \
   --user "$(id -u):$(id -g)" \
   -v "$PWD:/work" \
-  parsaghadermazi/metatrawl:1.4.1-cuda \
+  parsaghadermazi/metatrawl:2.0.0-cuda \
   matrix compare ... --backend torch-cuda
 ```
 
@@ -112,8 +113,8 @@ Clusters commonly expose containers through Apptainer rather than Docker. Pull
 the image once on a login node:
 
 ```bash
-apptainer pull metatrawl-1.4.1-cuda.sif \
-  docker://parsaghadermazi/metatrawl:1.4.1-cuda
+apptainer pull metatrawl-2.0.0-cuda.sif \
+  docker://parsaghadermazi/metatrawl:2.0.0-cuda
 ```
 
 Use `--nv` inside a GPU allocation and bind the project directory:
@@ -122,7 +123,7 @@ Use `--nv` inside a GPU allocation and bind the project directory:
 apptainer exec --nv \
   --bind "$PWD:/work" \
   --pwd /work \
-  metatrawl-1.4.1-cuda.sif \
+  metatrawl-2.0.0-cuda.sif \
   metatrawl matrix compare \
   --db metatrawl.duckdb \
   --matrix-file matrices/GCF_000012825.1.h5 \
@@ -137,14 +138,15 @@ apptainer exec --nv \
 Verify GPU access in the same allocation when diagnosing a cluster setup:
 
 ```bash
-apptainer exec --nv metatrawl-1.4.1-cuda.sif \
+apptainer exec --nv metatrawl-2.0.0-cuda.sif \
   python -c 'import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))'
 ```
 
 ## Build locally
 
-The MetaTrawl Dockerfile installs ZipStrain 1.3.0 or later in the 1.x
-series, with the `anchor` and `block` comparison kernels.
+The Dockerfile installs MetaTrawl 2 with ZipStrain 2.x and Rust profiler 0.2.x.
+Use a new schema-v2 project database. Keep the original 1.x image for further
+writes to schema-v1 projects; see [Schema v2](schema-v2.md).
 
 Build the CPU image from the repository root:
 

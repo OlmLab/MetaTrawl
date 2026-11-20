@@ -157,8 +157,8 @@ reference, gene, and STB content hashes are part of the resume checkpoint, so
 changing any input prevents reuse of BAM/profile checkpoints generated against
 the previous reference.
 
-MetaTrawl 1.1+ installs `zipstrain_rust_profiler` automatically alongside
-ZipStrain 1.3.0+. Add `--backend rust_profiler` to either `sync-profile` example
+MetaTrawl 2 installs `zipstrain_rust_profiler` 0.2.x automatically alongside
+ZipStrain 2.x. Add `--backend rust_profiler` to either `sync-profile` example
 above to use it. The worker environment must contain the same installation.
 Alternatively,
 set it in your workflow configuration:

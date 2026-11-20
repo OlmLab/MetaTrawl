@@ -1,6 +1,7 @@
 """Profiling backend selection belongs to execution, not scientific filters."""
 
 from dataclasses import replace
+import polars as pl
 import json
 from pathlib import Path
 import shlex
@@ -26,7 +27,7 @@ def test_backend_config_accepts_zipstrain_plugin_names(tmp_path, suffix, backend
     )
     config = load_workflow_config(config_file, threads=4, sample_count=2)
     assert config.profile.backend == backend
-    assert config.profile.min_freq == 0.0
+    assert config.profile.min_freq == 0.01
     assert config.matrix_compare.backend is None
 
 
@@ -131,7 +132,7 @@ def test_profile_backend_reaches_worker_command_and_manifest(tmp_path, monkeypat
     fasta.write_text(">chr\nACGT\n")
     genes.write_text(">chr_1 # 1 # 4 # 1 # ID=1\nACGT\n")
     stb.write_text("chr\tgenome\n")
-    for name in ("genomes_bed_file.bed", "gene_range_table.tsv", "null_model.parquet", "reference.fasta"):
+    for name in ("genomes_bed_file.bed", "gene_info.parquet", "reference_codons.parquet", "null_model.parquet", "reference.fasta"):
         (work / name).write_text("test-fixture")
     (work / "profiling_contract.json").write_text("{}")
     monkeypatch.setattr(workflows, "_validate_bam", lambda *args, **kwargs: None)
@@ -142,7 +143,7 @@ def test_profile_backend_reaches_worker_command_and_manifest(tmp_path, monkeypat
     def write_outputs(command):
         captured.append(command)
         for suffix in ("profile", "genome_stats", "gene_stats"):
-            (work / f"SRR1_{suffix}.parquet").write_text("fixture")
+            pl.DataFrame({"fixture": [1]}).write_parquet(work / f"SRR1_{suffix}.parquet")
 
     def runner(command, **kwargs):
         if command[0] == "sbatch":

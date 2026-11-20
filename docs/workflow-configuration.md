@@ -47,7 +47,7 @@ The configurable stages are `sra_download`, `sylph`, `genome_download`,
 
 The same file configures ZipStrain `profile-single` under
 `[profile]`: `backend`, `alignment_engine`, `min_mapq`, `min_baseq`, `min_freq`, `min_read_ani`, and
-`read_inclusion`. Matrix construction settings belong under `[matrix_build]`:
+`read_inclusion`, `collect_codons`, and `allele_integration`. Matrix construction settings belong under `[matrix_build]`:
 `storage_mode`, `count_dtype`, `min_cov`, `memory_limit_gb`, `export_batch_mb`,
 and `duckdb_export_threads`. New matrices use compact bitmask storage by default;
 choose count storage when `conani` or `cosani_<threshold>` is required. An
@@ -163,9 +163,11 @@ backend = "python"
 alignment_engine = "bowtie2"
 min_mapq = 0
 min_baseq = 13
-min_freq = 0.0
+min_freq = 0.01
 min_read_ani = 0.95
 read_inclusion = "paired"
+collect_codons = false
+allele_integration = "consensus" # or "weighted"
 
 [profile.null_model]
 # Optional overrides; omitted fields use installed ZipStrain defaults.
@@ -224,12 +226,12 @@ because the standard pipeline does not require any.
 Current ZipStrain profiling receives both `reference.fasta` and
 `profiling_contract.json`. This preserves reference-aware profile fields and
 enables `ref_ani` in imported genome and gene statistics. MetaTrawl follows the
-ZipStrain 1.x defaults of `min_freq = 0`, `min_read_ani = 0.95`, and
+ZipStrain 2 defaults of `min_freq = 0.01`, `min_read_ani = 0.95`, and
 `read_inclusion = "paired"`; set `min_read_ani = 0` to disable read-ANI
 filtering. Single-end inputs use all mapped reads.
 
-MetaTrawl installs the Rust profiler plugin automatically. MetaTrawl 1.4.0
-requires ZipStrain 1.3.0 or later in the 1.x series. Use the same MetaTrawl
+MetaTrawl installs the Rust profiler plugin automatically. MetaTrawl 2.x
+requires ZipStrain 2.x and Rust profiler 0.2.x. Use the same MetaTrawl
 installation for the `profile` stage, including Slurm workers.
 Set `[profile].backend = "rust_profiler"`, or pass
 `--backend rust_profiler` to `metatrawl sync-profile` or `metatrawl profile-sra`.
@@ -255,7 +257,7 @@ p_threshold = 0.000001
 model_type = "poisson"
 ```
 
-These example values match ZipStrain 1.3.0. Omit any field to inherit its value
+These example values match ZipStrain 2.0.0. Omit any field to inherit its value
 from the installed ZipStrain version. `error_rate` and `p_threshold` must be
 finite and strictly between 0 and 1; `max_total_reads` is a positive integer
 coverage ceiling, not a limit on total reads in a sample. Only `poisson` is
@@ -293,8 +295,35 @@ count matrices. Requests for `all`, `max_identical_stretch`, `gene_ani`, or
 cosANI with `block` are rejected before dispatch, never silently downgraded.
 ZipStrain's block kernel ignores anchor/target queue sizes, transfer batches,
 and loader/writer executors; backend and memory controls still apply.
-Legacy metric names (`ani`, `ibs`, `gene`) still work. The renamed options do
-not change the matrix format or the comparison database's resume contract.
+Legacy metric names (`ani`, `ibs`, `gene`) still map to the current matrix
+metrics. `all` here means genome ANI, gene ANI, and max identical stretch;
+it never enables pairwise selection. Pairwise dN/dS and pN/pS are available
+only through the Python API, not `matrix compare` or `matrix sync-compare`.
+Do not resume comparisons created by older ZipStrain generations with a new
+generation; keep those jobs on their original installation.
+
+### Codon evidence and reference-relative selection
+
+```toml
+[profile]
+collect_codons = true
+allele_integration = "consensus"
+```
+
+`collect_codons` defaults to `false`, matching ZipStrain. When enabled,
+ZipStrain computes reference-relative gene dN/dS and pN/pS and retains
+read-phased observed codon counts. MetaTrawl imports both the statistics and
+the counts before deleting the published bundle. This also works with
+allele-mask storage: codon evidence is independent of positional count storage.
+It increases storage and profiling work, so enable it only when needed.
+No codons are reconstructed from allele masks or marginal A/C/G/T counts.
+
+`allele_integration` selects `consensus` or `weighted` for the reference-relative
+statistics; its default is `consensus`. Both settings are part of the scientific
+contract. `sync-profile` and `profile-sra` also accept
+`--collect-codons` / `--no-collect-codons` and
+`--allele-integration consensus|weighted`, overriding the matching config fields.
+With collection disabled, selection fields are null, not zero.
 
 ### Alignment engines
 
@@ -334,9 +363,12 @@ and registering a class under the `metatrawl.alignment_engines` entry-point grou
 Adapters define index commands/sidecars, SAM commands, and scientific settings;
 MetaTrawl keeps execution and BAM handoff independent of the chosen tool.
 
-MetaTrawl preserves expanded ZipStrain 1.x statistics in DuckDB. Genome
+MetaTrawl preserves ZipStrain 2 statistics in DuckDB. Genome
 queries include coverage median and standard deviation, genome length, gap
 statistics, 5x covered sites, heterogeneity, FUG, mapped reads, population and
 consensus reference ANI, SNS/SNV counts, presence, and taxonomy when present in
-the imported output. Gene queries also retain gene length. Older MetaTrawl
-databases are migrated in place the next time a writable command opens them.
+the imported output. Gene queries retain the UInt64 gene ID, gene name,
+scaffold coordinates, gene length, reference ANI, and selection fields.
+Gene annotations live in a shared catalog, not in every position row.
+Schema-v1 databases remain readable but are not writable with MetaTrawl 2.
+See [Schema v2](schema-v2.md) before upgrading an existing project.

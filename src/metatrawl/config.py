@@ -134,12 +134,20 @@ class NullModelConfig:
 class ProfileConfig:
     min_mapq: int = 0
     min_baseq: int = 13
-    min_freq: float = 0.0
+    min_freq: float = 0.01
     min_read_ani: float | None = 0.95
     read_inclusion: str = "paired"
     backend: str = "python"
     alignment_engine: str = "bowtie2"
+    collect_codons: bool = False
+    allele_integration: str = "consensus"
     null_model: NullModelConfig = field(default_factory=NullModelConfig)
+
+    def __post_init__(self) -> None:
+        if type(self.collect_codons) is not bool:
+            raise ValueError("profile.collect_codons must be true or false")
+        if self.allele_integration not in ("consensus", "weighted"):
+            raise ValueError("profile.allele_integration must be consensus or weighted")
 
 
 def normalize_profile_backend(value: Any) -> str:
@@ -286,6 +294,8 @@ def _parse(raw: dict[str, Any], *, threads: int, sample_count: int) -> WorkflowC
         read_inclusion=read_inclusion,
         backend=normalize_profile_backend(profile.get("backend", ProfileConfig.backend)),
         alignment_engine=get_alignment_engine(profile.get("alignment_engine", ProfileConfig.alignment_engine)).name,
+        collect_codons=profile.get("collect_codons", False),
+        allele_integration=str(profile.get("allele_integration", "consensus")),
         null_model=NullModelConfig(**null_model),
     ), profile_import=ProfileImportConfig(
         queue_max_samples=_positive(

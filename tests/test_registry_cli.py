@@ -482,6 +482,8 @@ def test_first_profile_import_is_append_only_and_replacement_deletes_old_rows(
             "genome_stats",
             "gene_stats",
             "sylph_abundance",
+            "codon_counts",
+            "sample_profile_metadata",
         }
         assert conn.execute(
             "SELECT count(*) FROM profile_positions WHERE sample_id = 'SRR1'"
@@ -1569,7 +1571,8 @@ def test_fixed_reference_assets_and_bowtie_index_are_prepared_once(tmp_path: Pat
                 output.mkdir(parents=True)
                 (output / "reference.fasta").write_text(reference.read_text())
                 (output / "genomes_bed_file.bed").write_text("contig\t1\t4\n")
-                (output / "gene_range_table.tsv").write_text("contig_1\tcontig\t1\t4\n")
+                (output / "gene_info.parquet").write_text("contig_1\tcontig\t1\t4\n")
+                (output / "reference_codons.parquet").write_text("contig_1\tcontig\t1\t4\n")
                 (output / "null_model.parquet").write_text("null")
                 (output / "profiling_contract.json").write_text("{}")
             elif cmd[:2] == ["samtools", "faidx"]:
@@ -1751,14 +1754,15 @@ def test_alignment_and_profile_stage_publishes_outputs(tmp_path: Path, monkeypat
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "reference.fasta").write_text(">contig\nACGT\n")
             (output_dir / "genomes_bed_file.bed").write_text("contig\t1\t4\n")
-            (output_dir / "gene_range_table.tsv").write_text("gene\tcontig\t1\t2\n")
+            (output_dir / "gene_info.parquet").write_text("gene\tcontig\t1\t2\n")
+            (output_dir / "reference_codons.parquet").write_text("gene\tcontig\t1\t2\n")
             (output_dir / "null_model.parquet").write_text("null")
             (output_dir / "profiling_contract.json").write_text("{}")
         if cmd[:2] == ["samtools", "faidx"]:
             Path(str(cmd[2]) + ".fai").write_text("contig\t4\t8\t4\t5\n")
         if cmd[:3] == ["zipstrain", "utilities", "profile-single"]:
             output_dir = Path(cmd[cmd.index("--output-dir") + 1])
-            (output_dir / "SRR1_profile.parquet").write_text("profile")
+            pl.DataFrame({"fixture": [1]}).write_parquet(output_dir / "SRR1_profile.parquet")
             (output_dir / "SRR1_genome_stats.parquet").write_text("genome")
             (output_dir / "SRR1_gene_stats.parquet").write_text("gene")
 
@@ -1804,7 +1808,7 @@ def test_alignment_and_profile_stage_publishes_outputs(tmp_path: Path, monkeypat
     assert shell_calls
     assert "bowtie2 -x" in shell_calls[0]
     assert "samtools sort" in shell_calls[0]
-    assert (tmp_path / "outputs" / "SRR1.profile.parquet").read_text() == "profile"
+    assert pl.read_parquet(tmp_path / "outputs" / "SRR1.profile.parquet")["fixture"][0] == 1
     assert (tmp_path / "outputs" / "SRR1.genome_stats.parquet").read_text() == "genome"
     assert (tmp_path / "outputs" / "SRR1.gene_stats.parquet").read_text() == "gene"
     assert (tmp_path / "outputs" / ".SRR1.bundle.ready").exists()
@@ -1836,7 +1840,8 @@ def test_alignment_profile_builds_null_model_when_prepare_does_not(tmp_path: Pat
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "reference.fasta").write_text(">contig\nACGT\n")
             (output_dir / "genomes_bed_file.bed").write_text("contig\t1\t4\n")
-            (output_dir / "gene_range_table.tsv").write_text("gene\tcontig\t1\t2\n")
+            (output_dir / "gene_info.parquet").write_text("gene\tcontig\t1\t2\n")
+            (output_dir / "reference_codons.parquet").write_text("gene\tcontig\t1\t2\n")
             (output_dir / "profiling_contract.json").write_text("{}")
         if cmd[:3] == ["zipstrain", "utilities", "build-null-model"]:
             Path(cmd[cmd.index("--output-file") + 1]).write_text("null")
@@ -1844,7 +1849,7 @@ def test_alignment_profile_builds_null_model_when_prepare_does_not(tmp_path: Pat
             Path(str(cmd[2]) + ".fai").write_text("contig\t4\t8\t4\t5\n")
         if cmd[:3] == ["zipstrain", "utilities", "profile-single"]:
             output_dir = Path(cmd[cmd.index("--output-dir") + 1])
-            (output_dir / "SRR1_profile.parquet").write_text("profile")
+            pl.DataFrame({"fixture": [1]}).write_parquet(output_dir / "SRR1_profile.parquet")
             (output_dir / "SRR1_genome_stats.parquet").write_text("genome")
             (output_dir / "SRR1_gene_stats.parquet").write_text("gene")
 
@@ -1901,7 +1906,7 @@ def test_profile_failure_keeps_validated_bam_after_releasing_reads(
             profile_work = Path(cmd[cmd.index("--output-dir") + 1])
             (profile_work / "reference.fasta").write_text(">contig\nACGT\n")
             (profile_work / "genomes_bed_file.bed").write_text("contig\t1\t4\n")
-            (profile_work / "gene_range_table.tsv").write_text("gene\tcontig\t1\t2\n")
+            (profile_work / "gene_info.parquet").write_text("gene\tcontig\t1\t2\n")
             (profile_work / "profiling_contract.json").write_text("{}")
         elif cmd[:3] == ["zipstrain", "utilities", "build-null-model"]:
             Path(cmd[cmd.index("--output-file") + 1]).write_text("null")
@@ -2459,7 +2464,7 @@ def test_direct_matrix_store_is_consumed_by_zipstrain_v1_compare(tmp_path: Path)
     matrix_pairs.matrix_compare(
         matrix_db_file=matrix_file,
         output_file=compare_file,
-        calculate="ani",
+        calculate="genome_ani",
         backend="numpy",
         min_cov=5,
     )
@@ -2501,7 +2506,7 @@ def test_direct_count_matrix_supports_conani_compare(tmp_path: Path) -> None:
     matrix_pairs.matrix_compare(
         matrix_db_file=matrix_file,
         output_file=compare_file,
-        calculate="ani",
+        calculate="genome_ani",
         ani_method="conani",
         backend="numpy",
     )
@@ -2685,7 +2690,7 @@ def test_matrix_compare_uses_registered_matrix_store(tmp_path: Path, monkeypatch
     assert result.exit_code == 0, result.output
     assert "compare_id=compare" in result.output
     assert calls[0]["matrix_db_file"] == matrix_file
-    assert calls[0]["calculate"] == "ani+gene"
+    assert calls[0]["calculate"] == "genome_ani+gene_ani"
     assert calls[0]["genome"] == "genome_scope"
     assert calls[0]["backend"] == "mps"
     assert calls[0]["min_cov"] == 7

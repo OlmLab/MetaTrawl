@@ -228,7 +228,7 @@ def test_fixed_reference_cache_and_commands_include_null_settings(tmp_path):
             calls.append(command)
             if command[:3] == ["zipstrain", "utilities", "prepare_profiling"]:
                 directory = Path(command[command.index("--output-dir") + 1]); directory.mkdir()
-                for name in ("reference.fasta", "genomes_bed_file.bed", "gene_range_table.tsv", "null_model.parquet"):
+                for name in ("reference.fasta", "genomes_bed_file.bed", "gene_info.parquet", "reference_codons.parquet", "null_model.parquet"):
                     (directory / name).write_text("fixture")
                 (directory / "profiling_contract.json").write_text("{}")
             elif command[:2] == ["samtools", "faidx"]:

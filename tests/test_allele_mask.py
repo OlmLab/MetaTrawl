@@ -197,7 +197,7 @@ def _compare_results(path: Path) -> tuple[list[tuple], list[tuple]]:
         genome_rows = conn.execute(
             """
             SELECT sample_1, sample_2, genome, total_positions,
-                   share_allele_pos, genome_ani, max_consecutive_length
+                   share_allele_pos, genome_ani, max_identical_stretch
             FROM matrix_compare_results
             ORDER BY sample_idx_1, sample_idx_2, genome_idx
             """

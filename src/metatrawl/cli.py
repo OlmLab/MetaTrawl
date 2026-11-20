@@ -194,6 +194,9 @@ def profiles_remaining(db_file: Path, output_file: Path | None) -> None:
 
 
 @profiles_group.command("import")
+@click.option("--gene-info-file", type=click.Path(path_type=Path), help="V2 gene_info.parquet catalog.")
+@click.option("--reference-codons-file", type=click.Path(path_type=Path), help="Matching V2 reference_codons.parquet.")
+@click.option("--codon-counts-file", type=click.Path(path_type=Path), help="Optional observed read-phased codons.")
 @click.option("--allow-incompatible-profiles", is_flag=True, help="Acknowledge and record unknown or mismatched profiling provenance.")
 @click.option("--provenance-file", type=click.Path(exists=True, path_type=Path), help="Bundle provenance JSON; otherwise discovered beside the profile.")
 @click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
@@ -219,6 +222,9 @@ def profiles_import(
     add_run: bool,
     allow_incompatible_profiles: bool,
     provenance_file: Path | None,
+    gene_info_file: Path | None,
+    reference_codons_file: Path | None,
+    codon_counts_file: Path | None,
 ) -> None:
     """Import profile rows, stats, and Sylph abundance into DuckDB."""
     bundle = registry.ProfileBundle(
@@ -228,6 +234,9 @@ def profiles_import(
         gene_stats_file=gene_stats_file,
         sylph_abundance_file=sylph_abundance_file,
         provenance_file=provenance_file,
+        gene_info_file=gene_info_file,
+        reference_codons_file=reference_codons_file,
+        codon_counts_file=codon_counts_file,
     )
     try:
         with registry.connect(db_file) as conn:
@@ -519,8 +528,22 @@ def _override_null_model(config, error_rate, max_total_reads, p_threshold, model
     return replace(config, profile=replace(config.profile, null_model=replace(config.profile.null_model, **overrides)))
 
 
+def _selection_cli_options(command):
+    command = click.option("--collect-codons/--no-collect-codons", default=None,
+                           help="Retain read-phased codons and reference gene selection statistics. Overrides TOML.")(command)
+    return click.option("--allele-integration", type=click.Choice(["consensus", "weighted"]), default=None,
+                        help="Selection allele integration; overrides TOML.")(command)
+
+
+def _override_selection(config, collect_codons, allele_integration):
+    values = {key: value for key, value in
+              (("collect_codons", collect_codons), ("allele_integration", allele_integration)) if value is not None}
+    return replace(config, profile=replace(config.profile, **values))
+
+
 @cli.command("profile-sra")
 @_null_model_cli_options
+@_selection_cli_options
 @click.option("--alignment-engine", default=None, help="Alignment engine: bowtie2 (default), bwa-mem3, or an installed adapter. Overrides [profile].alignment_engine.")
 @click.option("--backend", default=None, help="Profiling backend: python or an installed ZipStrain plugin such as rust_profiler. Overrides [profile].backend.")
 @click.option("--allow-incompatible-profiles", is_flag=True, help="Acknowledge unknown legacy scratch checkpoints; recorded in bundle provenance.")
@@ -556,11 +579,14 @@ def profile_sra(
     null_model_max_total_reads: int | None,
     null_model_p_threshold: float | None,
     null_model_type: str | None,
+    collect_codons: bool | None,
+    allele_integration: str | None,
 ) -> None:
     """Run the local SRA profiling lifecycle with scratch cleanup."""
     run_ids = _read_remaining_csv(remaining_csv)
     try:
         execution_config = load_workflow_config(workflow_config, threads=threads, sample_count=len(run_ids))
+        execution_config = _override_selection(execution_config, collect_codons, allele_integration)
         execution_config = _override_null_model(
             execution_config, null_model_error_rate, null_model_max_total_reads,
             null_model_p_threshold, null_model_type,
@@ -600,6 +626,7 @@ def profile_sra(
 
 @cli.command("sync-profile")
 @_null_model_cli_options
+@_selection_cli_options
 @click.option("--alignment-engine", default=None, help="Alignment engine: bowtie2 (default), bwa-mem3, or an installed adapter. Overrides [profile].alignment_engine.")
 @click.option("--backend", default=None, help="Profiling backend: python or an installed ZipStrain plugin such as rust_profiler. Overrides [profile].backend.")
 @click.option("--allow-incompatible-profiles", is_flag=True, help="Acknowledge and record unknown or mismatched profiling provenance.")
@@ -637,12 +664,15 @@ def sync_profile(
     null_model_max_total_reads: int | None,
     null_model_p_threshold: float | None,
     null_model_type: str | None,
+    collect_codons: bool | None,
+    allele_integration: str | None,
 ) -> None:
     """Profile all remaining runs and import completed outputs into DuckDB."""
     try:
         with registry.connect(db_file) as conn:
             remaining_count = len(registry.remaining_runs(conn))
         execution_config = load_workflow_config(workflow_config, threads=threads, sample_count=remaining_count)
+        execution_config = _override_selection(execution_config, collect_codons, allele_integration)
         execution_config = _override_null_model(
             execution_config, null_model_error_rate, null_model_max_total_reads,
             null_model_p_threshold, null_model_type,
@@ -1917,6 +1947,9 @@ def _read_profile_manifest(manifest: Path) -> list[registry.ProfileBundle]:
                 gene_stats_file=Path(row["gene_stats_file"]) if row.get("gene_stats_file") else None,
                 sylph_abundance_file=Path(row["sylph_abundance_file"]),
                 provenance_file=Path(row["provenance_file"]) if row.get("provenance_file") else None,
+                gene_info_file=Path(row["gene_info_file"]) if row.get("gene_info_file") else None,
+                reference_codons_file=Path(row["reference_codons_file"]) if row.get("reference_codons_file") else None,
+                codon_counts_file=Path(row["codon_counts_file"]) if row.get("codon_counts_file") else None,
             )
             for row in reader
         ]

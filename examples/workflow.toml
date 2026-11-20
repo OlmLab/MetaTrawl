@@ -56,9 +56,11 @@ execution = "local"
 [profile]
 min_mapq = 0
 min_baseq = 13
-min_freq = 0.0
+min_freq = 0.01
 min_read_ani = 0.95
 read_inclusion = "paired"
+collect_codons = false
+allele_integration = "consensus"
 
 [profile.null_model]
 # Omit fields to inherit the installed ZipStrain defaults.
