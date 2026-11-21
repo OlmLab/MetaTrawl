@@ -10,7 +10,7 @@ def csv_column_base(monkeypatch, request):
 
     def scan_with_default_names(*args, **kwargs):
         frame = scan_csv(*args, **kwargs)
-        if kwargs.get("new_columns") is None:
+        if kwargs.get("new_columns") is None and kwargs.get("with_column_names") is None:
             columns = frame.collect_schema().names()
             frame = frame.rename(
                 {name: f"column_{request.param + idx}" for idx, name in enumerate(columns)}

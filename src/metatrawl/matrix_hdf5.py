@@ -1450,7 +1450,8 @@ def _collect_scaffold_specs_from_bed_and_stb(*, bed_file: Path, stb_file: Path, 
         raise FileNotFoundError(f"STB file does not exist: {stb_path}")
     bed_spans = (
         pl.scan_csv(
-            bed_path, separator="\t", has_header=False, new_columns=["chrom", "start", "end"]
+            bed_path, separator="\t", has_header=False,
+            with_column_names=lambda columns: ["chrom", "start", "end", *columns[3:]],
         )
         .select(
             pl.col("chrom").cast(pl.Utf8),

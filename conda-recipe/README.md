@@ -4,14 +4,14 @@ MetaTrawl already has a recipe in
 [`bioconda/bioconda-recipes`](https://github.com/bioconda/bioconda-recipes/tree/master/recipes/metatrawl).
 Update that recipe for each PyPI release rather than adding a second package.
 
-## MetaTrawl 2.0.0
+## MetaTrawl 2.0.1
 
 | Field | Value |
 | --- | --- |
-| Version | `2.0.0` |
+| Version | `2.0.1` |
 | Build number | `0` |
-| PyPI sdist | `metatrawl-2.0.0.tar.gz` |
-| SHA256 | `37b595aa3a9670da31d7dc7a9fd6cb23b29ba4270c33e26e650e1a3e9f3f0b05` |
+| PyPI sdist | `metatrawl-2.0.1.tar.gz` |
+| SHA256 | `10e2fba72ece6954342d9bf53c85f883593aa809546aff89c86e45063140e6b6` |
 
 The runtime requirements must include ZipStrain `>=2.0.0,<3`, its native
 Rust profiler `>=0.2.0,<0.3`, and Polars `>=1.36.1,<3`. Preserve these bounds
@@ -32,7 +32,7 @@ the plugin's current packaging is maintained with ZipStrain and upstream Biocond
 Use the hash published by PyPI, not the hash of a later rebuilt archive:
 
 ```bash
-curl -fsSL https://pypi.org/pypi/metatrawl/2.0.0/json |
+curl -fsSL https://pypi.org/pypi/metatrawl/2.0.1/json |
   python -c 'import json,sys; d=json.load(sys.stdin); print(next(x["digests"]["sha256"] for x in d["urls"] if x["packagetype"] == "sdist"))'
 ```
 
@@ -57,7 +57,7 @@ Bioinformatics tools remain Conda runtime dependencies; bwa-mem3 stays optional.
 After the dependencies and MetaTrawl recipe have been published:
 
 ```bash
-conda create -n metatrawl-2 -c conda-forge -c bioconda metatrawl=2.0.0
+conda create -n metatrawl-2 -c conda-forge -c bioconda metatrawl=2.0.1
 conda activate metatrawl-2
 metatrawl check
 ```

@@ -48,46 +48,47 @@ def import_evidence(conn, bundle) -> None:
                     raise ValueError(f"sample={bundle.run_id} selection statistics require the retained codon-count table")
             if utils.sha256_file(reference) != expected.get("zipstrain_reference_codons_sha256"):
                 raise ValueError("Reference codon contents do not match the gene catalog")
-            genes = gi.read_gene_info(catalog)
-            conn.register("_v2_genes", genes)
-            try:
-                if bundle.gene_stats_file is not None:
-                    if conn.execute("""
-                        SELECT EXISTS(
-                            SELECT 1 FROM read_parquet(?) s LEFT JOIN _v2_genes g USING(gene_id)
-                            WHERE g.gene_id IS NULL OR s.genome IS DISTINCT FROM g.genome
-                                OR s.chrom IS DISTINCT FROM g.chrom OR s.start IS DISTINCT FROM g.start
-                                OR s.end IS DISTINCT FROM g.end OR s.length IS DISTINCT FROM g.length
-                        )
-                    """, [str(bundle.gene_stats_file)]).fetchone()[0]:
-                        raise ValueError(f"sample={bundle.run_id} gene statistics do not match the gene catalog")
-                columns = list(gi.GENE_SCHEMA)
-                # Compare definitions, not only IDs; a collision must never merge annotations.
-                tests = " OR ".join(f'c."{name}" IS DISTINCT FROM n."{name}"' for name in columns if name != "gene_id")
-                if conn.execute(f"""
-                    SELECT EXISTS(SELECT 1 FROM gene_catalog c JOIN _v2_genes n USING(gene_id)
-                    WHERE {tests})
-                """).fetchone()[0]:
-                    raise ValueError("Gene ID collision or incompatible gene catalog")
-                conn.execute("""
-                    CREATE OR REPLACE TEMP TABLE _v2_new_gene_ids AS
-                    SELECT gene_id FROM _v2_genes n
-                    WHERE NOT EXISTS (SELECT 1 FROM gene_catalog c WHERE c.gene_id=n.gene_id)
-                """)
-                conn.execute("""
-                    INSERT INTO reference_codons
-                    SELECT r.gene_id, r.codon_index, r.reference_codon FROM read_parquet(?) r
-                    JOIN _v2_new_gene_ids n USING (gene_id)
-                """, [str(reference)])
-                quoted = ", ".join(f'"{name}"' for name in columns)
-                conn.execute(f"""
-                    INSERT INTO gene_catalog ({quoted})
-                    SELECT {quoted} FROM _v2_genes
-                    WHERE gene_id IN (SELECT gene_id FROM _v2_new_gene_ids)
-                """)
-            finally:
-                conn.unregister("_v2_genes")
-                conn.execute("DROP TABLE IF EXISTS _v2_new_gene_ids")
+            columns = list(gi.GENE_SCHEMA)
+            quoted = ", ".join(f'"{name}"' for name in columns)
+            # The catalog was authenticated above. A native Parquet scan avoids
+            # signed-integer coercion in Arrow filter pushdown for UInt64 IDs.
+            conn.execute(f"""
+                CREATE OR REPLACE TEMP TABLE _v2_genes AS
+                SELECT {quoted} FROM read_parquet(?)
+            """, [str(catalog)])
+            if bundle.gene_stats_file is not None:
+                if conn.execute("""
+                    SELECT EXISTS(
+                        SELECT 1 FROM read_parquet(?) s LEFT JOIN _v2_genes g USING(gene_id)
+                        WHERE g.gene_id IS NULL OR s.genome IS DISTINCT FROM g.genome
+                            OR s.chrom IS DISTINCT FROM g.chrom OR s.start IS DISTINCT FROM g.start
+                            OR s.end IS DISTINCT FROM g.end OR s.length IS DISTINCT FROM g.length
+                    )
+                """, [str(bundle.gene_stats_file)]).fetchone()[0]:
+                    raise ValueError(f"sample={bundle.run_id} gene statistics do not match the gene catalog")
+            tests = " OR ".join(f'c."{name}" IS DISTINCT FROM n."{name}"' for name in columns if name != "gene_id")
+            if conn.execute(f"""
+                SELECT EXISTS(SELECT 1 FROM gene_catalog c JOIN _v2_genes n USING(gene_id)
+                WHERE {tests})
+            """).fetchone()[0]:
+                raise ValueError("Gene ID collision or incompatible gene catalog")
+            conn.execute("""
+                CREATE OR REPLACE TEMP TABLE _v2_new_gene_ids AS
+                SELECT gene_id FROM _v2_genes n
+                WHERE NOT EXISTS (SELECT 1 FROM gene_catalog c WHERE c.gene_id=n.gene_id)
+            """)
+            conn.execute("""
+                INSERT INTO reference_codons
+                SELECT r.gene_id, r.codon_index, r.reference_codon FROM read_parquet(?) r
+                JOIN _v2_new_gene_ids n USING (gene_id)
+            """, [str(reference)])
+            conn.execute(f"""
+                INSERT INTO gene_catalog ({quoted})
+                SELECT {quoted} FROM _v2_genes
+                WHERE gene_id IN (SELECT gene_id FROM _v2_new_gene_ids)
+            """)
+            conn.execute("DROP TABLE IF EXISTS _v2_new_gene_ids")
+            conn.execute("DROP TABLE _v2_genes")
             conn.execute("INSERT OR IGNORE INTO annotation_catalogs VALUES (?, ?, ?)",
                          [expected[gi.ANNOTATION_ID], expected[gi.REFERENCE_ID], json.dumps(expected, sort_keys=True)])
             if bundle.codon_counts_file is not None:

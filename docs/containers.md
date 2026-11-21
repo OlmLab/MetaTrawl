@@ -5,9 +5,9 @@ NVIDIA CUDA comparison.
 
 | Image | PyTorch | Intended use |
 | --- | --- | --- |
-| `parsaghadermazi/metatrawl:2.0.0` | CPU | Profiling, matrix building, views, and CPU comparison |
+| `parsaghadermazi/metatrawl:2.0.1` | CPU | Profiling, matrix building, views, and CPU comparison |
 | `parsaghadermazi/metatrawl:latest` | CPU | Latest stable CPU image |
-| `parsaghadermazi/metatrawl:2.0.0-cuda` | CUDA 12.8 | The complete workflow with GPU comparison support |
+| `parsaghadermazi/metatrawl:2.0.1-cuda` | CUDA 12.8 | The complete workflow with GPU comparison support |
 
 The 2.0 images include MetaTrawl 2, ZipStrain 2.x, its native Rust profiler 0.2.x,
 Sylph, Bowtie2, bwa-mem3 0.14.0, Samtools, Prodigal, SRA Toolkit, NCBI Datasets,
@@ -40,8 +40,8 @@ used for comparisons only when a CUDA comparison backend is selected.
 Pull and verify the stable image:
 
 ```bash
-docker pull parsaghadermazi/metatrawl:2.0.0
-docker run --rm parsaghadermazi/metatrawl:2.0.0 check
+docker pull parsaghadermazi/metatrawl:2.0.1
+docker run --rm parsaghadermazi/metatrawl:2.0.1 check
 ```
 
 MetaTrawl uses `/work` as its container working directory. Mount the project
@@ -52,7 +52,7 @@ the host account:
 docker run --rm \
   --user "$(id -u):$(id -g)" \
   -v "$PWD:/work" \
-  parsaghadermazi/metatrawl:2.0.0 \
+  parsaghadermazi/metatrawl:2.0.1 \
   init --db metatrawl.duckdb
 ```
 
@@ -68,11 +68,11 @@ macOS cannot pass an NVIDIA GPU into this Linux container.
 Pull the image and verify that PyTorch can see the GPU:
 
 ```bash
-docker pull parsaghadermazi/metatrawl:2.0.0-cuda
+docker pull parsaghadermazi/metatrawl:2.0.1-cuda
 
 docker run --rm --gpus all \
   --entrypoint python \
-  parsaghadermazi/metatrawl:2.0.0-cuda \
+  parsaghadermazi/metatrawl:2.0.1-cuda \
   -c 'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))'
 ```
 
@@ -82,7 +82,7 @@ Run one CUDA comparison while mounting the current project:
 docker run --rm --gpus all \
   --user "$(id -u):$(id -g)" \
   -v "$PWD:/work" \
-  parsaghadermazi/metatrawl:2.0.0-cuda \
+  parsaghadermazi/metatrawl:2.0.1-cuda \
   matrix compare \
   --db metatrawl.duckdb \
   --matrix-file matrices/GCF_000012825.1.h5 \
@@ -103,7 +103,7 @@ To select one GPU on a multi-GPU host:
 docker run --rm --gpus '"device=1"' \
   --user "$(id -u):$(id -g)" \
   -v "$PWD:/work" \
-  parsaghadermazi/metatrawl:2.0.0-cuda \
+  parsaghadermazi/metatrawl:2.0.1-cuda \
   matrix compare ... --backend torch-cuda
 ```
 
@@ -113,8 +113,8 @@ Clusters commonly expose containers through Apptainer rather than Docker. Pull
 the image once on a login node:
 
 ```bash
-apptainer pull metatrawl-2.0.0-cuda.sif \
-  docker://parsaghadermazi/metatrawl:2.0.0-cuda
+apptainer pull metatrawl-2.0.1-cuda.sif \
+  docker://parsaghadermazi/metatrawl:2.0.1-cuda
 ```
 
 Use `--nv` inside a GPU allocation and bind the project directory:
@@ -123,7 +123,7 @@ Use `--nv` inside a GPU allocation and bind the project directory:
 apptainer exec --nv \
   --bind "$PWD:/work" \
   --pwd /work \
-  metatrawl-2.0.0-cuda.sif \
+  metatrawl-2.0.1-cuda.sif \
   metatrawl matrix compare \
   --db metatrawl.duckdb \
   --matrix-file matrices/GCF_000012825.1.h5 \
@@ -138,7 +138,7 @@ apptainer exec --nv \
 Verify GPU access in the same allocation when diagnosing a cluster setup:
 
 ```bash
-apptainer exec --nv metatrawl-2.0.0-cuda.sif \
+apptainer exec --nv metatrawl-2.0.1-cuda.sif \
   python -c 'import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))'
 ```
 

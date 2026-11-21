@@ -387,3 +387,22 @@ def test_invalid_gene_stats_roll_back(tmp_path, v2_inputs):
             db.import_profile_bundle(conn, bundle, add_run_if_missing=True)
         assert conn.execute("SELECT count(*) FROM gene_catalog").fetchone() == (0,)
         assert conn.execute("SELECT count(*) FROM samples").fetchone() == (0,)
+
+
+def test_gene_catalog_import_preserves_unsigned_ids_without_arrow_pushdown(tmp_path, v2_inputs):
+    bundle = make_bundle(tmp_path, v2_inputs, "S1")
+    genes = gi.read_gene_info(bundle.gene_info_file)
+    assert genes["gene_id"].max() > 2**63 - 1
+    with db.connect(tmp_path/"project.duckdb") as conn:
+        class Connection:
+            def __getattr__(self, name):
+                return getattr(conn, name)
+
+            def register(self, name, value):
+                if name == "_v2_genes":
+                    raise AssertionError("Gene catalogs must use DuckDB's native Parquet reader")
+                return conn.register(name, value)
+
+        db.import_profile_bundle(Connection(), bundle, add_run_if_missing=True)
+        stored = conn.execute("SELECT gene_id FROM gene_catalog ORDER BY gene_id").pl()
+        assert_frame_equal(stored, genes.select("gene_id").sort("gene_id"))

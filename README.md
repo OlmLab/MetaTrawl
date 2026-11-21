@@ -82,7 +82,7 @@ recipes. Until those are available, use PyPI or the containers for version 2;
 an unconstrained Conda install may still select MetaTrawl 1.x.
 
 ```bash
-conda create -n metatrawl -c conda-forge -c bioconda metatrawl=2.0.0
+conda create -n metatrawl -c conda-forge -c bioconda metatrawl=2.0.1
 conda activate metatrawl
 metatrawl check
 ```
@@ -90,7 +90,7 @@ metatrawl check
 ### PyPI
 
 ```bash
-pip install "metatrawl==2.0.0"
+pip install "metatrawl==2.0.1"
 ```
 
 The PyPI package installs Python dependencies. Sylph, Bowtie2, Samtools,
@@ -103,10 +103,10 @@ Published images contain the complete toolchain:
 
 ```bash
 # Portable CPU image
-docker pull parsaghadermazi/metatrawl:2.0.0
+docker pull parsaghadermazi/metatrawl:2.0.1
 
 # NVIDIA CUDA 12.8 image
-docker pull parsaghadermazi/metatrawl:2.0.0-cuda
+docker pull parsaghadermazi/metatrawl:2.0.1-cuda
 ```
 
 See [Container usage](docs/containers.md) for project mounts, CUDA checks,

@@ -20,4 +20,4 @@ dependencies:
   - pip
   - pip:
       # Requires the ZipStrain 2.x Bioconda recipe to be available.
-      - metatrawl==2.0.0
+      - metatrawl==2.0.1
