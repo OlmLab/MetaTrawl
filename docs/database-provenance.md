@@ -14,6 +14,14 @@ ZipStrain 2 profiling. See [Schema v2](schema-v2.md). The metadata-adoption
 instructions below apply to databases that have no version metadata yet,
 not to automatic conversion of schema v1 to v2.
 
+> **Unversioned databases (MetaTrawl 0.x).** MetaTrawl 2 adopts these as
+> **schema v2** on the first writable open, including ordinary commands such as
+> `runs add` or `sync-profile`, not only `database migrate`. Their existing
+> profiles are ZipStrain 1 profiles labelled `legacy-unknown`, and MetaTrawl 1.x
+> refuses further writes to the adopted file. To keep extending a 0.x project
+> with its original settings, write to it only with MetaTrawl 0.x or 1.x, and
+> open it from MetaTrawl 2 with the read-only Python API.
+
 Existing databases remain readable without migration. The first writable open
 adds small provenance tables and labels registered samples `legacy-unknown`.
 It does not infer old parameters from current defaults, scan profile positions,

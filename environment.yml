@@ -4,8 +4,7 @@ channels:
   - bioconda
 dependencies:
   - python >=3.12
-  # ZipStrain profiler + the external executables MetaTrawl shells out to
-  - zipstrain >=2.0.0,<3
+  # The external executables MetaTrawl shells out to
   - sylph
   - samtools
   - bowtie2
@@ -19,5 +18,6 @@ dependencies:
   - rich >=13.0
   - pip
   - pip:
-      # Requires the ZipStrain 2.x Bioconda recipe to be available.
+      # ZipStrain 2 and its Rust profiler come from PyPI until their Bioconda
+      # recipes are published; metatrawl pulls in both.
       - metatrawl==2.0.1

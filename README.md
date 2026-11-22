@@ -72,19 +72,29 @@ matrices, schedules comparisons, records provenance, and cleans temporary data.
 
 MetaTrawl 2 requires ZipStrain `>=2.0.0,<3` and its Rust profiler `>=0.2.0,<0.3`.
 
+Use 2.0.1 or later. MetaTrawl 2.0.0 cannot import ZipStrain 2 gene catalogs
+whose gene IDs exceed the signed 64-bit range, and it rejects four-column BED
+files during matrix builds.
+
 ### Bioconda
 
-Bioconda is the simplest installation for the complete workflow because it also
-installs the external bioinformatics tools:
+Bioconda recipes for MetaTrawl 2 and ZipStrain 2 are not published yet. Until
+they are, install version 2 from PyPI or use the containers. An unconstrained
+`conda install metatrawl` currently selects MetaTrawl 1.x, which is the right
+installation for continuing schema-v1 projects.
 
-The Bioconda 2.0 update also requires updated ZipStrain and Rust-profiler
-recipes. Until those are available, use PyPI or the containers for version 2;
-an unconstrained Conda install may still select MetaTrawl 1.x.
+To build a Conda environment with the external tools and MetaTrawl 2 from PyPI:
+
+```bash
+conda env create -f environment.yml
+conda activate metatrawl-v2
+metatrawl check
+```
+
+Once the Bioconda recipes are available, the direct install will be:
 
 ```bash
 conda create -n metatrawl -c conda-forge -c bioconda metatrawl=2.0.1
-conda activate metatrawl
-metatrawl check
 ```
 
 ### PyPI
