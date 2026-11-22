@@ -15,6 +15,14 @@ import pyarrow.parquet as pq
 from metatrawl import allele_mask, db
 
 
+def _manifest(conn, sample: str) -> dict:
+    """Recorded provenance for one sample; {} when unknown, including MetaTrawl 0.x files."""
+    if not db._table_exists(conn, "sample_provenance"):
+        return {}
+    row = conn.execute("SELECT manifest_json FROM sample_provenance WHERE sample_id=?", [sample]).fetchone()
+    return json.loads(row[0]) if row else {}
+
+
 @dataclass(frozen=True)
 class PairView:
     """A scoped pair; data is fetched only when an analysis is executed."""
@@ -66,8 +74,7 @@ class PairView:
         for sample in (self.sample_1, self.sample_2):
             if conn.execute("SELECT 1 FROM samples WHERE sample_id=? AND status='complete'", [sample]).fetchone() is None:
                 raise ValueError(f"Unknown or incomplete sample: {sample}")
-            row = conn.execute("SELECT manifest_json FROM sample_provenance WHERE sample_id=?", [sample]).fetchone()
-            manifest = json.loads(row[0]) if row else {}
+            manifest = _manifest(conn, sample)
             reference = manifest.get("references", {}).get(self.genome, {})
             contract = manifest.get("contract")
             if (not reference or not contract) and not self.allow_unknown_provenance:
@@ -189,8 +196,7 @@ def _selection(pair: PairView, parameters: dict, action):
             if row is None or row[0] is None:
                 raise ValueError(f"Sample {sample} has no retained codon evidence; profile with collect_codons=true")
             evidence[sample] = json.loads(row[0])
-            row = conn.execute("SELECT manifest_json FROM sample_provenance WHERE sample_id=?", [sample]).fetchone()
-            manifest = json.loads(row[0]) if row else {}
+            manifest = _manifest(conn, sample)
             reference = manifest.get("references", {}).get(pair.genome)
             if reference is None:
                 raise ValueError("Gene selection requires per-genome reference provenance from the imported bundle")

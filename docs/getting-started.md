@@ -452,8 +452,10 @@ metatrawl profiles compact-database \
   --min-cov 5
 ```
 
-The migration commits one sample at a time. Rerun the same command to resume
-after interruption. Do not replace the source until every sample reports
+The source must be a database created by MetaTrawl 2; older databases are
+read-only here (see [Database versions](database-provenance.md)). The conversion
+commits one sample at a time. Rerun the same command to resume after
+interruption. Do not replace the source until every sample reports
 completion and the new database has been validated.
 
 You can still run the lower-level worker command if you want to manage the

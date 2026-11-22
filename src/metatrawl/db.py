@@ -383,7 +383,9 @@ def _apply_connection_settings(
 def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     """Create and lightly migrate registry tables."""
     provenance.check_schema(conn, writable=True)
-    had_legacy_matrix_profiles = _table_exists(conn, "matrix_store_profiles")
+    # Version metadata comes first, so an interrupted first open can never leave
+    # registry tables that look like an unversioned MetaTrawl 0.x database.
+    provenance.install_metadata(conn)
     conn.execute(SCHEMA_SQL)
     conn.execute("ALTER TABLE sra_runs ADD COLUMN IF NOT EXISTS status VARCHAR DEFAULT 'added'")
     conn.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS gene_stats_file VARCHAR")
@@ -432,20 +434,8 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
     # MetaTrawl never reads profile_positions.gene: the matrix export selects
     # chrom/pos/ACGT only. Dropping it is metadata-only and idempotent.
     conn.execute("ALTER TABLE profile_positions DROP COLUMN IF EXISTS gene")
-    # Legacy count conversion rewrites the entire profile table. Keep the
-    # existing physical types on metadata-only adoption; imports cast explicitly.
     _run_once(conn, "allow_profiles_without_sylph", _allow_profiles_without_sylph)
     _run_once(conn, "normalize_sylph_genomes", _normalize_existing_sylph_genomes)
-    if had_legacy_matrix_profiles:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO matrix_store_samples
-            SELECT matrix_id, run_id AS sample_id, added_at
-            FROM matrix_store_profiles
-            """
-        )
-
-    provenance.migrate(conn)
 
 
 def profile_storage_config(conn: duckdb.DuckDBPyConnection) -> ProfileStorageConfig:

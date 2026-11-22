@@ -7,17 +7,16 @@ not converted by opening a project database.
 
 ## Existing projects
 
-- Schema-v1 projects can still be queried with the read-only Python API.
-- MetaTrawl 2 refuses writable opens of schema-v1 projects, before changing
-  tables or metadata. This guard cannot be bypassed by a provenance override.
-- Continue v1 profiling, matrix builds, and comparison resumes with the original
-  MetaTrawl/ZipStrain installation. Start a new project database for v2 profiles.
-- Unversioned historical registries (MetaTrawl 0.x) are adopted as schema v2 on
-  the first writable open by MetaTrawl 2, not only through `database migrate`.
-  Adoption marks old provenance unknown; it does not convert old scientific
-  results or make v1 and v2 profiles equivalent, and MetaTrawl 1.x cannot write
-  to the file afterwards. Back up these databases and keep MetaTrawl 2 to
-  read-only access if the project continues with its original settings.
+- Schema-v1 projects (MetaTrawl 1.x) and unversioned registries (MetaTrawl 0.x)
+  stay readable through the read-only CLI commands and the Python API, including
+  pair analyses with `allow_unknown_provenance=True`.
+- MetaTrawl 2 refuses every write to them before changing tables or metadata.
+  This guard cannot be bypassed by a provenance override.
+- Continue v1 or 0.x profiling, matrix builds, and comparison resumes with the
+  original MetaTrawl/ZipStrain installation. Start a new project database for
+  v2 profiles.
+- Files that MetaTrawl 2.0.0 or 2.0.1 adopted from 0.x (`legacy-adopted`) are
+  also read-only. See [Database versions](database-provenance.md).
 
 The generation is part of every new profiling contract. In particular, the
 v2 `min_freq` default is `0.01`, and gene statistics and selection follow

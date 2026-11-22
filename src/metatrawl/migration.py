@@ -76,7 +76,14 @@ def migrate_full_database(
     output_existed = output_db.exists()
     output_db.parent.mkdir(parents=True, exist_ok=True)
     source = db.connect_read_only(source_db)
-    target = db.connect(output_db)
+    try:
+        # The output is a writable v2 database, so its source must be one too;
+        # otherwise conversion would relabel v1 or 0.x profiles as v2.
+        provenance.check_schema(source, writable=True)
+        target = db.connect(output_db)
+    except Exception:
+        source.close()
+        raise
     try:
         source_storage = db.profile_storage_config(source)
         if source_storage.mode != allele_mask.PROFILE_STORAGE_FULL:

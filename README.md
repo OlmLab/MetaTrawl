@@ -72,9 +72,13 @@ matrices, schedules comparisons, records provenance, and cleans temporary data.
 
 MetaTrawl 2 requires ZipStrain `>=2.0.0,<3` and its Rust profiler `>=0.2.0,<0.3`.
 
-Use 2.0.1 or later. MetaTrawl 2.0.0 cannot import ZipStrain 2 gene catalogs
+Use 2.1.0 or later. MetaTrawl 2.0.0 cannot import ZipStrain 2 gene catalogs
 whose gene IDs exceed the signed 64-bit range, and it rejects four-column BED
-files during matrix builds.
+files during matrix builds. MetaTrawl 2.0.x also converted MetaTrawl 0.x
+databases to schema v2 on their first write; from 2.1.0, every database
+MetaTrawl 2 did not create is read-only (see
+[Database versions](docs/database-provenance.md)). See the
+[changelog](CHANGELOG.md).
 
 ### Bioconda
 
@@ -94,13 +98,13 @@ metatrawl check
 Once the Bioconda recipes are available, the direct install will be:
 
 ```bash
-conda create -n metatrawl -c conda-forge -c bioconda metatrawl=2.0.1
+conda create -n metatrawl -c conda-forge -c bioconda metatrawl=2.1.0
 ```
 
 ### PyPI
 
 ```bash
-pip install "metatrawl==2.0.1"
+pip install "metatrawl==2.1.0"
 ```
 
 The PyPI package installs Python dependencies. Sylph, Bowtie2, Samtools,
@@ -113,10 +117,10 @@ Published images contain the complete toolchain:
 
 ```bash
 # Portable CPU image
-docker pull parsaghadermazi/metatrawl:2.0.1
+docker pull parsaghadermazi/metatrawl:2.1.0
 
 # NVIDIA CUDA 12.8 image
-docker pull parsaghadermazi/metatrawl:2.0.1-cuda
+docker pull parsaghadermazi/metatrawl:2.1.0-cuda
 ```
 
 See [Container usage](docs/containers.md) for project mounts, CUDA checks,

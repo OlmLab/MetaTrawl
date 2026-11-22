@@ -358,7 +358,7 @@ def test_sample_input_type_cannot_be_changed_implicitly(tmp_path: Path) -> None:
             registry.add_sra_inputs(conn, ["SHARED_ID"])
 
 
-def test_schema_migrates_pre_v1_stat_tables_without_rebuild(tmp_path: Path) -> None:
+def test_pre_v1_stat_tables_are_read_only(tmp_path: Path) -> None:
     db_file = tmp_path / "metatrawl.duckdb"
     with duckdb.connect(str(db_file)) as conn:
         conn.execute(
@@ -376,11 +376,11 @@ def test_schema_migrates_pre_v1_stat_tables_without_rebuild(tmp_path: Path) -> N
         conn.execute("INSERT INTO genome_stats VALUES ('S1', 'G1', 2.0, 0.8, 0.7, 99.9)")
         conn.execute("INSERT INTO gene_stats VALUES ('S1', 'G1', 'gene1', 2.0, 0.8, NULL, 99.8)")
 
-    with registry.connect(db_file) as conn:
-        assert conn.execute(
-            "SELECT coverage, coverage_median, fug, SNV_count FROM genome_stats"
-        ).fetchone() == (2.0, None, None, None)
-        assert conn.execute("SELECT gene, length FROM gene_stats").fetchone() == ("gene1", None)
+    with pytest.raises(ValueError, match="MetaTrawl 0.x"):
+        registry.connect(db_file)
+    with registry.connect_read_only(db_file) as conn:
+        assert conn.execute("SELECT coverage, ref_ani FROM genome_stats").fetchone() == (2.0, 99.9)
+        assert conn.execute("SELECT gene FROM gene_stats").fetchone() == ("gene1",)
 
 
 def test_deleted_run_is_excluded_from_remaining_profiles(tmp_path: Path) -> None:
@@ -1697,33 +1697,6 @@ def test_profile_bundle_import_allows_missing_sylph_output(tmp_path: Path) -> No
         registry.import_profile_bundle(conn, fixed_bundle)
         assert registry.completed_sample_ids(conn) == ["S1"]
         assert conn.execute("SELECT count(*) FROM sylph_abundance").fetchone() == (0,)
-        assert conn.execute(
-            "SELECT sylph_abundance_file FROM profiles WHERE run_id = 'S1'"
-        ).fetchone() == (None,)
-
-
-def test_existing_profiles_table_is_migrated_to_allow_missing_sylph(tmp_path: Path) -> None:
-    db_file = tmp_path / "legacy.duckdb"
-    with duckdb.connect(str(db_file)) as conn:
-        conn.execute(
-            """
-            CREATE TABLE profiles (
-                run_id VARCHAR PRIMARY KEY,
-                profile_file VARCHAR NOT NULL,
-                genome_stats_file VARCHAR NOT NULL,
-                gene_stats_file VARCHAR,
-                sylph_abundance_file VARCHAR NOT NULL,
-                profile_storage_mode VARCHAR NOT NULL DEFAULT 'full',
-                profile_min_cov INTEGER,
-                created_at DOUBLE NOT NULL,
-                updated_at DOUBLE NOT NULL
-            )
-            """
-        )
-        registry.init_schema(conn)
-        conn.execute(
-            "INSERT INTO profiles VALUES ('S1', 'profile', 'stats', 'genes', NULL, 'full', NULL, 1, 1)"
-        )
         assert conn.execute(
             "SELECT sylph_abundance_file FROM profiles WHERE run_id = 'S1'"
         ).fetchone() == (None,)

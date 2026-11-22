@@ -43,21 +43,34 @@ def table_exists(conn, name: str) -> bool:
     return conn.execute("SELECT 1 FROM information_schema.tables WHERE table_schema='main' AND table_name=?", [name]).fetchone() is not None
 
 
+class DatabaseVersionError(ValueError):
+    """The database exists but this MetaTrawl release must not open it this way."""
+
+
 def check_schema(conn, *, writable: bool = False) -> None:
-    """Reject unsupported schemas before any DDL or writable migration."""
+    """Reject unsupported schemas before any DDL.
+
+    Every MetaTrawl database stays readable. Only databases MetaTrawl 2 created
+    are writable; older ones keep the release that created them.
+    """
     if not table_exists(conn, "database_metadata"):
+        if writable and conn.execute("SELECT 1 FROM information_schema.tables WHERE table_schema='main' LIMIT 1").fetchone():
+            raise DatabaseVersionError("This database predates MetaTrawl versioning (MetaTrawl 0.x). MetaTrawl 2 opens it "
+                             "read-only; write to it with the MetaTrawl 0.x or 1.x release or container that created it.")
         return
-    rows = conn.execute("SELECT schema_version FROM database_metadata").fetchall()
+    rows = conn.execute("SELECT schema_version, origin FROM database_metadata").fetchall()
     supported = (SCHEMA_VERSION,) if writable else (1, SCHEMA_VERSION)
     if len(rows) != 1 or rows[0][0] not in supported:
-        raise ValueError(f"Unsupported MetaTrawl database schema: {rows!r}; writable schema={SCHEMA_VERSION}. "
+        raise DatabaseVersionError(f"Unsupported MetaTrawl database schema: {[row[0] for row in rows]!r}; writable schema={SCHEMA_VERSION}. "
                          "Use MetaTrawl 1.x for schema-v1 writes; use a new v2 database for ZipStrain v2 profiles.")
+    if writable and rows[0][1] == "legacy-adopted":
+        raise DatabaseVersionError("This database was adopted from a MetaTrawl 0.x registry and holds ZipStrain 1 profiles. "
+                         "MetaTrawl 2 opens it read-only; use a new v2 database for ZipStrain v2 profiles.")
 
 
-def migrate(conn) -> None:
-    """Install provenance metadata once, touching only the sample registry."""
+def install_metadata(conn) -> None:
+    """Create version and provenance tables for a new database, once."""
     if table_exists(conn, "database_metadata"):
-        check_schema(conn, writable=True)
         return
     conn.execute("BEGIN TRANSACTION")
     try:
@@ -85,12 +98,12 @@ def migrate(conn) -> None:
             CREATE TABLE provenance_events (
                 event_id VARCHAR PRIMARY KEY, created_at DOUBLE NOT NULL,
                 sample_id VARCHAR, workflow_run_id VARCHAR, kind VARCHAR NOT NULL, details_json VARCHAR NOT NULL);
+            CREATE TABLE IF NOT EXISTS metatrawl_migrations (
+                name VARCHAR PRIMARY KEY, applied_at DOUBLE NOT NULL);
         ''')
-        legacy = conn.execute("SELECT EXISTS(SELECT 1 FROM samples)").fetchone()[0]
         now = time.time()
-        conn.execute("INSERT INTO database_metadata VALUES (1, ?, ?, ?, ?, ?, NULL)",
-                     [str(uuid.uuid4()), SCHEMA_VERSION, now, package_versions()["metatrawl"], "legacy-adopted" if legacy else "new"])
-        conn.execute("INSERT INTO sample_provenance SELECT sample_id, NULL, 'legacy-unknown', NULL, '{}', ? FROM samples", [now])
+        conn.execute("INSERT INTO database_metadata VALUES (1, ?, ?, ?, ?, 'new', NULL)",
+                     [str(uuid.uuid4()), SCHEMA_VERSION, now, package_versions()["metatrawl"]])
         conn.execute("INSERT INTO metatrawl_migrations VALUES ('provenance_schema_v1', ?)", [now])
         conn.execute("COMMIT")
     except Exception:
@@ -389,28 +402,3 @@ def operational_config(config) -> dict:
     for stage in result["stages"].values():
         stage["environment"] = {key: "<set>" for key in stage.get("environment", {})}
     return result
-
-
-def declare_legacy(conn, *, contract, samples, reason) -> int:
-    """Attach user-declared settings without claiming historical verification."""
-    if not reason.strip():
-        raise ValueError("A reason is required for a historical declaration.")
-    validate_contract(contract)
-    conn.execute("BEGIN TRANSACTION")
-    try:
-        rows = conn.execute("SELECT sample_id FROM sample_provenance WHERE contract_id IS NULL ORDER BY sample_id").fetchall()
-        eligible = {row[0] for row in rows}
-        selected = eligible if samples is None else set(samples)
-        if not selected <= eligible:
-            raise ValueError("Declarations can only target existing legacy-unknown samples.")
-        identity = register_contract(conn, contract)
-        for sample in sorted(selected):
-            manifest = {"status": "user-declared", "contract": contract, "reason": reason}
-            conn.execute("UPDATE sample_provenance SET contract_id=?, provenance_status='user-declared', manifest_json=?, updated_at=? WHERE sample_id=?",
-                         [identity, canonical(manifest), time.time(), sample])
-            event(conn, kind="legacy-contract-declared", details=manifest, sample_id=sample)
-        conn.execute("COMMIT")
-        return len(selected)
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise

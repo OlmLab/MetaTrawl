@@ -29,7 +29,15 @@ from metatrawl.execution import WorkflowRuntime
 from metatrawl.logging import WorkflowLogger
 
 
-@click.group()
+class _Cli(click.Group):
+    def invoke(self, ctx):
+        try:
+            return super().invoke(ctx)
+        except provenance.DatabaseVersionError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+
+@click.group(cls=_Cli)
 @click.version_option(version=__version__, prog_name="metatrawl")
 def cli() -> None:
     """Registry tooling for SRA-scale ZipStrain profiling projects."""
@@ -100,11 +108,11 @@ def runs_add(db_file: Path, run_ids: tuple[str, ...]) -> None:
 
 
 @runs_group.command("list")
-@click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
+@click.option("--db", "db_file", required=True, type=click.Path(exists=True, path_type=Path), help="MetaTrawl DuckDB registry.")
 @click.option("--include-deleted", is_flag=True, help="Show soft-deleted runs too.")
 def runs_list(db_file: Path, include_deleted: bool) -> None:
     """List registered SRA runs."""
-    with registry.connect(db_file) as conn:
+    with registry.connect_read_only(db_file) as conn:
         rows = registry.list_runs(conn, include_deleted=include_deleted)
     _print_rows(rows, columns=["run_id", "status", "deleted_at"], title="SRA runs")
 
@@ -177,11 +185,11 @@ def profiles_group() -> None:
 
 
 @profiles_group.command("remaining")
-@click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
+@click.option("--db", "db_file", required=True, type=click.Path(exists=True, path_type=Path), help="MetaTrawl DuckDB registry.")
 @click.option("--output-file", "-o", type=click.Path(path_type=Path), help="CSV path for remaining SRA run IDs.")
 def profiles_remaining(db_file: Path, output_file: Path | None) -> None:
     """Write active SRA run IDs that still need profile imports."""
-    with registry.connect(db_file) as conn:
+    with registry.connect_read_only(db_file) as conn:
         run_ids = registry.remaining_runs(conn)
     if output_file is not None:
         _write_remaining_csv(output_file, run_ids)
@@ -286,10 +294,10 @@ def profiles_add(
 
 
 @profiles_group.command("list")
-@click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
+@click.option("--db", "db_file", required=True, type=click.Path(exists=True, path_type=Path), help="MetaTrawl DuckDB registry.")
 def profiles_list(db_file: Path) -> None:
     """List imported profile bundles."""
-    with registry.connect(db_file) as conn:
+    with registry.connect_read_only(db_file) as conn:
         rows = registry.list_profiles(conn)
     _print_rows(
         rows,
@@ -1834,10 +1842,10 @@ def _genome_view_child_command(
 
 
 @cli.command("status")
-@click.option("--db", "db_file", required=True, type=click.Path(path_type=Path), help="MetaTrawl DuckDB registry.")
+@click.option("--db", "db_file", required=True, type=click.Path(exists=True, path_type=Path), help="MetaTrawl DuckDB registry.")
 def status(db_file: Path) -> None:
     """Show high-level registry counts."""
-    with registry.connect(db_file) as conn:
+    with registry.connect_read_only(db_file) as conn:
         counts = registry.registry_status(conn)
     for key, value in counts.items():
         click.echo(f"{key}={value}")
@@ -1981,17 +1989,6 @@ def database_info(db_file: Path) -> None:
         raise click.ClickException(str(exc)) from exc
 
 
-@database_group.command("migrate")
-@click.option("--db", "db_file", required=True, type=click.Path(exists=True, path_type=Path))
-def database_migrate(db_file: Path) -> None:
-    """Adopt legacy data with metadata-only versioning; never infer old settings."""
-    try:
-        with registry.connect(db_file) as conn:
-            click.echo(json.dumps(provenance.describe(conn), indent=2, sort_keys=True))
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
-
-
 @database_group.command("contract-template")
 @click.option("--workflow-config", type=click.Path(exists=True, path_type=Path))
 def database_contract_template(workflow_config: Path | None) -> None:
@@ -2004,29 +2001,13 @@ def database_contract_template(workflow_config: Path | None) -> None:
 @click.option("--db", "db_file", required=True, type=click.Path(exists=True, path_type=Path))
 @click.option("--limit", default=50, type=click.IntRange(min=1))
 def database_history(db_file: Path, limit: int) -> None:
-    """Show recent overrides and historical declarations."""
+    """Show recent overrides and provenance replacements."""
     with registry.connect_read_only(db_file) as conn:
         if not provenance.table_exists(conn, "provenance_events"):
             click.echo("[]")
             return
         rows = conn.execute("SELECT created_at, sample_id, workflow_run_id, kind, details_json FROM provenance_events ORDER BY created_at DESC LIMIT ?", [limit]).fetchall()
         click.echo(json.dumps([dict(time=r[0], sample=r[1], run=r[2], kind=r[3], details=json.loads(r[4])) for r in rows], indent=2))
-
-
-@database_group.command("declare-contract")
-@click.option("--db", "db_file", required=True, type=click.Path(exists=True, path_type=Path))
-@click.option("--contract-file", required=True, type=click.Path(exists=True, path_type=Path), help="JSON containing a complete effective profiling contract.")
-@click.option("--sample-id", multiple=True, help="Repeat for selected legacy samples; omitted means all legacy-unknown samples.")
-@click.option("--reason", required=True, help="How the historical settings were established.")
-def database_declare_contract(db_file: Path, contract_file: Path, sample_id: tuple[str, ...], reason: str) -> None:
-    """Attach user-declared settings to legacy samples, never verified provenance."""
-    try:
-        contract = json.loads(contract_file.read_text())
-        with registry.connect(db_file) as conn:
-            count = provenance.declare_legacy(conn, contract=contract, samples=list(sample_id) if sample_id else None, reason=reason)
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
-    click.echo(f"declared={count} provenance=user-declared")
 
 
 if __name__ == "__main__":

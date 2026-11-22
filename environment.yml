@@ -20,4 +20,4 @@ dependencies:
   - pip:
       # ZipStrain 2 and its Rust profiler come from PyPI until their Bioconda
       # recipes are published; metatrawl pulls in both.
-      - metatrawl==2.0.1
+      - metatrawl==2.1.0

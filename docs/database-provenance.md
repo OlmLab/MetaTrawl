@@ -1,44 +1,48 @@
 # Database versions and profiling provenance
 
 MetaTrawl records the database schema separately from its Python package version.
-A database receives a permanent UUID when it is created or adopted. Renaming,
-copying, or moving the file preserves the UUID; it is an identity, not a checksum.
-Two copies can subsequently diverge.
+A database receives a permanent UUID when it is created. Renaming, copying, or
+moving the file preserves the UUID; it is an identity, not a checksum. Two
+copies can subsequently diverge.
 
-## Existing databases
+## Older databases are read-only
 
-**MetaTrawl 2 writes schema v2 only.** Schema-v1 databases remain readable,
-but writable opens are rejected before any changes. Keep the original
-MetaTrawl 1.x environment for v1 project writes and start a new database for
-ZipStrain 2 profiling. See [Schema v2](schema-v2.md). The metadata-adoption
-instructions below apply to databases that have no version metadata yet,
-not to automatic conversion of schema v1 to v2.
+**MetaTrawl 2 writes only to databases that MetaTrawl 2 created.** Every older
+database stays readable, but any command that would write to it stops with an
+error before changing the file:
 
-> **Unversioned databases (MetaTrawl 0.x).** MetaTrawl 2 adopts these as
-> **schema v2** on the first writable open, including ordinary commands such as
-> `runs add` or `sync-profile`, not only `database migrate`. Their existing
-> profiles are ZipStrain 1 profiles labelled `legacy-unknown`, and MetaTrawl 1.x
-> refuses further writes to the adopted file. To keep extending a 0.x project
-> with its original settings, write to it only with MetaTrawl 0.x or 1.x, and
-> open it from MetaTrawl 2 with the read-only Python API.
+| Database | Created by | MetaTrawl 2 | Keep writing with |
+| --- | --- | --- | --- |
+| Schema v2, origin `new` | MetaTrawl 2 | read and write | MetaTrawl 2 |
+| Schema v1 | MetaTrawl 1.x | read-only | MetaTrawl 1.x |
+| Unversioned (no `database_metadata` table) | MetaTrawl 0.x | read-only | MetaTrawl 0.x or 1.x |
+| Schema v2, origin `legacy-adopted` | MetaTrawl 2.0.x opening a 0.x file | read-only | none; see below |
 
-Existing databases remain readable without migration. The first writable open
-adds small provenance tables and labels registered samples `legacy-unknown`.
-It does not infer old parameters from current defaults, scan profile positions,
-or convert the existing profile count columns. Existing profile, stats, matrix,
-and comparison data do not need to be rebuilt for this metadata adoption.
+Read-only access covers `database info`, `database history`, `runs list`,
+`profiles list`, `profiles remaining`, `status`, and the [Python API](python-api.md),
+including pair analyses. Older files have no recorded profiling settings, so
+pass `allow_unknown_provenance=True` to `pair(...)` to acknowledge that:
 
-You can adopt explicitly:
-
-```sh
-metatrawl database migrate --db metatrawl.duckdb
+```python
+from metatrawl import open_database
+pair = open_database("old_project.duckdb").pair(
+    "SRR1", "SRR2", genome="GCF_000005845", allow_unknown_provenance=True)
 ```
 
-Use a backup before upgrading a valuable database. Older MetaTrawl releases do
-not know about the new guards; do not use them to write to an adopted database.
-A newer, unsupported schema is rejected before modification. Overrides cannot
-bypass this protection. The metadata creation timestamp on an adopted database
-is the adoption time, not an inferred historical creation date.
+To keep profiling an older project with its original settings, use the release
+or container that created it. To profile with ZipStrain 2, start a new database.
+There is no in-place upgrade: an older database holds ZipStrain 1 profiles made
+with different defaults (for example `min_freq`), and relabelling the file would
+not change how those profiles were made.
+
+MetaTrawl 2.0.0 and 2.0.1 adopted unversioned files as schema v2 on their first
+write. Such files are marked `legacy-adopted`, MetaTrawl 1.x refuses to write
+to them, and MetaTrawl 2.1 opens them read-only. A backup taken before the
+adoption still works with MetaTrawl 0.x and 1.x.
+
+A file is created as a new v2 database only when it is missing or empty. A
+newer, unsupported schema is rejected before modification, even for reads.
+Overrides cannot bypass any of these checks.
 
 ## Inspect the database
 
@@ -49,7 +53,7 @@ metatrawl database history --db metatrawl.duckdb --limit 50
 
 `info` is read-only and prints the UUID, schema version, storage representation,
 profiling contracts, and provenance-status counts. `history` lists explicit
-overrides, sample-provenance replacements, and historical declarations.
+overrides and sample-provenance replacements.
 
 ```python
 from metatrawl import open_database
@@ -129,29 +133,20 @@ settings are unknown. Such continued samples are labeled `user-declared`, not
 in a new scratch directory, even with an import override. Published old bundles
 are imported as-is with unknown provenance; resuming does not relabel them.
 
-## Declare known historical settings
-
-If you have the original configuration, you can attach it to legacy samples:
+## Contract template
 
 ```sh
-metatrawl database contract-template --workflow-config historical.toml > contract.json
-# Inspect every field against the historical software and configuration first.
-metatrawl database declare-contract \
-  --db metatrawl.duckdb \
-  --contract-file contract.json \
-  --reason "Checked against archived workflow configuration"
+metatrawl database contract-template --workflow-config project.toml > contract.json
 ```
 
-The template resolves defaults from the **current installation**; it is not a
-reconstruction of old defaults. Correct the JSON from historical evidence before
-using it. Repeat `--sample-id` to restrict the declaration; otherwise it applies
-to all `legacy-unknown` samples. Declared settings stay labeled `user-declared`.
-Reference sequences are not reconstructed by this declaration.
+prints the profiling contract that a workflow configuration resolves to on the
+**current installation**. Use it to compare settings between configurations;
+it is not a reconstruction of the defaults an older release used.
 
 ## Scope
 
 This first version enforces compatibility at profiling preflight and DuckDB
 import. Existing matrix append, comparison resume, and genome-view checks remain
-unchanged; database adoption alone does not invalidate old artifacts. Propagating
+unchanged. Propagating
 per-sample provenance into HDF5/compare artifacts and enforcing those identities
 is a separate downstream step. A UUID alone does not establish compatibility.

@@ -49,24 +49,105 @@ def test_uuid_survives_reopen_move_copy_and_new_db_differs(tmp_path):
         assert provenance.describe(c)['database_uuid'] != first['database_uuid']
 
 
-def test_read_only_legacy_does_not_migrate_and_adoption_preserves_payload_types(tmp_path):
-    path = tmp_path / 'legacy.duckdb'
+def _unversioned(path):
+    """A MetaTrawl 0.x registry: registry tables, no version metadata."""
     with duckdb.connect(str(path)) as c:
         c.execute(db.SCHEMA_SQL)
         c.execute("INSERT INTO samples VALUES ('S1','S1','complete',1,1)")
-        c.execute("ALTER TABLE profile_positions ALTER COLUMN A TYPE DOUBLE")
-        c.execute("INSERT INTO profile_positions VALUES ('S1','c',1,'g',5,0,0,0,NULL)")
+        c.execute("INSERT INTO samples VALUES ('S2','S2','complete',1,1)")
+    return path
+
+
+def _tables(path):
+    with duckdb.connect(str(path), read_only=True) as c:
+        return sorted(r[0] for r in c.execute("SELECT table_name FROM information_schema.tables").fetchall())
+
+
+def _old_database(tmp_path, kind):
+    path = tmp_path / f'{kind}.duckdb'
+    if kind == 'unversioned':
+        return _unversioned(path)
+    with db.connect(path) as c:
+        db.add_runs(c, ['S1'])
+        if kind == 'v1':
+            c.execute('UPDATE database_metadata SET schema_version=1')
+        else:
+            c.execute("UPDATE database_metadata SET origin='legacy-adopted'")
+    return path
+
+
+@pytest.mark.parametrize('kind', ['unversioned', 'v1', 'legacy-adopted'])
+def test_old_databases_are_readable_but_never_written(tmp_path, kind):
+    path = _old_database(tmp_path, kind)
+    before = (_tables(path), path.read_bytes())
+    with pytest.raises(provenance.DatabaseVersionError, match='read-only|schema-v1'):
+        db.connect(path)
+    assert (_tables(path), path.read_bytes()) == before
+    with db.connect_read_only(path) as c:
+        assert c.execute('SELECT (SELECT count(*) FROM samples) + (SELECT count(*) FROM sra_runs)').fetchone()[0] >= 1
+    assert _tables(path) == before[0]
+
+
+def test_unversioned_database_is_described_without_adoption(tmp_path):
+    path = _unversioned(tmp_path / 'legacy.duckdb')
     with db.connect_read_only(path) as c:
         assert provenance.describe(c)['schema_version'] == 'legacy-unversioned'
-        assert not provenance.table_exists(c, 'database_metadata')
+    assert 'database_metadata' not in _tables(path)
+
+
+def test_cli_refuses_old_database_writes_with_a_message_and_still_reads(tmp_path):
+    path = _unversioned(tmp_path / 'legacy.duckdb')
+    runner = CliRunner()
+    result = runner.invoke(cli, ['runs', 'add', '--db', str(path), 'SRR9'])
+    assert result.exit_code == 1
+    assert 'MetaTrawl 0.x' in result.output and 'Traceback' not in result.output
+    assert 'database_metadata' not in _tables(path)
+    for args in (['runs', 'list'], ['profiles', 'list'], ['status'], ['database', 'history']):
+        listed = runner.invoke(cli, [*args, '--db', str(path)])
+        assert listed.exit_code == 0, (args, listed.output)
+    assert 'database_metadata' not in _tables(path)
+
+
+def test_pair_api_reads_unversioned_database_after_acknowledgement(tmp_path):
+    from metatrawl import open_database
+    path = _unversioned(tmp_path / 'legacy.duckdb')
+    with duckdb.connect(str(path), read_only=True) as c:
+        with pytest.raises(ValueError, match='Unverified provenance'):
+            open_database(path).pair('S1', 'S2', genome='g')._validate(c)
+        open_database(path).pair('S1', 'S2', genome='g', allow_unknown_provenance=True)._validate(c)
+
+
+def test_missing_or_empty_file_becomes_a_new_v2_database(tmp_path):
+    empty = tmp_path / 'empty.duckdb'
+    duckdb.connect(str(empty)).close()
+    for path in (tmp_path / 'missing.duckdb', empty):
+        with db.connect(path) as c:
+            assert provenance.describe(c)['origin'] == 'new'
+            assert provenance.describe(c)['schema_version'] == provenance.SCHEMA_VERSION
+
+
+def test_interrupted_first_open_stays_a_v2_database(tmp_path):
+    path = tmp_path / 'new.duckdb'
+    with duckdb.connect(str(path)) as c:
+        class FailOnRegistry:
+            def execute(self, sql, *args):
+                if sql is db.SCHEMA_SQL:
+                    raise RuntimeError('killed')
+                return c.execute(sql, *args)
+        with pytest.raises(RuntimeError):
+            db.init_schema(FailOnRegistry())
     with db.connect(path) as c:
-        assert provenance.describe(c)['origin'] == 'legacy-adopted'
-        assert c.execute("SELECT provenance_status FROM sample_provenance").fetchone()[0] == 'legacy-unknown'
-        assert c.execute("SELECT typeof(A),A FROM profile_positions").fetchone() == ('DOUBLE', 5.0)
-        identity = provenance.describe(c)['database_uuid']
-    with db.connect(path) as c:
-        assert provenance.describe(c)['database_uuid'] == identity
-        assert c.execute("SELECT count(*) FROM sample_provenance").fetchone()[0] == 1
+        assert provenance.describe(c)['origin'] == 'new'
+        db.add_runs(c, ['S1'])
+
+
+def test_storage_conversion_refuses_sources_it_cannot_write(tmp_path):
+    from metatrawl import migration
+    source = _unversioned(tmp_path / 'legacy.duckdb')
+    target = tmp_path / 'converted.duckdb'
+    with pytest.raises(provenance.DatabaseVersionError):
+        migration.migrate_full_database(source_db=source, output_db=target, cache_dir=tmp_path, min_cov=5)
+    assert not target.exists()
 
 
 @pytest.mark.parametrize('read_only', [False, True])
@@ -117,16 +198,6 @@ def test_unknown_import_needs_override_and_is_never_relabelled(conn,tmp_path):
         db.import_profile_bundle(conn,bundle(tmp_path,'S2'))
     db.import_profile_bundle(conn,bundle(tmp_path,'S2'),allow_incompatible_profiles=True)
     assert conn.execute("SELECT contract_id FROM sample_provenance WHERE sample_id='S1'").fetchone()[0] is None
-
-
-def test_legacy_declaration_does_not_claim_verification(conn,tmp_path):
-    db.import_profile_bundle(conn,bundle(tmp_path,'S1',manifest=False),allow_incompatible_profiles=True)
-    c=provenance.profiling_contract(ProfileConfig())
-    assert provenance.declare_legacy(conn,contract=c,samples=['S1'],reason='Archived configuration') == 1
-    assert conn.execute('SELECT provenance_status FROM sample_provenance').fetchone()[0] == 'user-declared'
-    db.import_profile_bundle(conn,bundle(tmp_path,'S2'))
-    with pytest.raises(ValueError,match='legacy-unknown'):
-        provenance.declare_legacy(conn,contract=c,samples=['S2'],reason='invalid')
 
 
 def test_payload_failure_rolls_back_all_provenance(conn,tmp_path):
@@ -282,34 +353,27 @@ def test_old_bam_checkpoint_requires_acknowledgement(tmp_path):
     assert not (scratch/'profiling_settings.json').exists()
 
 
-def test_database_cli_template_declaration_and_history(tmp_path):
+def test_database_cli_template_and_history(tmp_path):
     path=tmp_path/'project.duckdb'
     with db.connect(path) as c:
-        db.add_runs(c,['S1'])
+        db.add_runs(c,['S1','S2'])
         db.import_profile_bundle(c,bundle(tmp_path,'S1',manifest=False),allow_incompatible_profiles=True)
+        db.import_profile_bundle(c,bundle(tmp_path,'S2'),allow_incompatible_profiles=True)
     runner=CliRunner()
     template=runner.invoke(cli,['database','contract-template'])
     assert template.exit_code==0,template.output
-    contract_file=tmp_path/'contract.json'; contract_file.write_text(template.output)
-    result=runner.invoke(cli,['database','declare-contract','--db',str(path),
-                             '--contract-file',str(contract_file),'--reason','Archived config'])
-    assert result.exit_code==0,result.output
-    assert 'user-declared' in result.output
+    assert json.loads(template.output)
     history=runner.invoke(cli,['database','history','--db',str(path)])
-    assert history.exit_code==0
-    assert 'legacy-contract-declared' in history.output
+    assert history.exit_code==0,history.output
+    assert 'compatibility-override' in history.output
+    for removed in ('migrate','declare-contract'):
+        assert runner.invoke(cli,['database',removed,'--help']).exit_code!=0
 
 
-def test_user_declared_samples_do_not_become_recorded_on_reopen(conn,tmp_path):
-    db.import_profile_bundle(conn,bundle(tmp_path,'S1',manifest=False),allow_incompatible_profiles=True)
-    provenance.declare_legacy(conn,contract=provenance.profiling_contract(ProfileConfig()),samples=None,reason='Config')
-    db.init_schema(conn)
-    assert provenance.describe(conn)['sample_provenance']=={'user-declared':1}
-
-
-def test_schema_migration_never_selects_from_profile_positions(tmp_path):
-    with duckdb.connect(str(tmp_path/'legacy.duckdb')) as c:
-        c.execute(db.SCHEMA_SQL)
+def test_reopen_never_selects_from_profile_positions(tmp_path):
+    path=tmp_path/'project.duckdb'
+    db.connect(path).close()
+    with duckdb.connect(str(path)) as c:
         statements=[]
         class Recorder:
             def execute(self,sql,*args):
